@@ -8,10 +8,10 @@ institutional-grade quantitative trading modules, backed by a hybrid data engine
 that routes each asset class to the venue best suited to serve real Level-2 order
 book depth without requiring the user to hold API keys:
 
-    Crypto & Metals proxy  -> Binance Public REST API   (klines + depth)
-    Major Forex pairs      -> Kraken Public REST API    (OHLC + depth)
-    Macro / Index / Futures -> yfinance                 (OHLCV + option chains)
-    Universal fallback      -> yfinance                 (any source failure)
+    Crypto & Metals proxy   -> Binance Public REST API   (klines + depth, 3-endpoint fallback)
+    Major Forex pairs       -> Kraken Public REST API    (OHLC + depth)
+    Macro / Index / Futures -> yfinance                  (OHLCV + option chains)
+    Universal fallback      -> yfinance                  (any source failure)
 
 Modules:
   1. Institutional Order Flow & Liquidity Heatmap (BSL/SSL, FVGs, live $ volume
@@ -22,27 +22,24 @@ Modules:
   4. Volume Delta / Cumulative Volume Delta (CVD) Footprint Analysis
   5. Options Gamma Exposure (GEX) & Max Pain Engine (live chain or simulation)
   6. Institutional Execution Algorithms (VWAP / TWAP / Iceberg Detection)
-
-Author: Expert Quantitative Financial Engineer (generated)
 ==================================================================================
 """
 
+import math
 import warnings
 warnings.filterwarnings("ignore")
 
-import math
-
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 import yfinance as yf
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 # ==================================================================================
@@ -109,22 +106,106 @@ DARK_CSS = """
     thead tr th { background-color: #1f2937 !important; color: #f0b90b !important; }
 </style>
 """
-st.markdown(DARK_CSS, unsafe_allow_html=True)
+
+LIGHT_CSS = """
+<style>
+    .stApp { background-color: #f8f9fa; color: #1a1d23; }
+    section[data-testid="stSidebar"] { background-color: #ffffff; border-right: 1px solid #e2e5ea; }
+    div[data-testid="stMetric"] {
+        background-color: #ffffff;
+        border: 1px solid #e2e5ea;
+        border-radius: 10px;
+        padding: 12px 16px;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }
+    div[data-testid="stMetricValue"] { color: #b8860b; }
+    h1, h2, h3 { color: #1a1d23; }
+    .stTabs [data-baseweb="tab-list"] { gap: 6px; }
+    .stTabs [data-baseweb="tab"] {
+        background-color: #ffffff;
+        border-radius: 8px 8px 0 0;
+        padding: 8px 16px;
+        color: #4a4f5a;
+        border: 1px solid #e2e5ea;
+        border-bottom: none;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #eef0f3;
+        color: #b8860b;
+        font-weight: 600;
+    }
+    .module-note {
+        background-color: #ffffff;
+        border-left: 3px solid #b8860b;
+        padding: 10px 14px;
+        border-radius: 4px;
+        font-size: 0.85rem;
+        color: #4a4f5a;
+        margin-bottom: 10px;
+        border: 1px solid #e2e5ea;
+    }
+    .source-badge {
+        display: inline-block;
+        background-color: #eef0f3;
+        color: #8a6400;
+        border-radius: 6px;
+        padding: 3px 10px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        margin-right: 6px;
+    }
+    .stButton>button {
+        background-color: #b8860b;
+        color: #ffffff;
+        border: none;
+        font-weight: 600;
+        border-radius: 6px;
+    }
+    thead tr th { background-color: #eef0f3 !important; color: #8a6400 !important; }
+</style>
+"""
 
 PLOTLY_TEMPLATE = "plotly_dark"
 PURPLE_WALL = "#ba68c8"
+PLOTLY_CONFIG = {"scrollZoom": False, "displayModeBar": True, "responsive": True}
+
+# ==================================================================================
+# DATA ENGINE CONSTANTS — HTTP HEADERS & MULTI-ENDPOINT FALLBACK ROUTING
+# ==================================================================================
+
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
+
+BINANCE_KLINES_ENDPOINTS = [
+    "https://api.binance.com/api/v3/klines",
+    "https://data-api.binance.vision/api/v3/klines",
+    "https://api.binance.us/api/v3/klines",
+]
+
+BINANCE_DEPTH_ENDPOINTS = [
+    "https://api.binance.com/api/v3/depth",
+    "https://data-api.binance.vision/api/v3/depth",
+    "https://api.binance.us/api/v3/depth",
+]
 
 # ==================================================================================
 # ASSET UNIVERSE
 # ==================================================================================
 
 CRYPTO_ASSETS = {
-    "Bitcoin (BTC/USDT)":            "BTCUSDT",
-    "Ethereum (ETH/USDT)":           "ETHUSDT",
+    "Bitcoin (BTC/USDT)": "BTCUSDT",
+    "Ethereum (ETH/USDT)": "ETHUSDT",
     "PAX Gold — Gold Proxy (PAXG/USDT)": "PAXGUSDT",
-    "Solana (SOL/USDT)":             "SOLUSDT",
-    "XRP (XRP/USDT)":                "XRPUSDT",
-    "BNB (BNB/USDT)":                "BNBUSDT",
+    "Solana (SOL/USDT)": "SOLUSDT",
+    "XRP (XRP/USDT)": "XRPUSDT",
+    "BNB (BNB/USDT)": "BNBUSDT",
 }
 
 FOREX_ASSETS = {
@@ -137,70 +218,68 @@ FOREX_ASSETS = {
 }
 
 MACRO_ASSETS = {
-    "US Dollar Index (DXY)":       "DX-Y.NYB",
-    "US 10-Year Treasury Yield":   "^TNX",
-    "Gold Futures (GC=F)":         "GC=F",
-    "Silver Futures (SI=F)":       "SI=F",
-    "S&P 500 Index":               "^GSPC",
+    "US Dollar Index (DXY)": "DX-Y.NYB",
+    "US 10-Year Treasury Yield": "^TNX",
+    "Gold Futures (GC=F)": "GC=F",
+    "Silver Futures (SI=F)": "SI=F",
+    "S&P 500 Index": "^GSPC",
 }
 
-# yfinance option-chain proxies for macro instruments without a listed chain of their own
 OPTIONS_PROXY_MAP = {
     "GC=F": "GLD",
     "SI=F": "SLV",
     "^GSPC": "SPY",
 }
 
-INTERVAL_CHOICES = ["1m", "2m", "3m", "4m", "5m", "15m", "30m", "1h", "2h", "3h", "4h",
-                    "1d", "1wk", "1mo", "1y"]
+INTERVAL_CHOICES = [
+    "1m", "2m", "3m", "4m", "5m", "15m", "30m", "1h", "2h", "3h", "4h",
+    "1d", "1wk", "1mo", "1y",
+]
 
-# Each interval is served from a canonical "base" granularity actually requested from
-# the venue, then (if needed) resampled with pandas to the exact target interval.
 INTERVAL_CONFIG = {
-    "1m":  {"base": "1m",  "resample": None},
-    "2m":  {"base": "1m",  "resample": "2min"},
-    "3m":  {"base": "1m",  "resample": "3min"},
-    "4m":  {"base": "1m",  "resample": "4min"},
-    "5m":  {"base": "5m",  "resample": None},
+    "1m": {"base": "1m", "resample": None},
+    "2m": {"base": "1m", "resample": "2min"},
+    "3m": {"base": "1m", "resample": "3min"},
+    "4m": {"base": "1m", "resample": "4min"},
+    "5m": {"base": "5m", "resample": None},
     "15m": {"base": "15m", "resample": None},
     "30m": {"base": "30m", "resample": None},
-    "1h":  {"base": "1h",  "resample": None},
-    "2h":  {"base": "1h",  "resample": "2h"},
-    "3h":  {"base": "1h",  "resample": "3h"},
-    "4h":  {"base": "4h",  "resample": None},
-    "1d":  {"base": "1d",  "resample": None},
-    "1wk": {"base": "1d",  "resample": "W"},
-    "1mo": {"base": "1d",  "resample": "ME"},
-    "1y":  {"base": "1d",  "resample": "YE"},
+    "1h": {"base": "1h", "resample": None},
+    "2h": {"base": "1h", "resample": "2h"},
+    "3h": {"base": "1h", "resample": "3h"},
+    "4h": {"base": "4h", "resample": None},
+    "1d": {"base": "1d", "resample": None},
+    "1wk": {"base": "1d", "resample": "W"},
+    "1mo": {"base": "1d", "resample": "ME"},
+    "1y": {"base": "1d", "resample": "YE"},
 }
 
-BINANCE_BASE_MAP = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d"}
-KRAKEN_BASE_MAP = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
-
+BINANCE_BASE_MAP = {
+    "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d",
+}
+KRAKEN_BASE_MAP = {
+    "1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440,
+}
 
 # ==================================================================================
 # SYMBOL / TICKER TRANSLATION HELPERS
 # ==================================================================================
 
 def binance_to_yf_ticker(symbol: str) -> str:
-    """Best-effort translation of a Binance USDT/USDC/BUSD pair to a yfinance crypto ticker."""
     for quote in ("USDT", "USDC", "BUSD"):
         if symbol.upper().endswith(quote):
-            base = symbol.upper()[: -len(quote)]
+            base = symbol.upper()[:-len(quote)]
             return f"{base}-USD"
     return symbol
-
 
 def forex_to_yf_ticker(symbol: str) -> str:
     return f"{symbol.upper()}=X"
 
-
 # ==================================================================================
-# LOW-LEVEL SOURCE FETCHERS  (each defensive & self-contained)
+# LOW-LEVEL SOURCE FETCHERS
 # ==================================================================================
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """Aggregate a finer-granularity OHLCV frame up to a coarser target interval."""
     if df is None or df.empty:
         return pd.DataFrame()
     agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
@@ -212,34 +291,36 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
             out = df.resample(legacy_alias.get(rule, rule)).agg(agg)
         except Exception:
             return df
-    out = out.dropna(subset=["Open", "High", "Low", "Close"])
-    return out
-
+    return out.dropna(subset=["Open", "High", "Low", "Close"])
 
 def fetch_binance_klines(symbol: str, base_key: str, limit: int = 1000) -> pd.DataFrame:
     interval = BINANCE_BASE_MAP.get(base_key)
     if interval is None:
         return pd.DataFrame()
-    try:
-        url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-        resp = requests.get(url, params=params, timeout=8)
-        resp.raise_for_status()
-        data = resp.json()
-        if not isinstance(data, list) or not data:
-            return pd.DataFrame()
-        cols = ["open_time", "Open", "High", "Low", "Close", "Volume", "close_time",
-                "qav", "trades", "tbbav", "tbqav", "ignore"]
-        df = pd.DataFrame(data, columns=cols)
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-        df = df.set_index("open_time")
-        for c in ["Open", "High", "Low", "Close", "Volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        return df
-    except Exception:
-        return pd.DataFrame()
 
+    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+    for url in BINANCE_KLINES_ENDPOINTS:
+        try:
+            resp = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=8)
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, list) or not data:
+                continue
+            cols = [
+                "open_time", "Open", "High", "Low", "Close", "Volume",
+                "close_time", "qav", "trades", "tbbav", "tbqav", "ignore",
+            ]
+            df = pd.DataFrame(data, columns=cols)
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+            df = df.set_index("open_time")
+            for c in ["Open", "High", "Low", "Close", "Volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            if not df.empty:
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame()
 
 def fetch_kraken_ohlc(pair: str, base_key: str) -> pd.DataFrame:
     interval = KRAKEN_BASE_MAP.get(base_key)
@@ -248,7 +329,7 @@ def fetch_kraken_ohlc(pair: str, base_key: str) -> pd.DataFrame:
     try:
         url = "https://api.kraken.com/0/public/OHLC"
         params = {"pair": pair.upper(), "interval": interval}
-        resp = requests.get(url, params=params, timeout=8)
+        resp = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=8)
         resp.raise_for_status()
         payload = resp.json()
         if payload.get("error"):
@@ -265,25 +346,26 @@ def fetch_kraken_ohlc(pair: str, base_key: str) -> pd.DataFrame:
         df = df.set_index("time")
         for c in ["Open", "High", "Low", "Close", "Volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        return df
+        return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
     except Exception:
         return pd.DataFrame()
 
-
 def fetch_yfinance_ohlcv(ticker: str, base_key: str) -> pd.DataFrame:
-    """yfinance fallback / macro source. Internally resolves any base_key to a valid
-    yfinance (period, interval) pair, resampling 4h from 60m bars since yfinance has
-    no native 4-hour granularity."""
-    period_map = {"1m": "7d", "5m": "60d", "15m": "60d", "30m": "60d",
-                  "1h": "730d", "4h": "730d", "1d": "10y"}
-    interval_map = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-                    "1h": "60m", "4h": "60m", "1d": "1d"}
+    period_map = {
+        "1m": "7d", "5m": "60d", "15m": "60d", "30m": "60d",
+        "1h": "730d", "4h": "730d", "1d": "10y",
+    }
+    interval_map = {
+        "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+        "1h": "60m", "4h": "60m", "1d": "1d",
+    }
     period = period_map.get(base_key, "1y")
     yf_interval = interval_map.get(base_key, "1d")
     try:
-        raw = yf.download(tickers=ticker, period=period, interval=yf_interval,
-                          progress=False, auto_adjust=False, threads=False)
+        raw = yf.download(
+            tickers=ticker, period=period, interval=yf_interval,
+            progress=False, auto_adjust=False, threads=False,
+        )
         if raw is None or raw.empty:
             return pd.DataFrame()
         if isinstance(raw.columns, pd.MultiIndex):
@@ -305,11 +387,8 @@ def fetch_yfinance_ohlcv(ticker: str, base_key: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_ohlcv(asset_class: str, symbol: str, yf_ticker: str, interval_key: str):
-    """Top-level dispatcher: routes to Binance / Kraken by asset class, falls back to
-    yfinance transparently on any empty/failed response. Returns (df, source_used)."""
     cfg = INTERVAL_CONFIG.get(interval_key, INTERVAL_CONFIG["1d"])
     base_key = cfg["base"]
     resample_rule = cfg["resample"]
@@ -339,13 +418,11 @@ def fetch_ohlcv(asset_class: str, symbol: str, yf_ticker: str, interval_key: str
 
     return df, source_used
 
-
 def get_last_price(asset_class: str, symbol: str, yf_ticker: str):
     df, _src = fetch_ohlcv(asset_class, symbol, yf_ticker, "1d")
     if df.empty:
         return None
     return float(df["Close"].iloc[-1])
-
 
 # ==================================================================================
 # L2 DOM ORDER BOOK ENGINE
@@ -353,27 +430,32 @@ def get_last_price(asset_class: str, symbol: str, yf_ticker: str):
 
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_order_book(asset_class: str, symbol: str) -> pd.DataFrame:
-    """Live Level-2 order book snapshot. Returns columns [price, qty, side]. Empty for
-    asset classes without a public L2 DOM (macro / index / futures via yfinance)."""
     try:
         if asset_class == "crypto":
-            url = "https://api.binance.com/api/v3/depth"
-            resp = requests.get(url, params={"symbol": symbol.upper(), "limit": 1000}, timeout=6)
-            resp.raise_for_status()
-            data = resp.json()
-            bids = pd.DataFrame(data.get("bids", []), columns=["price", "qty"])
-            asks = pd.DataFrame(data.get("asks", []), columns=["price", "qty"])
-            if bids.empty and asks.empty:
-                return pd.DataFrame()
-            bids = bids.astype(float)
-            asks = asks.astype(float)
-            bids["side"] = "bid"
-            asks["side"] = "ask"
-            return pd.concat([bids, asks], ignore_index=True)
+            params = {"symbol": symbol.upper(), "limit": 1000}
+            for url in BINANCE_DEPTH_ENDPOINTS:
+                try:
+                    resp = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=6)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    bids = pd.DataFrame(data.get("bids", []), columns=["price", "qty"])
+                    asks = pd.DataFrame(data.get("asks", []), columns=["price", "qty"])
+                    if bids.empty and asks.empty:
+                        continue
+                    bids = bids.astype(float)
+                    asks = asks.astype(float)
+                    bids["side"] = "bid"
+                    asks["side"] = "ask"
+                    combined = pd.concat([bids, asks], ignore_index=True)
+                    if not combined.empty:
+                        return combined
+                except Exception:
+                    continue
+            return pd.DataFrame()
 
         elif asset_class == "forex":
             url = "https://api.kraken.com/0/public/Depth"
-            resp = requests.get(url, params={"pair": symbol.upper(), "count": 500}, timeout=6)
+            resp = requests.get(url, params={"pair": symbol.upper(), "count": 500}, headers=HTTP_HEADERS, timeout=6)
             resp.raise_for_status()
             payload = resp.json()
             if payload.get("error"):
@@ -398,7 +480,6 @@ def fetch_order_book(asset_class: str, symbol: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-
 def format_dollars(value: float) -> str:
     try:
         value = float(value)
@@ -415,9 +496,19 @@ def format_dollars(value: float) -> str:
     else:
         return f"{sign}${value:,.0f}"
 
+def format_price_level(price: float) -> str:
+    try:
+        price = float(price)
+    except Exception:
+        return "0.00"
+    if abs(price) < 10:
+        return f"{price:,.5f}"
+    elif abs(price) < 1000:
+        return f"{price:,.3f}"
+    else:
+        return f"{price:,.2f}"
 
 def compute_level_dollar_volume(order_book_df: pd.DataFrame, level_price: float, tolerance_pct: float = 0.15) -> float:
-    """Sums the resting limit-order dollar volume within +/- tolerance_pct of a price level."""
     if order_book_df.empty or level_price <= 0:
         return 0.0
     tol = level_price * (tolerance_pct / 100.0)
@@ -427,12 +518,18 @@ def compute_level_dollar_volume(order_book_df: pd.DataFrame, level_price: float,
         return 0.0
     return float((subset["price"] * subset["qty"]).sum())
 
-
-def isolate_institutional_walls(order_book_df: pd.DataFrame, percentile: float = 80.0, top_n_per_side: int = 5) -> pd.DataFrame:
-    """Filters retail-sized book levels, isolating top-percentile ('bank') resting orders."""
+def isolate_institutional_walls(
+    order_book_df: pd.DataFrame, current_price: float, percentile: float = 80.0,
+    top_n_per_side: int = 5, max_distance_pct: float = 25.0
+) -> pd.DataFrame:
     if order_book_df.empty:
         return pd.DataFrame()
     df = order_book_df.copy()
+    if current_price and current_price > 0:
+        band = current_price * (max_distance_pct / 100.0)
+        df = df[(df["price"] >= current_price - band) & (df["price"] <= current_price + band)]
+    if df.empty:
+        return pd.DataFrame()
     df["dollar_value"] = df["price"] * df["qty"]
     threshold = np.percentile(df["dollar_value"], percentile)
     walls = df[df["dollar_value"] >= threshold].copy()
@@ -442,10 +539,7 @@ def isolate_institutional_walls(order_book_df: pd.DataFrame, percentile: float =
     ask_walls = walls[walls["side"] == "ask"].sort_values("dollar_value", ascending=False).head(top_n_per_side)
     return pd.concat([bid_walls, ask_walls], ignore_index=True).sort_values("dollar_value", ascending=False)
 
-
 def compute_bank_anchor_pnl(walls_df: pd.DataFrame, current_price: float) -> pd.DataFrame:
-    """Estimates unrealized PnL% of each institutional wall treated as a bank's resting
-    price anchor, and classifies whether the position is expanding profit or unwinding."""
     if walls_df.empty or current_price <= 0:
         return pd.DataFrame()
 
@@ -474,7 +568,6 @@ def compute_bank_anchor_pnl(walls_df: pd.DataFrame, current_price: float) -> pd.
     out["status"] = out["pnl_pct"].apply(status)
     return out.sort_values("dollar_value", ascending=False)
 
-
 # ==================================================================================
 # SHARED TECHNICAL UTILITIES
 # ==================================================================================
@@ -489,14 +582,12 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
 
-
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high_low = df["High"] - df["Low"]
     high_close = (df["High"] - df["Close"].shift()).abs()
     low_close = (df["Low"] - df["Close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period, min_periods=1).mean()
-
 
 def safe_pct(a, b):
     try:
@@ -506,6 +597,25 @@ def safe_pct(a, b):
     except Exception:
         return 0.0
 
+def price_axis_range(*series_list, pad_pct: float = 0.08):
+    values = []
+    for s in series_list:
+        if s is None:
+            continue
+        s = pd.Series(s).dropna()
+        if not s.empty:
+            values.append(s)
+    if not values:
+        return None
+    combined = pd.concat(values)
+    lo = float(combined.min())
+    hi = float(combined.max())
+    if hi <= lo:
+        hi = lo * 1.01 if lo > 0 else lo + 1.0
+    pad = (hi - lo) * pad_pct
+    if pad <= 0:
+        pad = abs(hi) * 0.01 if hi != 0 else 1.0
+    return [lo - pad, hi + pad]
 
 # ==================================================================================
 # MODULE 1 — INSTITUTIONAL ORDER FLOW & LIQUIDITY HEATMAP
@@ -525,9 +635,7 @@ def detect_swings(df: pd.DataFrame, window: int = 5):
             swing_lows.append((df.index[i], float(lows[i])))
     return swing_highs, swing_lows
 
-
 def detect_fvg(df: pd.DataFrame):
-    """Fair Value Gap: 3-candle imbalance pattern."""
     bullish, bearish = [], []
     highs = df["High"].values
     lows = df["Low"].values
@@ -545,12 +653,13 @@ def detect_fvg(df: pd.DataFrame):
             })
     return bullish, bearish
 
-
 def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, asset_class: str, label: str):
-    st.markdown('<div class="module-note">Swing-point liquidity pools (BSL/SSL) and Fair Value Gap '
-                'imbalance zones from price-action structure, dynamically annotated with live resting '
-                '$ order-book volume, institutional bank-wall isolation, and a Bank Anchor PnL Tracker.</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        '<div class="module-note">Swing-point liquidity pools (BSL/SSL) and Fair Value Gap '
+        'imbalance zones from price-action structure, dynamically annotated with live resting '
+        '$ order-book volume, institutional bank-wall isolation, and a Bank Anchor PnL Tracker.</div>',
+        unsafe_allow_html=True,
+    )
 
     if len(df) < 15:
         st.warning("Not enough bars returned for this selection to compute liquidity structure. Try a longer interval.")
@@ -568,14 +677,18 @@ def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, asset
 
     has_dom = asset_class in ("crypto", "forex") and not order_book_df.empty
     if not has_dom:
-        st.info("Live L2 DOM order book unavailable for this instrument right now (macro/index assets have no "
-                "public order book, or the live feed is temporarily unreachable) — $ volume annotations and "
-                "institutional wall isolation are skipped. Swing/FVG structure is still fully computed from "
-                "price action below.")
+        st.info(
+            "Live L2 DOM order book unavailable for this instrument right now (macro/index assets have no "
+            "public order book, or the live feed is temporarily unreachable) — $ volume annotations and "
+            "institutional wall isolation are skipped. Swing/FVG structure is still fully computed from "
+            "price action below."
+        )
     else:
-        st.markdown(f'<span class="source-badge">🟢 LIVE L2 DOM CONNECTED</span> '
-                    f'<span style="color:#8b90a0; font-size:0.8rem;">{len(order_book_df):,} resting order levels loaded</span>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            f'<span class="source-badge">🟢 LIVE L2 DOM CONNECTED</span> '
+            f'<span style="color:#8b90a0; font-size:0.8rem;">{len(order_book_df):,} resting order levels loaded</span>',
+            unsafe_allow_html=True,
+        )
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("BSL Pools (Swing Highs)", len(swing_highs))
@@ -594,45 +707,42 @@ def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, asset
 
     for t, price in recent_highs:
         dv = compute_level_dollar_volume(order_book_df, price, tolerance) if has_dom else 0.0
-        annot_text = f"BSL: {format_dollars(dv)}" if has_dom else "BSL"
-        fig.add_shape(type="line", x0=t, x1=df.index[-1], y0=price, y1=price,
-                       line=dict(color="#ff5252", width=1, dash="dot"))
-        fig.add_annotation(x=df.index[-1], y=price, text=annot_text, showarrow=False,
-                            font=dict(color="#ff5252", size=10), xanchor="left")
+        annot_text = f"BSL @ {format_price_level(price)} ({format_dollars(dv)})" if has_dom else f"BSL @ {format_price_level(price)}"
+        fig.add_shape(type="line", x0=t, x1=df.index[-1], y0=price, y1=price, line=dict(color="#ff5252", width=1, dash="dot"))
+        fig.add_annotation(x=df.index[-1], y=price, text=annot_text, showarrow=False, font=dict(color="#ff5252", size=10), xanchor="left")
 
     for t, price in recent_lows:
         dv = compute_level_dollar_volume(order_book_df, price, tolerance) if has_dom else 0.0
-        annot_text = f"SSL: {format_dollars(dv)}" if has_dom else "SSL"
-        fig.add_shape(type="line", x0=t, x1=df.index[-1], y0=price, y1=price,
-                       line=dict(color="#00e5ff", width=1, dash="dot"))
-        fig.add_annotation(x=df.index[-1], y=price, text=annot_text, showarrow=False,
-                            font=dict(color="#00e5ff", size=10), xanchor="left")
+        annot_text = f"SSL @ {format_price_level(price)} ({format_dollars(dv)})" if has_dom else f"SSL @ {format_price_level(price)}"
+        fig.add_shape(type="line", x0=t, x1=df.index[-1], y0=price, y1=price, line=dict(color="#00e5ff", width=1, dash="dot"))
+        fig.add_annotation(x=df.index[-1], y=price, text=annot_text, showarrow=False, font=dict(color="#00e5ff", size=10), xanchor="left")
 
     for zone in bullish_fvg[-max_zones:]:
-        fig.add_shape(type="rect", x0=zone["start"], x1=df.index[-1], y0=zone["bottom"], y1=zone["top"],
-                       fillcolor="rgba(38,166,154,0.18)", line=dict(width=0))
+        fig.add_shape(type="rect", x0=zone["start"], x1=df.index[-1], y0=zone["bottom"], y1=zone["top"], fillcolor="rgba(38,166,154,0.18)", line=dict(width=0))
     for zone in bearish_fvg[-max_zones:]:
-        fig.add_shape(type="rect", x0=zone["start"], x1=df.index[-1], y0=zone["bottom"], y1=zone["top"],
-                       fillcolor="rgba(239,83,80,0.18)", line=dict(width=0))
+        fig.add_shape(type="rect", x0=zone["start"], x1=df.index[-1], y0=zone["bottom"], y1=zone["top"], fillcolor="rgba(239,83,80,0.18)", line=dict(width=0))
 
     walls_df = pd.DataFrame()
     if has_dom:
-        walls_df = isolate_institutional_walls(order_book_df, percentile=wall_pctl, top_n_per_side=5)
+        walls_df = isolate_institutional_walls(order_book_df, current_price, percentile=wall_pctl, top_n_per_side=5)
         for _, w in walls_df.iterrows():
-            fig.add_shape(type="line", x0=df.index[0], x1=df.index[-1], y0=w["price"], y1=w["price"],
-                           line=dict(color=PURPLE_WALL, width=2, dash="dash"))
+            fig.add_shape(type="line", x0=df.index[0], x1=df.index[-1], y0=w["price"], y1=w["price"], line=dict(color=PURPLE_WALL, width=2, dash="dash"))
             side_tag = "BID WALL" if w["side"] == "bid" else "ASK WALL"
-            fig.add_annotation(x=df.index[len(df)//2], y=w["price"],
-                                text=f"🏦 {side_tag}: {format_dollars(w['dollar_value'])}",
-                                showarrow=False, font=dict(color=PURPLE_WALL, size=10),
-                                bgcolor="rgba(11,14,20,0.7)")
+            fig.add_annotation(
+                x=df.index[len(df)//2], y=w["price"],
+                text=f"🏦 {side_tag} @ {format_price_level(w['price'])}: {format_dollars(w['dollar_value'])}",
+                showarrow=False, font=dict(color=PURPLE_WALL, size=10), bgcolor="rgba(11,14,20,0.7)"
+            )
+
+    y_range = price_axis_range(df["Low"], df["High"], pad_pct=0.10)
 
     fig.update_layout(
-        template=PLOTLY_TEMPLATE, height=680, xaxis_rangeslider_visible=False,
+        template=PLOTLY_TEMPLATE, height=680, xaxis_rangeslider_visible=False, dragmode="pan",
         title=f"{label} — Liquidity Pools, Fair Value Gaps & Institutional Bank Walls",
         margin=dict(l=10, r=10, t=50, b=10),
+        yaxis=dict(range=y_range, autorange=False if y_range else True),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
     if has_dom:
         st.subheader("🏦 Bank Anchor PnL Tracker")
@@ -662,8 +772,7 @@ def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, asset
             display_df["Unrealized PnL %"] = display_df["Unrealized PnL %"].round(2)
             st.dataframe(display_df, use_container_width=True, hide_index=True)
         else:
-            st.info("No institutional-sized walls detected above the selected percentile threshold in the "
-                   "current order book snapshot. Try lowering the percentile slider above.")
+            st.info("No institutional-sized walls detected above the selected percentile threshold within a realistic band of the current price.")
 
     with st.expander("📋 Nearest Liquidity Levels to Current Price"):
         all_levels = [("BSL", t, p) for t, p in swing_highs] + [("SSL", t, p) for t, p in swing_lows]
@@ -672,12 +781,12 @@ def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, asset
             lvl_df["Distance %"] = lvl_df["Price"].apply(lambda p: safe_pct(p, current_price))
             if has_dom:
                 lvl_df["$ Volume Nearby"] = lvl_df["Price"].apply(
-                    lambda p: format_dollars(compute_level_dollar_volume(order_book_df, p, tolerance)))
+                    lambda p: format_dollars(compute_level_dollar_volume(order_book_df, p, tolerance))
+                )
             lvl_df = lvl_df.reindex(lvl_df["Distance %"].abs().sort_values().index).head(10)
             st.dataframe(lvl_df.set_index("Timestamp"), use_container_width=True)
         else:
             st.info("Not enough data to identify swing liquidity levels for the selected window.")
-
 
 # ==================================================================================
 # MODULE 2 — QUANTITATIVE ML CLASSIFIER
@@ -699,15 +808,16 @@ def build_ml_features(df: pd.DataFrame) -> pd.DataFrame:
     feat["hl_range"] = (df["High"] - df["Low"]) / df["Close"]
     return feat
 
-
 def render_ml_module(df: pd.DataFrame, label: str):
-    st.markdown('<div class="module-note">A RandomForest classifier trained live on engineered technical '
-                'features (RSI, ATR, volatility, MA ratios, volume delta, momentum) to estimate the '
-                'probability of the next-N-bar directional move.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="module-note">A RandomForest classifier trained live on engineered technical '
+        'features (RSI, ATR, volatility, MA ratios, volume delta, momentum) to estimate the '
+        'probability of the next-N-bar directional move.</div>',
+        unsafe_allow_html=True,
+    )
 
     if len(df) < 80:
-        st.warning("Insufficient historical data for reliable ML training. Select a longer interval / lower "
-                   "timeframe granularity to accumulate more bars.")
+        st.warning("Insufficient historical data for reliable ML training. Select a longer interval / lower timeframe granularity.")
         return
 
     horizon = st.slider("Prediction Horizon (bars ahead)", 1, 10, 3, key="ml_horizon")
@@ -716,19 +826,19 @@ def render_ml_module(df: pd.DataFrame, label: str):
     feat = build_ml_features(df)
     future_return = df["Close"].shift(-horizon) / df["Close"] - 1
 
-    labels = pd.Series(1, index=df.index)  # 1 = Hold
-    labels[future_return > threshold] = 2   # Buy
-    labels[future_return < -threshold] = 0  # Sell
+    labels = pd.Series(1, index=df.index)
+    labels[future_return > threshold] = 2
+    labels[future_return < -threshold] = 0
 
     data = feat.copy()
     data["target"] = labels
     data = data.dropna()
 
     if len(data) < 50 or data["target"].nunique() < 2:
-        st.warning("Not enough class diversity in the selected sample to train a robust classifier. Try adjusting the threshold or horizon.")
+        st.warning("Not enough class diversity in the selected sample to train a robust classifier.")
         return
 
-    feature_cols = [c for c in feat.columns]
+    feature_cols = list(feat.columns)
     X = data[feature_cols]
     y = data["target"]
 
@@ -772,22 +882,18 @@ def render_ml_module(df: pd.DataFrame, label: str):
     with col_a:
         fi = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=True)
         fig_fi = go.Figure(go.Bar(x=fi.values, y=fi.index, orientation="h", marker_color="#f0b90b"))
-        fig_fi.update_layout(template=PLOTLY_TEMPLATE, height=420, title="Feature Importance",
-                              margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig_fi, use_container_width=True)
+        fig_fi.update_layout(template=PLOTLY_TEMPLATE, height=420, title="Feature Importance", margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
+        st.plotly_chart(fig_fi, use_container_width=True, config=PLOTLY_CONFIG)
 
     with col_b:
         fig_proba = go.Figure(go.Pie(
             labels=["Sell", "Hold", "Buy"], values=[sell_p, hold_p, buy_p],
             marker=dict(colors=["#ef5350", "#f0b90b", "#26a69a"]), hole=0.55,
         ))
-        fig_proba.update_layout(template=PLOTLY_TEMPLATE, height=420, title="Directional Probability",
-                                 margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig_proba, use_container_width=True)
+        fig_proba.update_layout(template=PLOTLY_TEMPLATE, height=420, title="Directional Probability", margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(fig_proba, use_container_width=True, config=PLOTLY_CONFIG)
 
-    st.caption(f"Model trained on {len(X_train)} bars, validated on {len(X_test)} out-of-sample bars for {label}. "
-               "This is a statistical estimate, not investment advice.")
-
+    st.caption(f"Model trained on {len(X_train)} bars, validated on {len(X_test)} out-of-sample bars for {label}.")
 
 # ==================================================================================
 # MODULE 3 — CROSS-ASSET CORRELATION & MACRO YIELD MATRIX
@@ -802,12 +908,12 @@ def fetch_macro_series(yf_ticker: str, lookback_days: int = 180) -> pd.Series:
     df = df[df.index >= cutoff]
     return df["Close"]
 
-
 def render_correlation_module(symbol: str, yf_ticker: str, asset_class: str, label: str):
-    st.markdown('<div class="module-note">Cross-asset relationships between the active instrument (or Gold, '
-                'when the active instrument already is one of the macro legs), the US Dollar Index, 10-Year '
-                'Treasury Yields, and Bitcoin — key macro drivers for positioning. Sourced via yfinance.</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        '<div class="module-note">Cross-asset relationships between the active instrument, '
+        'the US Dollar Index, 10-Year Treasury Yields, and Bitcoin — key macro drivers.</div>',
+        unsafe_allow_html=True,
+    )
 
     lookback = st.slider("Correlation Lookback (Days)", 30, 730, 180, step=10, key="corr_lookback")
 
@@ -848,14 +954,13 @@ def render_correlation_module(symbol: str, yf_ticker: str, asset_class: str, lab
             series_dict[m_label] = s
 
     if fetch_errors:
-        st.warning(f"Could not retrieve live data for: {', '.join(fetch_errors)}. Displaying available assets only.")
+        st.warning(f"Could not retrieve live data for: {', '.join(fetch_errors)}.")
 
     if len(series_dict) < 2:
-        st.error("Insufficient macro data available to compute correlations right now. Please try again shortly.")
+        st.error("Insufficient macro data available to compute correlations right now.")
         return
 
-    combined = pd.DataFrame(series_dict).dropna(how="all")
-    combined = combined.ffill().dropna()
+    combined = pd.DataFrame(series_dict).dropna(how="all").ffill().dropna()
 
     if combined.empty or len(combined) < 10:
         st.warning("Not enough overlapping historical data across assets for this lookback window.")
@@ -868,9 +973,8 @@ def render_correlation_module(symbol: str, yf_ticker: str, asset_class: str, lab
         colorscale="RdBu", zmin=-1, zmax=1, zmid=0,
         text=np.round(corr_matrix.values, 2), texttemplate="%{text}",
     ))
-    fig_heat.update_layout(template=PLOTLY_TEMPLATE, height=460, title="Cross-Asset Correlation Matrix",
-                            margin=dict(l=10, r=10, t=50, b=10))
-    st.plotly_chart(fig_heat, use_container_width=True)
+    fig_heat.update_layout(template=PLOTLY_TEMPLATE, height=460, title="Cross-Asset Correlation Matrix", margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
+    st.plotly_chart(fig_heat, use_container_width=True, config=PLOTLY_CONFIG)
 
     st.subheader(f"Rolling 30-Day Correlation vs {anchor_label}")
     if anchor_label in combined.columns:
@@ -880,22 +984,18 @@ def render_correlation_module(symbol: str, yf_ticker: str, asset_class: str, lab
             if col == anchor_label:
                 continue
             rolling_corr = combined[anchor_label].rolling(rolling_window).corr(combined[col])
-            fig_roll.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr, mode="lines",
-                                           name=f"{anchor_label} vs {col}"))
+            fig_roll.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr, mode="lines", name=f"{anchor_label} vs {col}"))
         fig_roll.add_hline(y=0, line_dash="dot", line_color="#666")
-        fig_roll.update_layout(template=PLOTLY_TEMPLATE, height=420,
-                                title=f"Rolling {rolling_window}-Day Correlation",
-                                margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig_roll, use_container_width=True)
+        fig_roll.update_layout(template=PLOTLY_TEMPLATE, height=420, title=f"Rolling {rolling_window}-Day Correlation", margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
+        st.plotly_chart(fig_roll, use_container_width=True, config=PLOTLY_CONFIG)
 
     with st.expander("📈 Normalized Price Performance (Rebased to 100)"):
         rebased = combined / combined.iloc[0] * 100
         fig_reb = go.Figure()
         for col in rebased.columns:
             fig_reb.add_trace(go.Scatter(x=rebased.index, y=rebased[col], mode="lines", name=col))
-        fig_reb.update_layout(template=PLOTLY_TEMPLATE, height=420, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig_reb, use_container_width=True)
-
+        fig_reb.update_layout(template=PLOTLY_TEMPLATE, height=420, margin=dict(l=10, r=10, t=30, b=10), dragmode="pan")
+        st.plotly_chart(fig_reb, use_container_width=True, config=PLOTLY_CONFIG)
 
 # ==================================================================================
 # MODULE 4 — VOLUME DELTA & FOOTPRINT IMBALANCE
@@ -911,17 +1011,16 @@ def compute_volume_delta(df: pd.DataFrame) -> pd.DataFrame:
     out["cvd"] = out["delta"].cumsum()
     return out
 
-
 def render_volume_delta_module(df: pd.DataFrame, label: str, source_used: str):
-    st.markdown('<div class="module-note">Order-flow reconstruction: buying vs. selling volume estimated '
-                'from real exchange-reported volume weighted by intra-bar close position, aggregated into '
-                'Cumulative Volume Delta (CVD). Historical L2 DOM depth is not retained by any venue, so '
-                'per-bar buy/sell attribution is derived from executed volume and price action rather than '
-                'a resting order book replay.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="module-note">Order-flow reconstruction: buying vs. selling volume estimated '
+        'from real exchange-reported volume weighted by intra-bar close position, aggregated into '
+        'Cumulative Volume Delta (CVD).</div>',
+        unsafe_allow_html=True,
+    )
 
     if df["Volume"].sum() == 0:
-        st.warning("No volume data returned for this instrument/feed — Volume Delta analysis requires "
-                   "non-zero volume.")
+        st.warning("No volume data returned for this instrument — Volume Delta requires non-zero volume.")
 
     vd = compute_volume_delta(df)
     z_thresh = st.slider("Imbalance Spike Sensitivity (Z-score)", 1.0, 4.0, 2.0, step=0.25, key="vd_z")
@@ -953,12 +1052,17 @@ def render_volume_delta_module(df: pd.DataFrame, label: str, source_used: str):
 
     bar_colors = np.where(vd["delta"] >= 0, "#26a69a", "#ef5350")
     fig.add_trace(go.Bar(x=vd.index, y=vd["delta"], marker_color=bar_colors, name="Delta"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=vd.index, y=vd["cvd"], mode="lines", name="CVD",
-                              line=dict(color="#00e5ff", width=2)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=vd.index, y=vd["cvd"], mode="lines", name="CVD", line=dict(color="#00e5ff", width=2)), row=3, col=1)
 
-    fig.update_layout(template=PLOTLY_TEMPLATE, height=780, showlegend=False,
-                       xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=50, b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    price_range = price_axis_range(vd["Low"], vd["High"], pad_pct=0.06)
+    if price_range:
+        fig.update_yaxes(range=price_range, row=1, col=1)
+
+    fig.update_layout(
+        template=PLOTLY_TEMPLATE, height=780, showlegend=False,
+        xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=50, b=10), dragmode="pan",
+    )
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
     with st.expander("⚠️ Detected Order Flow Divergence / Imbalance Events"):
         if not spikes.empty:
@@ -967,26 +1071,21 @@ def render_volume_delta_module(df: pd.DataFrame, label: str, source_used: str):
         else:
             st.info("No significant volume imbalance spikes detected at the current sensitivity level.")
 
-
 # ==================================================================================
 # MODULE 5 — OPTIONS GAMMA EXPOSURE (GEX) & MAX PAIN ENGINE
 # ==================================================================================
 
 def bs_gamma(spot, strike, t_years, iv, r=0.045):
-    """Black-Scholes gamma."""
     try:
         if t_years <= 0 or iv <= 0 or spot <= 0 or strike <= 0:
             return 0.0
         d1 = (math.log(spot / strike) + (r + 0.5 * iv ** 2) * t_years) / (iv * math.sqrt(t_years))
         pdf = math.exp(-0.5 * d1 ** 2) / math.sqrt(2 * math.pi)
-        gamma = pdf / (spot * iv * math.sqrt(t_years))
-        return gamma
+        return pdf / (spot * iv * math.sqrt(t_years))
     except Exception:
         return 0.0
 
-
 def simulate_gex(spot: float, n_strikes: int = 25, iv: float = 0.18, days_to_expiry: int = 30, seed: int = 7):
-    """Mathematical GEX simulation for assets without a native listed options market."""
     rng = np.random.default_rng(seed)
     spacing = spot * 0.01
     strikes = np.round(spot + np.arange(-n_strikes, n_strikes + 1) * spacing, 2)
@@ -1007,7 +1106,6 @@ def simulate_gex(spot: float, n_strikes: int = 25, iv: float = 0.18, days_to_exp
         "call_gex": call_gex, "put_gex": put_gex, "net_gex": call_gex + put_gex,
     })
 
-
 def compute_max_pain_from_sim(gex_df: pd.DataFrame):
     try:
         strikes = gex_df["strike"].values
@@ -1024,10 +1122,8 @@ def compute_max_pain_from_sim(gex_df: pd.DataFrame):
     except Exception:
         return None, pd.DataFrame()
 
-
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_options_chain(proxy_symbol: str):
-    """Attempt to pull a real yfinance options chain. Returns (calls, puts, expiry, spot) or None."""
     try:
         tk = yf.Ticker(proxy_symbol)
         expiries = tk.options
@@ -1043,7 +1139,6 @@ def fetch_options_chain(proxy_symbol: str):
         return calls, puts, expiry, spot
     except Exception:
         return None
-
 
 def gex_from_chain(calls: pd.DataFrame, puts: pd.DataFrame, spot: float, days_to_expiry: int):
     t_years = max(days_to_expiry, 1) / 365.0
@@ -1064,9 +1159,7 @@ def gex_from_chain(calls: pd.DataFrame, puts: pd.DataFrame, spot: float, days_to
     merged = pd.merge(c_proc, p_proc, on="strike", how="outer", suffixes=("_call", "_put")).fillna(0)
     merged["net_gex"] = merged["gex_call"] + merged["gex_put"]
     merged = merged.rename(columns={"gex_call": "call_gex", "gex_put": "put_gex"})
-    merged = merged.sort_values("strike").reset_index(drop=True)
-    return merged
-
+    return merged.sort_values("strike").reset_index(drop=True)
 
 def compute_max_pain(calls: pd.DataFrame, puts: pd.DataFrame):
     try:
@@ -1082,13 +1175,12 @@ def compute_max_pain(calls: pd.DataFrame, puts: pd.DataFrame):
     except Exception:
         return None, pd.DataFrame()
 
-
 def render_gex_module(symbol: str, yf_ticker: str, asset_class: str, label: str):
-    st.markdown('<div class="module-note">Gamma Exposure (GEX) profile identifying dealer positioning, '
-                'volatility pin zones, and the gamma flip level. Uses a live listed options chain via '
-                'yfinance where a liquid proxy exists (Gold/Silver futures → GLD/SLV, S&P 500 → SPY), '
-                'or a Black-Scholes gamma simulation engine for crypto/forex assets without one.</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        '<div class="module-note">Gamma Exposure (GEX) profile identifying dealer positioning, '
+        'volatility pin zones, and the gamma flip level.</div>',
+        unsafe_allow_html=True,
+    )
 
     proxy = OPTIONS_PROXY_MAP.get(yf_ticker) if asset_class == "macro" else None
     chain_result = fetch_options_chain(proxy) if proxy else None
@@ -1105,8 +1197,7 @@ def render_gex_module(symbol: str, yf_ticker: str, asset_class: str, label: str)
     else:
         spot = get_last_price(asset_class, symbol, yf_ticker)
         if spot is None:
-            st.error(f"Could not retrieve a live spot price for {label} to calibrate the GEX engine. "
-                     "Please try refreshing data.")
+            st.error(f"Could not retrieve a live spot price for {label} to calibrate the GEX engine.")
             return
         dte = st.slider("Simulated Days to Expiry", 1, 90, 30, key="gex_dte")
         iv_assumed = st.slider("Assumed Implied Volatility (%)", 5, 80, 18, key="gex_iv") / 100
@@ -1136,19 +1227,20 @@ def render_gex_module(symbol: str, yf_ticker: str, asset_class: str, label: str)
     if max_pain is not None:
         fig.add_vline(x=max_pain, line_dash="dashdot", line_color=PURPLE_WALL, annotation_text="Max Pain", annotation_position="top")
 
-    fig.update_layout(template=PLOTLY_TEMPLATE, height=560, barmode="relative",
-                       title=f"{label} — Gamma Exposure Profile by Strike",
-                       xaxis_title="Strike", yaxis_title="Gamma Exposure",
-                       margin=dict(l=10, r=10, t=50, b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        template=PLOTLY_TEMPLATE, height=560, barmode="relative",
+        title=f"{label} — Gamma Exposure Profile by Strike",
+        xaxis_title="Strike", yaxis_title="Gamma Exposure",
+        margin=dict(l=10, r=10, t=50, b=10), dragmode="pan",
+    )
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
     interpretation = (
-        "Positive net GEX suggests dealers are net long gamma → they hedge by buying dips / selling rallies, "
-        "typically dampening volatility. Negative net GEX suggests dealers are net short gamma → hedging "
-        "flows can amplify moves, increasing realized volatility, especially below the gamma flip level."
+        "Positive net GEX suggests dealers are net long gamma → they hedge by buying dips / selling rallies. "
+        "Negative net GEX suggests dealers are net short gamma → hedging flows can amplify moves, "
+        "increasing realized volatility, especially below the gamma flip level."
     )
     st.info(interpretation)
-
 
 # ==================================================================================
 # MODULE 6 — INSTITUTIONAL EXECUTION ALGORITHMS (VWAP / TWAP / ICEBERG)
@@ -1175,7 +1267,6 @@ def compute_vwap_bands(df: pd.DataFrame):
     out["twap"] = typical_price.expanding().mean()
     return out
 
-
 def detect_icebergs(df: pd.DataFrame, z_thresh: float = 2.5):
     out = df.copy()
     price_range = (out["High"] - out["Low"]).replace(0, np.nan)
@@ -1186,15 +1277,15 @@ def detect_icebergs(df: pd.DataFrame, z_thresh: float = 2.5):
     icebergs = out[(out["vr_z"] >= z_thresh)]
     return out, icebergs
 
-
 def render_execution_module(df: pd.DataFrame, label: str):
-    st.markdown('<div class="module-note">Institutional execution benchmarks — VWAP with statistical '
-                'deviation bands, TWAP baseline, and detection of probable iceberg / hidden-order clusters '
-                'via volume-to-range anomaly analysis.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="module-note">Institutional execution benchmarks — VWAP with statistical '
+        'deviation bands, TWAP baseline, and detection of probable iceberg / hidden-order clusters.</div>',
+        unsafe_allow_html=True,
+    )
 
     if df["Volume"].sum() == 0:
-        st.warning("No volume data returned for this instrument/feed — VWAP and iceberg detection require "
-                   "non-zero volume. TWAP will still be computed from price only.")
+        st.warning("No volume data returned for this instrument — VWAP and iceberg detection require non-zero volume.")
 
     vwap_df = compute_vwap_bands(df)
     z_thresh = st.slider("Iceberg Detection Sensitivity (Z-score)", 1.5, 4.0, 2.5, step=0.25, key="ice_z")
@@ -1215,18 +1306,12 @@ def render_execution_module(df: pd.DataFrame, label: str):
         x=vwap_df.index, open=vwap_df["Open"], high=vwap_df["High"], low=vwap_df["Low"], close=vwap_df["Close"],
         name=label, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
     ))
-    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap"], mode="lines", name="VWAP",
-                              line=dict(color="#f0b90b", width=2)))
-    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["twap"], mode="lines", name="TWAP",
-                              line=dict(color=PURPLE_WALL, width=2, dash="dash")))
-    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap_u1"], mode="lines", name="+1 SD",
-                              line=dict(color="rgba(38,166,154,0.6)", width=1)))
-    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap_u2"], mode="lines", name="+2 SD",
-                              line=dict(color="rgba(38,166,154,0.35)", width=1)))
-    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap_l1"], mode="lines", name="-1 SD",
-                              line=dict(color="rgba(239,83,80,0.6)", width=1)))
-    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap_l2"], mode="lines", name="-2 SD",
-                              line=dict(color="rgba(239,83,80,0.35)", width=1)))
+    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap"], mode="lines", name="VWAP", line=dict(color="#f0b90b", width=2)))
+    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["twap"], mode="lines", name="TWAP", line=dict(color=PURPLE_WALL, width=2, dash="dash")))
+    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap_u1"], mode="lines", name="+1 SD", line=dict(color="rgba(38,166,154,0.6)", width=1)))
+    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap_u2"], mode="lines", name="+2 SD", line=dict(color="rgba(38,166,154,0.35)", width=1)))
+    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap_l1"], mode="lines", name="-1 SD", line=dict(color="rgba(239,83,80,0.6)", width=1)))
+    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap_l2"], mode="lines", name="-2 SD", line=dict(color="rgba(239,83,80,0.35)", width=1)))
 
     if not icebergs.empty:
         fig.add_trace(go.Scatter(
@@ -1234,17 +1319,23 @@ def render_execution_module(df: pd.DataFrame, label: str):
             marker=dict(color="#00e5ff", size=10, symbol="diamond"),
         ))
 
-    fig.update_layout(template=PLOTLY_TEMPLATE, height=650, xaxis_rangeslider_visible=False,
-                       title=f"{label} — VWAP / TWAP Execution Benchmarks & Iceberg Detection",
-                       margin=dict(l=10, r=10, t=50, b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    price_range = price_axis_range(
+        vwap_df["Low"], vwap_df["High"], vwap_df["vwap_l2"], vwap_df["vwap_u2"], pad_pct=0.06
+    )
+
+    fig.update_layout(
+        template=PLOTLY_TEMPLATE, height=650, xaxis_rangeslider_visible=False, dragmode="pan",
+        title=f"{label} — VWAP / TWAP Execution Benchmarks & Iceberg Detection",
+        margin=dict(l=10, r=10, t=50, b=10),
+        yaxis=dict(range=price_range, autorange=False if price_range else True),
+    )
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
     fig_vol = go.Figure(go.Bar(x=vwap_df.index, y=vwap_df["Volume"], marker_color="#5c6bc0", name="Volume"))
     if not icebergs.empty:
         fig_vol.add_trace(go.Bar(x=icebergs.index, y=icebergs["Volume"], marker_color="#00e5ff", name="Iceberg Volume"))
-    fig_vol.update_layout(template=PLOTLY_TEMPLATE, height=280, title="Volume Profile & Anomaly Bars",
-                           margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig_vol, use_container_width=True)
+    fig_vol.update_layout(template=PLOTLY_TEMPLATE, height=280, title="Volume Profile & Anomaly Bars", margin=dict(l=10, r=10, t=40, b=10), dragmode="pan")
+    st.plotly_chart(fig_vol, use_container_width=True, config=PLOTLY_CONFIG)
 
     with st.expander("🧊 Detected Iceberg / Hidden Order Clusters"):
         if not icebergs.empty:
@@ -1253,13 +1344,23 @@ def render_execution_module(df: pd.DataFrame, label: str):
         else:
             st.info("No statistically significant iceberg clusters detected at the current sensitivity level.")
 
-
 # ==================================================================================
-# SIDEBAR — ASSET SELECTION & DATA ENGINE CONTROLS
+# SIDEBAR — THEME TOGGLE, ASSET SELECTION & DATA ENGINE CONTROLS
 # ==================================================================================
 
 st.sidebar.markdown("## 📊 Institutional Quant Terminal")
 st.sidebar.caption("Hybrid Multi-Source L2 DOM Data Engine")
+
+theme_choice = st.sidebar.radio(
+    "🎨 Theme", ["Dark Theme", "Light Theme"], index=0, horizontal=True, key="theme_choice",
+)
+if theme_choice == "Dark Theme":
+    st.markdown(DARK_CSS, unsafe_allow_html=True)
+    PLOTLY_TEMPLATE = "plotly_dark"
+else:
+    st.markdown(LIGHT_CSS, unsafe_allow_html=True)
+    PLOTLY_TEMPLATE = "plotly_white"
+
 st.sidebar.divider()
 
 st.sidebar.subheader("Asset Selection")
@@ -1273,7 +1374,7 @@ if asset_category == "Crypto (Binance)":
     symbol = CRYPTO_ASSETS[asset_label]
     asset_class = "crypto"
     yf_ticker = binance_to_yf_ticker(symbol)
-    primary_source_note = "Primary: Binance REST (klines + L2 depth)"
+    primary_source_note = "Primary: Binance REST (klines + L2 depth, 3-endpoint fallback)"
 
 elif asset_category == "Forex (Kraken)":
     asset_label = st.sidebar.selectbox("Select Forex Pair", list(FOREX_ASSETS.keys()))
@@ -1298,7 +1399,7 @@ else:
     asset_label = f"Custom: {symbol}"
     if asset_class == "crypto":
         yf_ticker = binance_to_yf_ticker(symbol)
-        primary_source_note = "Primary: Binance REST (klines + L2 depth)"
+        primary_source_note = "Primary: Binance REST (klines + L2 depth, 3-endpoint fallback)"
     elif asset_class == "forex":
         yf_ticker = forex_to_yf_ticker(symbol)
         primary_source_note = "Primary: Kraken REST (OHLC + L2 depth)"
@@ -1318,14 +1419,15 @@ if st.sidebar.button("🔄 Refresh All Data (Clear Cache)", use_container_width=
 
 st.sidebar.divider()
 st.sidebar.markdown(
-    "<div style='font-size:0.75rem; color:#8b90a0;'>"
+    "<div style='font-size:0.75rem; opacity:0.75;'>"
     "<b>Data Engine Routing</b><br>"
-    "Crypto/Metals proxy → Binance Public API<br>"
+    "Crypto/Metals proxy → Binance Public API (3-endpoint fallback)<br>"
     "Major Forex → Kraken Public API<br>"
     "Macro/Index/Futures → yfinance<br>"
     "Any source failure → automatic yfinance fallback<br><br>"
     "For informational / research purposes only — not investment advice."
-    "</div>", unsafe_allow_html=True,
+    "</div>",
+    unsafe_allow_html=True,
 )
 
 # ==================================================================================
@@ -1346,16 +1448,12 @@ if asset_class in ("crypto", "forex"):
 if main_df.empty:
     st.error(
         f"⚠️ Unable to retrieve OHLCV data for **{symbol}** at interval '{interval}' from any configured "
-        "source (primary venue and yfinance fallback both failed or returned empty). This can happen due to "
-        "an invalid custom symbol, venue rate limits, or a temporary network issue. Try a different interval, "
-        "verify the symbol, or click **Refresh All Data** in the sidebar."
+        "source. Try a different interval, verify the symbol, or click **Refresh All Data** in the sidebar."
     )
     st.stop()
 
 if len(main_df) < 20:
-    st.warning("Very limited data returned for this selection — some modules (especially ML and Liquidity) "
-               "may produce low-confidence or empty results. Consider a lower-granularity interval to "
-               "accumulate more history.")
+    st.warning("Very limited data returned for this selection — consider a lower-granularity interval.")
 
 dom_badge = "🟢 LIVE L2 DOM" if not order_book_df.empty else ("⚪ NO L2 DOM (macro asset)" if asset_class == "macro" else "🔴 L2 DOM UNAVAILABLE")
 st.markdown(
@@ -1364,7 +1462,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Top-level snapshot metrics
+# Snapshot metrics
 last_row = main_df.iloc[-1]
 prev_row = main_df.iloc[-2] if len(main_df) > 1 else last_row
 chg = safe_pct(last_row["Close"], prev_row["Close"])
@@ -1430,8 +1528,5 @@ with tab6:
 st.divider()
 st.caption(
     "⚠️ Disclaimer: This dashboard is provided for research and educational purposes only. "
-    "It does not constitute financial advice. Machine learning predictions, simulated gamma exposure, "
-    "L2 order-book-derived wall/PnL estimates, and synthetic order-flow metrics are statistical estimates "
-    "and may not reflect actual institutional positioning. Always conduct independent due diligence before "
-    "making trading decisions."
+    "It does not constitute financial advice."
 )
