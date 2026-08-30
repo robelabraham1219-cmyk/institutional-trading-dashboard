@@ -3,5 +3,4 @@ pandas
 numpy
 plotly
 scikit-learn
-websocket-client
-https://github.com/rongardF/tvdatafeed/archive/refs/heads/main.zip
+yfinance
