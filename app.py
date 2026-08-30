@@ -1,17 +1,16 @@
 """
 ==================================================================================
 INSTITUTIONAL QUANTITATIVE TRADING DASHBOARD
-Gold (XAU/USD) | Forex | Crypto  —  Powered by TradingView Datafeed (tvdatafeed)
+Gold (XAU/USD) | Forex | Crypto
 ==================================================================================
 A single-file, production-ready Streamlit dashboard integrating six institutional
-quantitative trading modules, sourcing all market data from TradingView via the
-`tvdatafeed` library:
+quantitative trading modules:
 
   1. Order Flow & Liquidity Heatmap (BSL/SSL + Fair Value Gaps)
   2. Quantitative Machine Learning Classifier (RandomForest direction model)
   3. Cross-Asset Correlation & Macro Yield Matrix
   4. Volume Delta / Cumulative Volume Delta (CVD) Footprint Analysis
-  5. Options Gamma Exposure (GEX) & Max Pain Simulation Engine
+  5. Options Gamma Exposure (GEX) & Max Pain Engine
   6. Institutional Execution Algorithms (VWAP / TWAP / Iceberg Detection)
 ==================================================================================
 """
@@ -20,10 +19,13 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import math
+import datetime as dt
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
+import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -31,12 +33,6 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
-
-try:
-    from tvdatafeed import TvDatafeed, Interval
-    TVDATAFEED_AVAILABLE = True
-except Exception:
-    TVDATAFEED_AVAILABLE = False
 
 # ==================================================================================
 # PAGE CONFIG & GLOBAL STYLE
@@ -97,86 +93,58 @@ st.markdown(DARK_CSS, unsafe_allow_html=True)
 PLOTLY_TEMPLATE = "plotly_dark"
 
 # ==================================================================================
-# ASSET UNIVERSE — TradingView symbol / exchange mapping
+# ASSET UNIVERSE
 # ==================================================================================
 
 ASSET_MAP = {
-    "Gold (XAU/USD)":        ("XAUUSD", "OANDA"),
-    "Silver (XAG/USD)":      ("XAGUSD", "OANDA"),
-    "EUR/USD":                ("EURUSD", "OANDA"),
-    "GBP/USD":                ("GBPUSD", "OANDA"),
-    "USD/JPY":                ("USDJPY", "OANDA"),
-    "AUD/USD":                ("AUDUSD", "OANDA"),
-    "USD/CHF":                ("USDCHF", "OANDA"),
-    "Bitcoin (BTC/USDT)":    ("BTCUSDT", "BINANCE"),
-    "Ethereum (ETH/USDT)":   ("ETHUSDT", "BINANCE"),
+    "Gold (XAU/USD)": "GC=F",
+    "Silver (XAG/USD)": "SI=F",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "USDJPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CHF": "USDCHF=X",
+    "Bitcoin (BTC/USD)": "BTC-USD",
+    "Ethereum (ETH/USD)": "ETH-USD",
+}
+
+OPTIONS_PROXY_MAP = {
+    "GC=F": "GLD",
+    "SI=F": "SLV",
+    "BTC-USD": None,
+    "ETH-USD": None,
 }
 
 MACRO_TICKERS = {
-    "Gold":              ("XAUUSD", "OANDA"),
-    "US Dollar Index":   ("DXY", "TVC"),
-    "US 10Y Yield":      ("US10Y", "TVC"),
-    "Bitcoin":           ("BTCUSDT", "BINANCE"),
+    "Gold": "GC=F",
+    "US Dollar Index": "DX-Y.NYB",
+    "US 10Y Yield": "^TNX",
+    "Bitcoin": "BTC-USD",
 }
-
-# ==================================================================================
-# TVDATAFEED CLIENT & INTERVAL / PERIOD MAPPING
-# ==================================================================================
-
-if TVDATAFEED_AVAILABLE:
-    INTERVAL_MAP = {
-        "15m": Interval.in_15_minute,
-        "30m": Interval.in_30_minute,
-        "1h":  Interval.in_1_hour,
-        "1d":  Interval.in_daily,
-        "1wk": Interval.in_weekly,
-    }
-else:
-    INTERVAL_MAP = {}
-
-PERIOD_BARS_MAP = {
-    "5d":  100,
-    "1mo": 200,
-    "3mo": 400,
-    "6mo": 600,
-    "1y":  800,
-    "2y":  1000,
-}
-
-
-@st.cache_resource(show_spinner=False)
-def get_tv_client():
-    if not TVDATAFEED_AVAILABLE:
-        return None
-    try:
-        tv = TvDatafeed()
-        return tv
-    except Exception:
-        return None
-
 
 # ==================================================================================
 # DATA LAYER
 # ==================================================================================
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_ohlcv(symbol: str, exchange: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
-    tv = get_tv_client()
-    if tv is None or not TVDATAFEED_AVAILABLE:
-        return pd.DataFrame()
-
+def fetch_ohlcv(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     try:
-        tv_interval = INTERVAL_MAP.get(interval, Interval.in_daily)
-        n_bars = PERIOD_BARS_MAP.get(period, 500)
-
-        raw = tv.get_hist(symbol=symbol, exchange=exchange, interval=tv_interval, n_bars=n_bars)
-
-        if raw is None or raw.empty:
+        df = yf.download(
+            tickers=ticker,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+        if df is None or df.empty:
             return pd.DataFrame()
 
-        df = raw.rename(columns={
-            "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume",
-        }).copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            try:
+                df.columns = df.columns.get_level_values(0)
+            except Exception:
+                df.columns = ["_".join([str(c) for c in col if c]) for col in df.columns]
 
         expected = ["Open", "High", "Low", "Close", "Volume"]
         for col in expected:
@@ -184,9 +152,6 @@ def fetch_ohlcv(symbol: str, exchange: str, period: str = "6mo", interval: str =
                 return pd.DataFrame()
 
         df = df[expected].copy()
-        df.index = pd.to_datetime(df.index)
-        df = df[~df.index.duplicated(keep="last")]
-        df = df.sort_index()
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
         df["Volume"] = df["Volume"].fillna(0)
         return df
@@ -195,16 +160,35 @@ def fetch_ohlcv(symbol: str, exchange: str, period: str = "6mo", interval: str =
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_close_series(symbol: str, exchange: str, period: str = "1y", interval: str = "1d") -> pd.Series:
-    df = fetch_ohlcv(symbol, exchange, period, interval)
+def fetch_close_series(ticker: str, period: str = "1y", interval: str = "1d") -> pd.Series:
+    df = fetch_ohlcv(ticker, period, interval)
     if df.empty:
         return pd.Series(dtype=float)
     return df["Close"]
 
 
-def get_last_price(symbol: str, exchange: str):
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_options_chain(symbol: str):
     try:
-        df = fetch_ohlcv(symbol, exchange, period="5d", interval="1d")
+        tk = yf.Ticker(symbol)
+        expiries = tk.options
+        if not expiries:
+            return None
+        expiry = expiries[0]
+        chain = tk.option_chain(expiry)
+        calls, puts = chain.calls.copy(), chain.puts.copy()
+        hist = tk.history(period="5d")
+        if hist.empty:
+            return None
+        spot = float(hist["Close"].iloc[-1])
+        return calls, puts, expiry, spot
+    except Exception:
+        return None
+
+
+def get_last_price(ticker: str):
+    try:
+        df = fetch_ohlcv(ticker, period="5d", interval="1d")
         if df.empty:
             return None
         return float(df["Close"].iloc[-1])
@@ -282,15 +266,10 @@ def detect_fvg(df: pd.DataFrame):
     return bullish, bearish
 
 
-def render_liquidity_module(df: pd.DataFrame, label: str):
+def render_liquidity_module(df: pd.DataFrame, ticker: str):
     st.markdown('<div class="module-note">Swing-point liquidity pools (Buy-Side / Sell-Side Liquidity) and '
                 'Fair Value Gap imbalance zones, derived from raw price-action structure.</div>',
                 unsafe_allow_html=True)
-
-    if len(df) < 15:
-        st.warning("Not enough bars returned for this selection to compute liquidity structure. "
-                   "Try a longer period.")
-        return
 
     window = st.slider("Swing Detection Sensitivity (lookback bars)", 2, 15, 5, key="liq_window")
     max_zones = st.slider("Max FVG Zones Displayed", 3, 30, 12, key="liq_fvg_count")
@@ -307,7 +286,7 @@ def render_liquidity_module(df: pd.DataFrame, label: str):
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-        name=label, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        name=ticker, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
     ))
 
     recent_highs = sorted(swing_highs, key=lambda x: x[0])[-8:]
@@ -336,7 +315,7 @@ def render_liquidity_module(df: pd.DataFrame, label: str):
 
     fig.update_layout(
         template=PLOTLY_TEMPLATE, height=620, xaxis_rangeslider_visible=False,
-        title=f"{label} — Liquidity Pools & Fair Value Gaps",
+        title=f"{ticker} — Liquidity Pools & Fair Value Gaps",
         margin=dict(l=10, r=10, t=50, b=10),
     )
     st.plotly_chart(fig, use_container_width=True)
@@ -374,7 +353,7 @@ def build_ml_features(df: pd.DataFrame) -> pd.DataFrame:
     return feat
 
 
-def render_ml_module(df: pd.DataFrame, label: str):
+def render_ml_module(df: pd.DataFrame, ticker: str):
     st.markdown('<div class="module-note">A RandomForest classifier trained live on engineered technical '
                 'features to estimate the probability of the next-bar directional move.</div>',
                 unsafe_allow_html=True)
@@ -390,8 +369,8 @@ def render_ml_module(df: pd.DataFrame, label: str):
     future_return = df["Close"].shift(-horizon) / df["Close"] - 1
 
     labels = pd.Series(1, index=df.index)
-    labels[future_return > threshold] = 2   # Buy
-    labels[future_return < -threshold] = 0  # Sell
+    labels[future_return > threshold] = 2
+    labels[future_return < -threshold] = 0
 
     data = feat.copy()
     data["target"] = labels
@@ -463,36 +442,30 @@ def render_ml_module(df: pd.DataFrame, label: str):
                                  margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig_proba, use_container_width=True)
 
-    st.caption(f"Model trained on {len(X_train)} bars, validated on {len(X_test)} out-of-sample bars for {label}. "
-               "This is a statistical estimate, not investment advice.")
-
 
 # ==================================================================================
 # MODULE 3 — CROSS-ASSET CORRELATION & MACRO YIELD MATRIX
 # ==================================================================================
 
-def render_correlation_module(period: str, interval: str):
+def render_correlation_module(period: str):
     st.markdown('<div class="module-note">Cross-asset relationships between Gold, the US Dollar Index, '
-                '10-Year Treasury Yields, and Bitcoin — key macro drivers for precious metals positioning. '
-                'Sourced from TradingView (OANDA / TVC / BINANCE feeds).</div>',
+                '10-Year Treasury Yields, and Bitcoin — key macro drivers for precious metals positioning.</div>',
                 unsafe_allow_html=True)
 
     series_dict = {}
     fetch_errors = []
-    for macro_label, (sym, exch) in MACRO_TICKERS.items():
-        s = fetch_close_series(sym, exch, period=period, interval=interval)
+    for label, tk in MACRO_TICKERS.items():
+        s = fetch_close_series(tk, period=period, interval="1d")
         if s.empty:
-            fetch_errors.append(macro_label)
+            fetch_errors.append(label)
         else:
-            series_dict[macro_label] = s
+            series_dict[label] = s
 
     if fetch_errors:
-        st.warning(f"Could not retrieve live TradingView data for: {', '.join(fetch_errors)}. "
-                   "Displaying available assets only.")
+        st.warning(f"Could not retrieve live data for: {', '.join(fetch_errors)}. Displaying available assets only.")
 
     if len(series_dict) < 2:
-        st.error("Insufficient macro data available to compute correlations right now. Please try again shortly, "
-                 "or verify TradingView Datafeed connectivity.")
+        st.error("Insufficient macro data available to compute correlations right now. Please try again shortly.")
         return
 
     combined = pd.DataFrame(series_dict).dropna(how="all")
@@ -524,11 +497,9 @@ def render_correlation_module(period: str, interval: str):
             fig_roll.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr, mode="lines", name=f"Gold vs {col}"))
         fig_roll.add_hline(y=0, line_dash="dot", line_color="#666")
         fig_roll.update_layout(template=PLOTLY_TEMPLATE, height=420,
-                                title=f"Rolling {rolling_window}-Bar Correlation",
+                                title=f"Rolling {rolling_window}-Day Correlation",
                                 margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig_roll, use_container_width=True)
-    else:
-        st.info("Gold series unavailable for rolling correlation reference.")
 
     with st.expander("📈 Normalized Price Performance (Rebased to 100)"):
         rebased = combined / combined.iloc[0] * 100
@@ -554,14 +525,10 @@ def compute_volume_delta(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def render_volume_delta_module(df: pd.DataFrame, label: str):
+def render_volume_delta_module(df: pd.DataFrame, ticker: str):
     st.markdown('<div class="module-note">Synthetic order-flow reconstruction: buying vs. selling volume '
                 'estimated from intra-bar close position, aggregated into Cumulative Volume Delta (CVD).</div>',
                 unsafe_allow_html=True)
-
-    if df["Volume"].sum() == 0:
-        st.warning("No volume data returned for this instrument/feed — Volume Delta analysis requires "
-                   "non-zero volume (note: some FX spot feeds report tick volume only).")
 
     vd = compute_volume_delta(df)
     z_thresh = st.slider("Imbalance Spike Sensitivity (Z-score)", 1.0, 4.0, 2.0, step=0.25, key="vd_z")
@@ -578,11 +545,11 @@ def render_volume_delta_module(df: pd.DataFrame, label: str):
 
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.25, 0.25], vertical_spacing=0.03,
-        subplot_titles=(f"{label} Price", "Volume Delta (Buy − Sell)", "Cumulative Volume Delta (CVD)"),
+        subplot_titles=(f"{ticker} Price", "Volume Delta (Buy − Sell)", "Cumulative Volume Delta (CVD)"),
     )
     fig.add_trace(go.Candlestick(
         x=vd.index, open=vd["Open"], high=vd["High"], low=vd["Low"], close=vd["Close"],
-        name=label, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        name=ticker, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
     ), row=1, col=1)
 
     if not spikes.empty:
@@ -609,7 +576,7 @@ def render_volume_delta_module(df: pd.DataFrame, label: str):
 
 
 # ==================================================================================
-# MODULE 5 — OPTIONS GAMMA EXPOSURE (GEX) & MAX PAIN SIMULATION ENGINE
+# MODULE 5 — OPTIONS GAMMA EXPOSURE (GEX) & MAX PAIN ENGINE
 # ==================================================================================
 
 def bs_gamma(spot, strike, t_years, iv, r=0.045):
@@ -646,47 +613,76 @@ def simulate_gex(spot: float, n_strikes: int = 25, iv: float = 0.18, days_to_exp
     })
 
 
-def compute_max_pain_from_sim(gex_df: pd.DataFrame):
+def gex_from_chain(calls: pd.DataFrame, puts: pd.DataFrame, spot: float, days_to_expiry: int):
+    t_years = max(days_to_expiry, 1) / 365.0
+    contract_mult = 100
+
+    def process(chain, sign):
+        c = chain.copy()
+        c["impliedVolatility"] = c["impliedVolatility"].replace(0, np.nan).fillna(c["impliedVolatility"].median())
+        c["impliedVolatility"] = c["impliedVolatility"].fillna(0.2)
+        c["openInterest"] = c["openInterest"].fillna(0)
+        c["gamma"] = c.apply(lambda r: bs_gamma(spot, r["strike"], t_years, max(r["impliedVolatility"], 0.01)), axis=1)
+        c["gex"] = sign * c["gamma"] * c["openInterest"] * contract_mult * spot * spot * 0.01
+        return c[["strike", "openInterest", "gex"]]
+
+    c_proc = process(calls, 1)
+    p_proc = process(puts, -1)
+    merged = pd.merge(c_proc, p_proc, on="strike", how="outer", suffixes=("_call", "_put")).fillna(0)
+    merged["net_gex"] = merged["gex_call"] + merged["gex_put"]
+    merged = merged.rename(columns={"gex_call": "call_gex", "gex_put": "put_gex"})
+    merged = merged.sort_values("strike").reset_index(drop=True)
+    return merged
+
+
+def compute_max_pain(calls: pd.DataFrame, puts: pd.DataFrame):
     try:
-        strikes = gex_df["strike"].values
-        call_oi = gex_df["call_oi"].values
-        put_oi = gex_df["put_oi"].values
+        strikes = sorted(set(calls["strike"]).union(set(puts["strike"])))
         pain = []
         for s in strikes:
-            call_loss = (np.clip(s - strikes, 0, None) * call_oi).sum()
-            put_loss = (np.clip(strikes - s, 0, None) * put_oi).sum()
+            call_loss = ((s - calls["strike"]).clip(lower=0) * calls["openInterest"].fillna(0)).sum()
+            put_loss = ((puts["strike"] - s).clip(lower=0) * puts["openInterest"].fillna(0)).sum()
             pain.append(call_loss + put_loss)
-        pain = np.array(pain)
-        max_pain_strike = float(strikes[np.argmin(pain)])
-        return max_pain_strike, pd.DataFrame({"strike": strikes, "total_pain": pain})
+        pain_df = pd.DataFrame({"strike": strikes, "total_pain": pain})
+        max_pain_strike = pain_df.loc[pain_df["total_pain"].idxmin(), "strike"]
+        return max_pain_strike, pain_df
     except Exception:
         return None, pd.DataFrame()
 
 
-def render_gex_module(symbol: str, exchange: str, label: str):
-    st.markdown('<div class="module-note">Gamma Exposure (GEX) profile identifying probable dealer '
-                'positioning, volatility pin zones, and the gamma flip level — generated via a '
-                'Black-Scholes gamma simulation engine calibrated to the live TradingView spot price.</div>',
-                unsafe_allow_html=True)
+def render_gex_module(ticker: str):
+    st.markdown('<div class="module-note">Gamma Exposure (GEX) profile identifying dealer positioning, '
+                'volatility pin zones, and the gamma flip level. Uses live listed options where available, '
+                'or a Black-Scholes-based simulation engine otherwise.</div>', unsafe_allow_html=True)
 
-    spot = get_last_price(symbol, exchange)
-    if spot is None:
-        st.error(f"Could not retrieve a live spot price for {label} from TradingView to calibrate the "
-                 "GEX simulation. Please try refreshing data.")
-        return
+    proxy = OPTIONS_PROXY_MAP.get(ticker, None)
+    use_live = proxy is not None
+    live_symbol = proxy if use_live else ticker
 
-    dte = st.slider("Simulated Days to Expiry", 1, 90, 30, key="gex_dte")
-    iv_assumed = st.slider("Assumed Implied Volatility (%)", 5, 80, 18, key="gex_iv") / 100
-    n_strikes = st.slider("Strike Range (± strikes around spot)", 10, 40, 25, key="gex_strikes")
+    chain_result = fetch_options_chain(live_symbol) if use_live else None
 
-    gex_df = simulate_gex(spot, n_strikes=n_strikes, iv=iv_assumed, days_to_expiry=dte)
-    max_pain, pain_df = compute_max_pain_from_sim(gex_df)
+    if chain_result is not None:
+        calls, puts, expiry, spot = chain_result
+        try:
+            dte = max((pd.to_datetime(expiry) - pd.Timestamp.now()).days, 1)
+        except Exception:
+            dte = 30
+        gex_df = gex_from_chain(calls, puts, spot, dte)
+        max_pain, pain_df = compute_max_pain(calls, puts)
+        source_label = f"Live listed options — proxy: {live_symbol} (expiry {expiry})"
+    else:
+        spot = get_last_price(ticker) or 2000.0
+        dte = st.slider("Simulated Days to Expiry", 1, 90, 30, key="gex_dte")
+        iv_assumed = st.slider("Assumed Implied Volatility (%)", 5, 80, 18, key="gex_iv") / 100
+        gex_df = simulate_gex(spot, n_strikes=25, iv=iv_assumed, days_to_expiry=dte)
+        max_pain = gex_df.loc[(gex_df["call_oi"] + gex_df["put_oi"]).idxmax(), "strike"]
+        pain_df = pd.DataFrame()
+        source_label = f"Simulated GEX engine (Black-Scholes gamma model) — no listed options market for {ticker}"
 
-    st.caption(f"Data source: Simulated GEX engine (Black-Scholes gamma model), spot calibrated live from "
-               f"TradingView — {symbol} ({exchange})")
+    st.caption(f"Data source: {source_label}")
 
     net_gex_total = gex_df["net_gex"].sum()
-    flip_candidates = gex_df.sort_values("strike").copy()
+    flip_candidates = gex_df.sort_values("strike")
     flip_candidates["cum_gex"] = flip_candidates["net_gex"].cumsum()
     sign_changes = flip_candidates[flip_candidates["cum_gex"] * flip_candidates["cum_gex"].shift(1) < 0]
     gamma_flip = float(sign_changes["strike"].iloc[0]) if not sign_changes.empty else float(gex_df["strike"].median())
@@ -708,17 +704,10 @@ def render_gex_module(symbol: str, exchange: str, label: str):
                       annotation_text="Max Pain", annotation_position="top")
 
     fig.update_layout(template=PLOTLY_TEMPLATE, height=560, barmode="relative",
-                       title=f"{label} — Simulated Gamma Exposure Profile by Strike",
+                       title=f"{ticker} — Gamma Exposure Profile by Strike",
                        xaxis_title="Strike", yaxis_title="Gamma Exposure",
                        margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig, use_container_width=True)
-
-    interpretation = (
-        "Positive net GEX suggests dealers are net long gamma → they hedge by buying dips / selling rallies, "
-        "typically dampening volatility. Negative net GEX suggests dealers are net short gamma → hedging "
-        "flows can amplify moves, increasing realized volatility, especially below the gamma flip level."
-    )
-    st.info(interpretation)
 
 
 # ==================================================================================
@@ -758,14 +747,10 @@ def detect_icebergs(df: pd.DataFrame, z_thresh: float = 2.5):
     return out, icebergs
 
 
-def render_execution_module(df: pd.DataFrame, label: str):
+def render_execution_module(df: pd.DataFrame, ticker: str):
     st.markdown('<div class="module-note">Institutional execution benchmarks — VWAP with statistical '
                 'deviation bands, TWAP baseline, and detection of probable iceberg / hidden-order clusters '
                 'via volume-to-range anomaly analysis.</div>', unsafe_allow_html=True)
-
-    if df["Volume"].sum() == 0:
-        st.warning("No volume data returned for this instrument/feed — VWAP and iceberg detection require "
-                   "non-zero volume. TWAP will still be computed from price only.")
 
     vwap_df = compute_vwap_bands(df)
     z_thresh = st.slider("Iceberg Detection Sensitivity (Z-score)", 1.5, 4.0, 2.5, step=0.25, key="ice_z")
@@ -784,7 +769,7 @@ def render_execution_module(df: pd.DataFrame, label: str):
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
         x=vwap_df.index, open=vwap_df["Open"], high=vwap_df["High"], low=vwap_df["Low"], close=vwap_df["Close"],
-        name=label, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        name=ticker, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
     ))
     fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap"], mode="lines", name="VWAP",
                               line=dict(color="#f0b90b", width=2)))
@@ -806,23 +791,9 @@ def render_execution_module(df: pd.DataFrame, label: str):
         ))
 
     fig.update_layout(template=PLOTLY_TEMPLATE, height=650, xaxis_rangeslider_visible=False,
-                       title=f"{label} — VWAP / TWAP Execution Benchmarks & Iceberg Detection",
+                       title=f"{ticker} — VWAP / TWAP Execution Benchmarks & Iceberg Detection",
                        margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig, use_container_width=True)
-
-    fig_vol = go.Figure(go.Bar(x=vwap_df.index, y=vwap_df["Volume"], marker_color="#5c6bc0", name="Volume"))
-    if not icebergs.empty:
-        fig_vol.add_trace(go.Bar(x=icebergs.index, y=icebergs["Volume"], marker_color="#00e5ff", name="Iceberg Volume"))
-    fig_vol.update_layout(template=PLOTLY_TEMPLATE, height=280, title="Volume Profile & Anomaly Bars",
-                           margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig_vol, use_container_width=True)
-
-    with st.expander("🧊 Detected Iceberg / Hidden Order Clusters"):
-        if not icebergs.empty:
-            show_cols = ["Close", "Volume", "vol_range_ratio", "vr_z"]
-            st.dataframe(icebergs[show_cols].tail(15).round(3), use_container_width=True)
-        else:
-            st.info("No statistically significant iceberg clusters detected at the current sensitivity level.")
 
 
 # ==================================================================================
@@ -830,58 +801,38 @@ def render_execution_module(df: pd.DataFrame, label: str):
 # ==================================================================================
 
 st.sidebar.markdown("## 📊 Institutional Quant Terminal")
-st.sidebar.caption("Gold · Forex · Crypto — Multi-Module Analytics (TradingView Datafeed)")
+st.sidebar.caption("Gold · Forex · Crypto — Multi-Module Analytics")
 st.sidebar.divider()
 
-if not TVDATAFEED_AVAILABLE:
-    st.sidebar.error("`tvdatafeed` is not installed in this environment. Install it to enable live data "
-                     "(see requirements.txt for the install source).")
-
 asset_label = st.sidebar.selectbox("Asset", list(ASSET_MAP.keys()), index=0)
-symbol, exchange = ASSET_MAP[asset_label]
-ticker_display = f"{symbol} ({exchange})"
+ticker = ASSET_MAP[asset_label]
 
 period = st.sidebar.selectbox("Historical Period", ["5d", "1mo", "3mo", "6mo", "1y", "2y"], index=3)
 interval = st.sidebar.selectbox("Interval", ["15m", "30m", "1h", "1d", "1wk"], index=3)
-
-st.sidebar.caption(f"Requesting ≈{PERIOD_BARS_MAP.get(period, 500)} bars @ {interval} from {exchange}.")
 
 st.sidebar.divider()
 if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-st.sidebar.divider()
-st.sidebar.markdown(
-    "<div style='font-size:0.75rem; color:#8b90a0;'>"
-    "Data via TradingView Datafeed (tvdatafeed). Anonymous sessions may be rate-limited or occasionally "
-    "unavailable; some symbols/exchanges may differ from TradingView's live chart naming."
-    "</div>", unsafe_allow_html=True,
-)
-
 # ==================================================================================
 # MAIN HEADER & DATA FETCH
 # ==================================================================================
 
 st.title("📊 Institutional Quantitative Trading Dashboard")
-st.caption(f"Active Instrument: **{asset_label}** ({ticker_display}) · Period: {period} · Interval: {interval}")
+st.caption(f"Active Instrument: **{asset_label}** ({ticker}) · Period: {period} · Interval: {interval}")
 
-with st.spinner(f"Fetching market data for {ticker_display} from TradingView..."):
-    main_df = fetch_ohlcv(symbol, exchange, period=period, interval=interval)
+with st.spinner(f"Fetching market data for {ticker}..."):
+    main_df = fetch_ohlcv(ticker, period=period, interval=interval)
 
 if main_df.empty:
     st.error(
-        f"⚠️ Unable to retrieve data for **{ticker_display}** with period='{period}', interval='{interval}'. "
-        "This can happen due to TradingView anonymous session rate limits, an incorrect symbol/exchange "
-        "mapping, or a temporary network issue. Try a different period/interval, or click "
-        "**Refresh Data** in the sidebar."
+        f"⚠️ Unable to retrieve data for **{ticker}** with period='{period}', interval='{interval}'. "
+        "Try a different period/interval, or click **Refresh Data** in the sidebar."
     )
     st.stop()
 
-if len(main_df) < 20:
-    st.warning("Very limited data returned for this selection — some modules (especially ML and Liquidity) "
-               "may produce low-confidence or empty results. Consider a longer period.")
-
+# Snapshot metrics
 last_row = main_df.iloc[-1]
 prev_row = main_df.iloc[-2] if len(main_df) > 1 else last_row
 chg = safe_pct(last_row["Close"], prev_row["Close"])
@@ -910,42 +861,36 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 
 with tab1:
     try:
-        render_liquidity_module(main_df, ticker_display)
+        render_liquidity_module(main_df, ticker)
     except Exception as e:
-        st.error(f"Liquidity module encountered an error: {e}")
+        st.error(f"Liquidity module error: {e}")
 
 with tab2:
     try:
-        render_ml_module(main_df, ticker_display)
+        render_ml_module(main_df, ticker)
     except Exception as e:
-        st.error(f"ML Classifier module encountered an error: {e}")
+        st.error(f"ML Classifier error: {e}")
 
 with tab3:
     try:
-        render_correlation_module(period=period if period != "5d" else "3mo", interval="1d")
+        render_correlation_module(period=period if period not in ["5d"] else "3mo")
     except Exception as e:
-        st.error(f"Correlation module encountered an error: {e}")
+        st.error(f"Correlation error: {e}")
 
 with tab4:
     try:
-        render_volume_delta_module(main_df, ticker_display)
+        render_volume_delta_module(main_df, ticker)
     except Exception as e:
-        st.error(f"Volume Delta module encountered an error: {e}")
+        st.error(f"Volume Delta error: {e}")
 
 with tab5:
     try:
-        render_gex_module(symbol, exchange, ticker_display)
+        render_gex_module(ticker)
     except Exception as e:
-        st.error(f"GEX module encountered an error: {e}")
+        st.error(f"GEX module error: {e}")
 
 with tab6:
     try:
-        render_execution_module(main_df, ticker_display)
+        render_execution_module(main_df, ticker)
     except Exception as e:
-        st.error(f"Execution Algorithms module encountered an error: {e}")
-
-st.divider()
-st.caption(
-    "⚠️ Disclaimer: This dashboard is provided for research and educational purposes only. "
-    "Always conduct independent due diligence before making trading decisions."
-)
+        st.error(f"Execution error: {e}")
