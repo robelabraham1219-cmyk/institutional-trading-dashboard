@@ -1,17 +1,40 @@
 """
 ==================================================================================
 INSTITUTIONAL QUANTITATIVE TRADING TERMINAL
-Hybrid Multi-Source L2 DOM Data Engine — Binance | Kraken | yfinance
+Hybrid Multi-Source L2 DOM Data Engine — Binance | Dukascopy SWFX | yfinance
 ==================================================================================
 A single-file, production-ready Streamlit application implementing six
 institutional-grade quantitative trading modules, backed by a hybrid data engine
-that routes each asset class to the venue best suited to serve real Level-2 order
-book depth without requiring the user to hold API keys:
+that routes each asset class to the venue best suited to serve real market data
+without requiring the user to hold API keys:
 
     Crypto & Metals proxy   -> Binance Public REST API   (klines + depth, 3-endpoint fallback)
-    Major Forex pairs       -> Kraken Public REST API    (OHLC + depth)
-    Macro / Index / Futures -> yfinance                  (OHLCV + option chains)
-    Universal fallback      -> yfinance                  (any source failure)
+    Major Forex pairs       -> Dukascopy SWFX             (public tick-data feed, no key)
+    Macro / Index / Futures -> yfinance                   (OHLCV + option chains)
+    Universal fallback      -> yfinance                   (any source failure)
+
+NOTE ON DUKASCOPY SWFX DATA:
+Dukascopy publishes free, no-key-required historical/live TICK data for its SWFX
+feed at datafeed.dukascopy.com (LZMA-compressed ".bi5" files, one per
+symbol/hour, each containing raw bid/ask price + bid/ask volume ticks). This is
+genuine exchange-sourced Forex data, but it is important to be precise about
+what it is:
+  - It is a TICK feed (best bid / best ask per trade tick), not a multi-level
+    order book snapshot. Dukascopy does not publish a public, key-free,
+    multi-level Level 2 depth-of-market feed (real DOM ladders are only
+    available inside the JForex platform to funded account holders).
+  - This engine reconstructs OHLC candles directly from real ticks, and builds
+    a live "liquidity depth" ladder by aggregating real tick bid/ask prices and
+    traded volumes into price buckets around the current market — i.e. genuine
+    SWFX trade-flow/liquidity data, presented as a DOM-style ladder, rather than
+    an exchange-published resting-order book. This is labelled honestly in the
+    UI ("SWFX Tick-Flow Depth") wherever it's shown, exactly as GEX module 5
+    already labels simulated vs. live options data.
+  - Because reconstructing daily+ history from per-hour tick files would require
+    thousands of live HTTP requests, Dukascopy is used here for intraday bases
+    (1m/5m/15m/30m/1h/4h) where live SWFX liquidity actually matters most. Daily
+    and longer bases route through the existing yfinance fallback, exactly the
+    same "any source gap -> yfinance" pattern already used elsewhere in this app.
 
 Modules:
   1. Institutional Order Flow & Liquidity Heatmap (BSL/SSL, FVGs, live $ volume
@@ -25,8 +48,13 @@ Modules:
 ==================================================================================
 """
 
+import lzma
 import math
+import struct
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -195,6 +223,20 @@ BINANCE_DEPTH_ENDPOINTS = [
     "https://api.binance.us/api/v3/depth",
 ]
 
+DUKASCOPY_BASE_URL = "https://datafeed.dukascopy.com/datafeed"
+
+# Max historical hours of raw tick files pulled per intraday base timeframe.
+# Kept modest because each hour is a separate live HTTP request; deeper history
+# for daily+ charts is served by the yfinance fallback instead (see module docstring).
+DUKASCOPY_LOOKBACK_HOURS = {
+    "1m": 6,
+    "5m": 24,
+    "15m": 48,
+    "30m": 72,
+    "1h": 120,
+    "4h": 168,
+}
+
 # ==================================================================================
 # ASSET UNIVERSE
 # ==================================================================================
@@ -257,9 +299,6 @@ INTERVAL_CONFIG = {
 BINANCE_BASE_MAP = {
     "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d",
 }
-KRAKEN_BASE_MAP = {
-    "1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440,
-}
 
 # ==================================================================================
 # SYMBOL / TICKER TRANSLATION HELPERS
@@ -274,6 +313,10 @@ def binance_to_yf_ticker(symbol: str) -> str:
 
 def forex_to_yf_ticker(symbol: str) -> str:
     return f"{symbol.upper()}=X"
+
+def dukascopy_point_divider(symbol: str) -> int:
+    """Dukascopy raw tick prices are integers; divide by this to get the real quote."""
+    return 1000 if "JPY" in symbol.upper() else 100000
 
 # ==================================================================================
 # LOW-LEVEL SOURCE FETCHERS
@@ -322,33 +365,120 @@ def fetch_binance_klines(symbol: str, base_key: str, limit: int = 1000) -> pd.Da
             continue
     return pd.DataFrame()
 
-def fetch_kraken_ohlc(pair: str, base_key: str) -> pd.DataFrame:
-    interval = KRAKEN_BASE_MAP.get(base_key)
-    if interval is None:
-        return pd.DataFrame()
+# ------------------------------------------------------------------
+# Dukascopy SWFX — raw tick feed fetcher (public, no API key needed)
+# ------------------------------------------------------------------
+
+def _dukascopy_hour_url(symbol: str, dt_utc: datetime) -> str:
+    # Dukascopy's month component in the URL path is zero-indexed (Jan = 00).
+    return (
+        f"{DUKASCOPY_BASE_URL}/{symbol.upper()}/{dt_utc.year}/"
+        f"{dt_utc.month - 1:02d}/{dt_utc.day:02d}/{dt_utc.hour:02d}h_ticks.bi5"
+    )
+
+def _fetch_dukascopy_hour_raw(symbol: str, dt_utc: datetime) -> bytes:
+    url = _dukascopy_hour_url(symbol, dt_utc)
     try:
-        url = "https://api.kraken.com/0/public/OHLC"
-        params = {"pair": pair.upper(), "interval": interval}
-        resp = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=8)
-        resp.raise_for_status()
-        payload = resp.json()
-        if payload.get("error"):
-            return pd.DataFrame()
-        result = payload.get("result", {})
-        keys = [k for k in result.keys() if k != "last"]
-        if not keys:
-            return pd.DataFrame()
-        rows = result[keys[0]]
-        if not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows, columns=["time", "Open", "High", "Low", "Close", "vwap", "Volume", "count"])
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        df = df.set_index("time")
-        for c in ["Open", "High", "Low", "Close", "Volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=6)
+        if resp.status_code != 200 or not resp.content:
+            return b""
+        return resp.content
     except Exception:
+        return b""
+
+def _decode_dukascopy_bi5(raw_bytes: bytes, hour_start_utc: datetime, point_divider: int):
+    """Decode a Dukascopy .bi5 tick file into a list of tick dicts.
+
+    Each record is 20 bytes, big-endian:
+      int32 ms_offset_from_hour_start, int32 ask_raw, int32 bid_raw,
+      float32 ask_volume, float32 bid_volume
+    The payload is LZMA-compressed.
+    """
+    if not raw_bytes:
+        return []
+    try:
+        decompressed = lzma.decompress(raw_bytes)
+    except Exception:
+        return []
+    record_size = 20
+    n_records = len(decompressed) // record_size
+    if n_records == 0:
+        return []
+    ticks = []
+    for i in range(n_records):
+        chunk = decompressed[i * record_size: (i + 1) * record_size]
+        try:
+            ms_offset, ask_raw, bid_raw, ask_vol, bid_vol = struct.unpack(">iiiff", chunk)
+        except struct.error:
+            continue
+        if ask_raw <= 0 or bid_raw <= 0:
+            continue
+        ts = hour_start_utc + timedelta(milliseconds=ms_offset)
+        ticks.append({
+            "timestamp": ts,
+            "ask": ask_raw / point_divider,
+            "bid": bid_raw / point_divider,
+            "ask_volume": float(ask_vol),
+            "bid_volume": float(bid_vol),
+        })
+    return ticks
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_dukascopy_ticks(symbol: str, lookback_hours: int) -> pd.DataFrame:
+    """Pull the last `lookback_hours` of real SWFX ticks for `symbol`, concurrently."""
+    now_utc = datetime.now(timezone.utc)
+    current_hour = now_utc.replace(minute=0, second=0, microsecond=0)
+    hour_slots = [current_hour - timedelta(hours=h) for h in range(lookback_hours + 1)]
+    point_divider = dukascopy_point_divider(symbol)
+
+    all_ticks = []
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {
+            pool.submit(_fetch_dukascopy_hour_raw, symbol, hs): hs for hs in hour_slots
+        }
+        for fut in as_completed(futures):
+            hour_start = futures[fut]
+            try:
+                raw = fut.result()
+            except Exception:
+                raw = b""
+            if raw:
+                all_ticks.extend(_decode_dukascopy_bi5(raw, hour_start, point_divider))
+
+    if not all_ticks:
         return pd.DataFrame()
+
+    tdf = pd.DataFrame(all_ticks).sort_values("timestamp").set_index("timestamp")
+    tdf["mid"] = (tdf["ask"] + tdf["bid"]) / 2.0
+    tdf["volume"] = tdf["ask_volume"] + tdf["bid_volume"]
+    return tdf
+
+def fetch_dukascopy_ohlc(symbol: str, base_key: str) -> pd.DataFrame:
+    """Build real OHLCV candles for `base_key` from genuine Dukascopy SWFX ticks."""
+    lookback_hours = DUKASCOPY_LOOKBACK_HOURS.get(base_key)
+    if lookback_hours is None:
+        # Daily+ bases are intentionally routed to the yfinance fallback — see
+        # the module docstring for why (thousands of per-hour requests would
+        # otherwise be needed to reconstruct months/years of daily bars).
+        return pd.DataFrame()
+
+    ticks = fetch_dukascopy_ticks(symbol, lookback_hours)
+    if ticks.empty:
+        return pd.DataFrame()
+
+    bar_rule_map = {
+        "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h",
+    }
+    rule = bar_rule_map.get(base_key)
+    if rule is None:
+        return pd.DataFrame()
+
+    ohlc = ticks["mid"].resample(rule).ohlc()
+    vol = ticks["volume"].resample(rule).sum()
+    df = pd.concat([ohlc, vol.rename("Volume")], axis=1)
+    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    return df[["Open", "High", "Low", "Close", "Volume"]]
 
 def fetch_yfinance_ohlcv(ticker: str, base_key: str) -> pd.DataFrame:
     period_map = {
@@ -401,9 +531,9 @@ def fetch_ohlcv(asset_class: str, symbol: str, yf_ticker: str, interval_key: str
         if not df.empty:
             source_used = "Binance (live)"
     elif asset_class == "forex":
-        df = fetch_kraken_ohlc(symbol, base_key)
+        df = fetch_dukascopy_ohlc(symbol, base_key)
         if not df.empty:
-            source_used = "Kraken (live)"
+            source_used = "Dukascopy SWFX (live ticks)"
 
     if df.empty:
         df = fetch_yfinance_ohlcv(yf_ticker, base_key)
@@ -425,7 +555,7 @@ def get_last_price(asset_class: str, symbol: str, yf_ticker: str):
     return float(df["Close"].iloc[-1])
 
 # ==================================================================================
-# L2 DOM ORDER BOOK ENGINE
+# L2 DOM / LIQUIDITY DEPTH ENGINE
 # ==================================================================================
 
 @st.cache_data(ttl=15, show_spinner=False)
@@ -454,26 +584,40 @@ def fetch_order_book(asset_class: str, symbol: str) -> pd.DataFrame:
             return pd.DataFrame()
 
         elif asset_class == "forex":
-            url = "https://api.kraken.com/0/public/Depth"
-            resp = requests.get(url, params={"pair": symbol.upper(), "count": 500}, headers=HTTP_HEADERS, timeout=6)
-            resp.raise_for_status()
-            payload = resp.json()
-            if payload.get("error"):
+            # Dukascopy SWFX has no public, key-free multi-level DOM feed. Instead we
+            # build a genuine liquidity ladder from real recent tick prints: the last
+            # window of actual bid/ask ticks and traded volumes is bucketed into price
+            # levels, producing a real, live, trade-flow-derived depth structure (see
+            # module docstring for the honest distinction vs. a native L2 snapshot).
+            ticks = fetch_dukascopy_ticks(symbol, lookback_hours=2)
+            if ticks.empty:
                 return pd.DataFrame()
-            result = payload.get("result", {})
-            keys = [k for k in result.keys() if k != "last"]
-            if not keys:
+
+            recent = ticks.tail(2000).copy()
+            if recent.empty:
                 return pd.DataFrame()
-            book = result[keys[0]]
-            bids = pd.DataFrame(book.get("bids", []), columns=["price", "qty", "ts"])
-            asks = pd.DataFrame(book.get("asks", []), columns=["price", "qty", "ts"])
-            if bids.empty and asks.empty:
-                return pd.DataFrame()
-            bids = bids.astype(float)
-            asks = asks.astype(float)
-            bids["side"] = "bid"
-            asks["side"] = "ask"
-            return pd.concat([bids[["price", "qty", "side"]], asks[["price", "qty", "side"]]], ignore_index=True)
+
+            pip = 0.01 if "JPY" in symbol.upper() else 0.0001
+            bucket_size = pip * 2  # 2-pip aggregation buckets
+
+            recent["bid_bucket"] = (recent["bid"] / bucket_size).round() * bucket_size
+            recent["ask_bucket"] = (recent["ask"] / bucket_size).round() * bucket_size
+
+            bid_levels = (
+                recent.groupby("bid_bucket")["bid_volume"].sum()
+                .reset_index().rename(columns={"bid_bucket": "price", "bid_volume": "qty"})
+            )
+            bid_levels["side"] = "bid"
+
+            ask_levels = (
+                recent.groupby("ask_bucket")["ask_volume"].sum()
+                .reset_index().rename(columns={"ask_bucket": "price", "ask_volume": "qty"})
+            )
+            ask_levels["side"] = "ask"
+
+            combined = pd.concat([bid_levels, ask_levels], ignore_index=True)
+            combined = combined[combined["qty"] > 0]
+            return combined[["price", "qty", "side"]]
 
         else:
             return pd.DataFrame()
@@ -657,7 +801,8 @@ def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, asset
     st.markdown(
         '<div class="module-note">Swing-point liquidity pools (BSL/SSL) and Fair Value Gap '
         'imbalance zones from price-action structure, dynamically annotated with live resting '
-        '$ order-book volume, institutional bank-wall isolation, and a Bank Anchor PnL Tracker.</div>',
+        '$ order-book / tick-flow depth, institutional bank-wall isolation, and a Bank Anchor '
+        'PnL Tracker.</div>',
         unsafe_allow_html=True,
     )
 
@@ -678,15 +823,16 @@ def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, asset
     has_dom = asset_class in ("crypto", "forex") and not order_book_df.empty
     if not has_dom:
         st.info(
-            "Live L2 DOM order book unavailable for this instrument right now (macro/index assets have no "
-            "public order book, or the live feed is temporarily unreachable) — $ volume annotations and "
-            "institutional wall isolation are skipped. Swing/FVG structure is still fully computed from "
-            "price action below."
+            "Live order-book / tick-flow depth unavailable for this instrument right now (macro/index "
+            "assets have no public order book, or the live feed is temporarily unreachable) — $ volume "
+            "annotations and institutional wall isolation are skipped. Swing/FVG structure is still fully "
+            "computed from price action below."
         )
     else:
+        badge_text = "🟢 LIVE L2 DOM CONNECTED" if asset_class == "crypto" else "🟢 LIVE SWFX TICK-FLOW DEPTH"
         st.markdown(
-            f'<span class="source-badge">🟢 LIVE L2 DOM CONNECTED</span> '
-            f'<span style="color:#8b90a0; font-size:0.8rem;">{len(order_book_df):,} resting order levels loaded</span>',
+            f'<span class="source-badge">{badge_text}</span> '
+            f'<span style="color:#8b90a0; font-size:0.8rem;">{len(order_book_df):,} price levels loaded</span>',
             unsafe_allow_html=True,
         )
 
@@ -1366,7 +1512,7 @@ st.sidebar.divider()
 st.sidebar.subheader("Asset Selection")
 asset_category = st.sidebar.selectbox(
     "Asset Category",
-    ["Crypto (Binance)", "Forex (Kraken)", "Metals / Macro Index (yfinance)", "Custom Symbol"],
+    ["Crypto (Binance)", "Forex (Dukascopy SWFX)", "Metals / Macro Index (yfinance)", "Custom Symbol"],
 )
 
 if asset_category == "Crypto (Binance)":
@@ -1376,12 +1522,12 @@ if asset_category == "Crypto (Binance)":
     yf_ticker = binance_to_yf_ticker(symbol)
     primary_source_note = "Primary: Binance REST (klines + L2 depth, 3-endpoint fallback)"
 
-elif asset_category == "Forex (Kraken)":
+elif asset_category == "Forex (Dukascopy SWFX)":
     asset_label = st.sidebar.selectbox("Select Forex Pair", list(FOREX_ASSETS.keys()))
     symbol = FOREX_ASSETS[asset_label]
     asset_class = "forex"
     yf_ticker = forex_to_yf_ticker(symbol)
-    primary_source_note = "Primary: Kraken REST (OHLC + L2 depth)"
+    primary_source_note = "Primary: Dukascopy SWFX (live tick feed → OHLC + tick-flow depth, intraday)"
 
 elif asset_category == "Metals / Macro Index (yfinance)":
     asset_label = st.sidebar.selectbox("Select Macro Asset", list(MACRO_ASSETS.keys()))
@@ -1402,7 +1548,7 @@ else:
         primary_source_note = "Primary: Binance REST (klines + L2 depth, 3-endpoint fallback)"
     elif asset_class == "forex":
         yf_ticker = forex_to_yf_ticker(symbol)
-        primary_source_note = "Primary: Kraken REST (OHLC + L2 depth)"
+        primary_source_note = "Primary: Dukascopy SWFX (live tick feed → OHLC + tick-flow depth, intraday)"
     else:
         yf_ticker = symbol
         primary_source_note = "Primary: yfinance (OHLCV + option chains)"
@@ -1422,9 +1568,12 @@ st.sidebar.markdown(
     "<div style='font-size:0.75rem; opacity:0.75;'>"
     "<b>Data Engine Routing</b><br>"
     "Crypto/Metals proxy → Binance Public API (3-endpoint fallback)<br>"
-    "Major Forex → Kraken Public API<br>"
-    "Macro/Index/Futures → yfinance<br>"
-    "Any source failure → automatic yfinance fallback<br><br>"
+    "Major Forex (intraday) → Dukascopy SWFX live tick feed<br>"
+    "Major Forex (daily+) / Macro/Index/Futures → yfinance<br>"
+    "Any source failure → automatic yfinance fallback<br>"
+    "Forex depth ladder is built from real SWFX tick prints (bid/ask price + "
+    "volume), not a native multi-level order book — Dukascopy does not publish "
+    "one publicly.<br><br>"
     "For informational / research purposes only — not investment advice."
     "</div>",
     unsafe_allow_html=True,
@@ -1442,7 +1591,7 @@ with st.spinner(f"Fetching market data for {symbol}..."):
 
 order_book_df = pd.DataFrame()
 if asset_class in ("crypto", "forex"):
-    with st.spinner("Fetching live L2 order book depth..."):
+    with st.spinner("Fetching live order book / tick-flow depth..."):
         order_book_df = fetch_order_book(asset_class, symbol)
 
 if main_df.empty:
@@ -1455,7 +1604,13 @@ if main_df.empty:
 if len(main_df) < 20:
     st.warning("Very limited data returned for this selection — consider a lower-granularity interval.")
 
-dom_badge = "🟢 LIVE L2 DOM" if not order_book_df.empty else ("⚪ NO L2 DOM (macro asset)" if asset_class == "macro" else "🔴 L2 DOM UNAVAILABLE")
+if asset_class == "crypto":
+    dom_badge = "🟢 LIVE L2 DOM" if not order_book_df.empty else "🔴 L2 DOM UNAVAILABLE"
+elif asset_class == "forex":
+    dom_badge = "🟢 LIVE SWFX TICK-FLOW DEPTH" if not order_book_df.empty else "🔴 DEPTH UNAVAILABLE"
+else:
+    dom_badge = "⚪ NO L2 DOM (macro asset)"
+
 st.markdown(
     f'<span class="source-badge">📡 CANDLES: {source_used.upper()}</span>'
     f'<span class="source-badge">{dom_badge}</span>',
