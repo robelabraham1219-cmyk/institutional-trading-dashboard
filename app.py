@@ -379,7 +379,7 @@ def _dukascopy_hour_url(symbol: str, dt_utc: datetime) -> str:
 def _fetch_dukascopy_hour_raw(symbol: str, dt_utc: datetime) -> bytes:
     url = _dukascopy_hour_url(symbol, dt_utc)
     try:
-        resp = requests.get(url, headers=HTTP_HEADERS, timeout=6)
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=15)
         if resp.status_code != 200 or not resp.content:
             return b""
         return resp.content
@@ -589,7 +589,7 @@ def fetch_order_book(asset_class: str, symbol: str) -> pd.DataFrame:
             # window of actual bid/ask ticks and traded volumes is bucketed into price
             # levels, producing a real, live, trade-flow-derived depth structure (see
             # module docstring for the honest distinction vs. a native L2 snapshot).
-            ticks = fetch_dukascopy_ticks(symbol, lookback_hours=2)
+            ticks = fetch_dukascopy_ticks(symbol, lookback_hours=72)
             if ticks.empty:
                 return pd.DataFrame()
 
