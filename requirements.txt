@@ -1,7 +1,7 @@
-streamlit>=1.32.0
-yfinance>=0.2.40
-pandas>=2.0.0
-numpy>=1.24.0
-plotly>=5.18.0
-scikit-learn>=1.3.0
-requests>=2.31.0
+streamlit>=1.32.0[span_0](start_span)[span_0](end_span)
+pandas>=2.2.0[span_1](start_span)[span_1](end_span)
+numpy>=1.24.0[span_2](start_span)[span_2](end_span)
+plotly>=5.18.0[span_3](start_span)[span_3](end_span)
+scikit-learn>=1.3.0[span_4](start_span)[span_4](end_span)
+requests>=2.31.0[span_5](start_span)[span_5](end_span)
+yfinance>=0.2.40[span_6](start_span)[span_6](end_span)
