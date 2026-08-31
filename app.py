@@ -1,7 +1,7 @@
 """
 ==================================================================================
 INSTITUTIONAL QUANTITATIVE TRADING TERMINAL
-Hybrid Multi-Source Data Engine — Binance | Dukascopy SWFX + yfinance | yfinance
+Hybrid Multi-Source Data Engine — Binance | yfinance (+ optional Dukascopy SWFX overlay)
 ==================================================================================
 A single-file, production-ready Streamlit application implementing six
 institutional-grade quantitative trading modules, backed by a hybrid data engine
@@ -9,41 +9,71 @@ that routes each asset class to the venue best suited to serve real market data
 without requiring the user to hold API keys:
 
     Crypto & Metals proxy   -> Binance Public REST API   (klines + depth, 3-endpoint fallback)
-    Major Forex pairs       -> HYBRID: yfinance structural baseline (guarantees 200+ bars on
-                                every timeframe) + Dukascopy SWFX live tick overlay (real
-                                bid/ask volume stitched onto the baseline candles, and a
-                                tick-derived DOM/liquidity ladder)
+    Major Forex pairs       -> yfinance structural baseline (ALWAYS, fast, guarantees 200+
+                                bars) + OPTIONAL Dukascopy SWFX live tick overlay for real
+                                volume / DOM, fetched as a separate, toggleable, lazy step
     Macro / Index / Futures -> yfinance                   (OHLCV + option chains)
     Universal fallback      -> yfinance                   (any source failure)
 
-WHY A HYBRID PIPELINE FOR FOREX:
-Dukascopy's free, no-key-required SWFX feed (datafeed.dukascopy.com, LZMA-compressed
-".bi5" files, one per symbol/hour) is genuine exchange-sourced tick data — but it is a
-TICK feed (best bid/ask per print), not a bar-history service, and reconstructing deep
-OHLC history from it means one live HTTP request per hour of history. Earlier revisions
-of this engine used Dukascopy ticks as the PRIMARY candle source, which meant thin or
-just-opened trading sessions (or transient fetch gaps) could starve the chart down to a
-handful of bars — breaking the ML Classifier, FVG detection, and Liquidity Pool modules,
-which all need a real history to work with.
+PERFORMANCE ARCHITECTURE (why "Fetching market data..." is now fast):
+Earlier revisions called the Dukascopy SWFX tick downloader (`fetch_dukascopy_ticks`,
+which fans out up to ~168 concurrent HTTP requests) INSIDE `fetch_ohlcv()` — i.e. inside
+the exact call wrapped by the "Fetching market data..." spinner on every page load and
+every timeframe change. That's what made the UI feel stuck.
 
-This revision inverts that: for forex, the STRUCTURAL candle history (Open/High/Low/
-Close, used by every module for price action, indicators, and ML features) always comes
-from yfinance, exactly the same reliable, deep-history source already used for macro
-assets — so bar counts are never starved. Real Dukascopy SWFX ticks are then stitched on
-TOP of that baseline purely as an enrichment layer:
-  - Volume overlay: real tick-derived traded volume is resampled onto the same bar grid
-    and substituted into the Volume column wherever live tick coverage exists, so Volume
-    Delta / CVD and VWAP get genuine forex order-flow volume instead of yfinance's usually
-    empty FX volume field.
-  - DOM/liquidity ladder: recent real tick bid/ask prices and volumes are bucketed into
-    price levels to build a live "SWFX Tick-Flow Depth" ladder for Module 1 (bank-wall
-    isolation, Bank Anchor PnL Tracker). This is honestly labelled as tick-derived depth,
-    not a native multi-level order book — Dukascopy does not publish one publicly (see the
-    depth engine section below for the full explanation).
+This revision fully decouples the two:
+  1. `fetch_ohlcv()` for forex now ONLY calls yfinance, exactly once. It never touches
+     Dukascopy, and it never issues a second, identical yfinance call for the same
+     ticker/interval (a wasted duplicate retry that existed in an earlier revision).
+     This is the same call used for every asset class, so "Fetching market data..." is
+     always just one fast, cached yfinance/Binance request — no network fan-out, ever.
+  2. Dukascopy tick fetching (used for both the real-volume overlay and the DOM ladder)
+     happens afterwards, under its own separate spinner, and ONLY when the sidebar
+     "Enable Live SWFX Tick Overlay" toggle is on and the selected timeframe is intraday
+     (daily+ timeframes never needed it and now explicitly skip it). Both the volume
+     overlay and the DOM ladder pull from the SAME cached `fetch_dukascopy_ticks()` call
+     (identical symbol + lookback-hours cache key), so there is only ever one network
+     batch per rerun, not two.
+  3. Every `.bi5` hourly download and the tick-parsing step are `st.cache_data(ttl=300)`,
+     so once an hour's ticks are fetched they are reused instantly across refreshes.
 
-Both the raw ".bi5" hourly downloads and the tick-parsing pipeline are wrapped in
-`st.cache_data(ttl=300)` so that historical hours (which never change) are fetched once
-and reused instantly across chart refreshes, timeframe switches, and tab changes.
+Honest caveat: Streamlit executes a script top-to-bottom on every rerun and paints the
+page only once that run finishes — there's no true background/async rendering without
+extra infrastructure (e.g. st.fragment + session-state polling, or a websocket bridge),
+which this single-file app does not attempt to fake. What's guaranteed here is that the
+Dukascopy fan-out is no longer on the *candle* critical path, is user-toggleable, is
+skipped automatically on timeframes that don't need it, and is cached — so the heaviest
+part of a load is, at worst, one clearly-labeled optional spinner instead of blocking
+candle rendering entirely.
+
+VOLUME ROBUSTNESS (why VWAP/CVD/Iceberg no longer break on forex):
+yfinance reports zero (or missing) volume for most FX pairs, and Dukascopy's real tick
+volume only covers a recent rolling window. Rather than let downstream math divide by a
+column that's sometimes entirely zero, a Synthetic Volume Proxy
+(`apply_synthetic_volume_proxy`) is applied immediately after the baseline candles are
+fetched — before any module sees the data — whenever real reported volume is missing on
+more than half the bars. It is a bar-range/volatility-weighted estimate
+((High-Low) scaled by the bar's absolute return), NOT real traded volume, and it is
+always disclosed as such: a neutral "🧮 Synthetic Volume Proxy" badge (not a jarring
+yellow warning) is shown wherever it's in effect, and any real Dukascopy tick volume
+fetched afterwards overwrites the synthetic estimate bar-by-bar wherever real coverage
+exists. This guarantees every bar has a positive Volume value, so VWAP/CVD/Volume Delta/
+Iceberg detection never divide by zero or degrade to all-NaN.
+
+PRODUCTION HARDENING NOTES (this revision):
+  - `overlay_dukascopy_tick_volume()` is now wrapped in its own try/except so timezone
+    mismatches, resample hiccups, or a misaligned/missing index degrade gracefully to
+    "keep the baseline volume" instead of crashing the whole page. The call site in the
+    main flow also wraps the tick fetch and order-book fetch in try/except for the same
+    reason — a live network hiccup on the optional overlay step must never take down the
+    candles that already rendered successfully.
+  - `fetch_ohlcv()` no longer issues a wasted, identical duplicate yfinance retry for
+    forex (same ticker, same interval, guaranteed to return the same empty result). Macro
+    assets now have their own explicit branch so they are correctly labeled
+    "yfinance (macro)" instead of being mislabeled "yfinance (fallback)" when yfinance was
+    actually the primary (and only) source for that asset class all along.
+  - The ML probability donut chart now sets `dragmode="pan"` like every other chart in
+    the app, for a consistent interaction model across all six modules.
 
 Modules:
   1. Institutional Order Flow & Liquidity Heatmap (BSL/SSL, FVGs, live $ volume
@@ -133,6 +163,17 @@ DARK_CSS = """
         font-weight: 600;
         margin-right: 6px;
     }
+    .info-badge {
+        display: inline-block;
+        background-color: #16202e;
+        color: #7ea6d8;
+        border: 1px solid #24405e;
+        border-radius: 6px;
+        padding: 4px 12px;
+        font-size: 0.8rem;
+        font-weight: 500;
+        margin-bottom: 8px;
+    }
     .stButton>button {
         background-color: #f0b90b;
         color: #0b0e14;
@@ -191,6 +232,17 @@ LIGHT_CSS = """
         font-weight: 600;
         margin-right: 6px;
     }
+    .info-badge {
+        display: inline-block;
+        background-color: #eef4fb;
+        color: #2f5d8a;
+        border: 1px solid #cfe0f0;
+        border-radius: 6px;
+        padding: 4px 12px;
+        font-size: 0.8rem;
+        font-weight: 500;
+        margin-bottom: 8px;
+    }
     .stButton>button {
         background-color: #b8860b;
         color: #ffffff;
@@ -234,20 +286,13 @@ BINANCE_DEPTH_ENDPOINTS = [
 
 DUKASCOPY_BASE_URL = "https://datafeed.dukascopy.com/datafeed"
 
-# How many hours of real Dukascopy SWFX ticks are pulled to build the volume-overlay
-# and DOM ladder layers, per intraday base timeframe. This ONLY controls the enrichment
-# layer now — the structural candle history always comes from yfinance (see docstring),
-# so these values can stay modest without ever starving the chart of bars.
-TICK_OVERLAY_LOOKBACK_HOURS = {
-    "1m": 6,
-    "5m": 24,
-    "15m": 48,
-    "30m": 72,
-    "1h": 120,
-    "4h": 168,
-}
+# Base timeframes for which a Dukascopy tick overlay is even meaningful. Daily+ bases
+# are never attempted — yfinance is the sole source there, backstopped by the synthetic
+# volume proxy, so no tick fetch (and no request fan-out) happens on those timeframes.
+TICK_OVERLAY_ELIGIBLE_BASES = {"1m", "5m", "15m", "30m", "1h", "4h"}
+BAR_RULE_MAP = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h"}
 
-DEFAULT_DOM_LOOKBACK_HOURS = 72
+DEFAULT_TICK_LOOKBACK_HOURS = 48
 DEFAULT_DOM_BUCKET_PIPS = 2.0
 DEFAULT_BINANCE_DEPTH_LIMIT = 1000
 
@@ -379,12 +424,149 @@ def fetch_binance_klines(symbol: str, base_key: str, limit: int = 1000) -> pd.Da
             continue
     return pd.DataFrame()
 
-# ------------------------------------------------------------------
-# Dukascopy SWFX — raw tick feed fetcher (public, no API key needed)
-# Used ONLY as an enrichment layer (volume overlay + DOM ladder), never
-# as the structural candle source — see module docstring.
-# ------------------------------------------------------------------
+def fetch_yfinance_ohlcv(ticker: str, base_key: str) -> pd.DataFrame:
+    period_map = {
+        "1m": "7d", "5m": "60d", "15m": "60d", "30m": "60d",
+        "1h": "730d", "4h": "730d", "1d": "10y",
+    }
+    interval_map = {
+        "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+        "1h": "60m", "4h": "60m", "1d": "1d",
+    }
+    period = period_map.get(base_key, "1y")
+    yf_interval = interval_map.get(base_key, "1d")
+    try:
+        raw = yf.download(
+            tickers=ticker, period=period, interval=yf_interval,
+            progress=False, auto_adjust=False, threads=False,
+        )
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        if isinstance(raw.columns, pd.MultiIndex):
+            try:
+                raw.columns = raw.columns.get_level_values(0)
+            except Exception:
+                raw.columns = ["_".join([str(c) for c in col if c]) for col in raw.columns]
+        expected = ["Open", "High", "Low", "Close", "Volume"]
+        for col in expected:
+            if col not in raw.columns:
+                return pd.DataFrame()
+        df = raw[expected].copy()
+        df.index = pd.to_datetime(df.index)
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        df["Volume"] = df["Volume"].fillna(0)
+        if base_key == "4h" and not df.empty:
+            df = resample_ohlcv(df, "4h")
+        return df
+    except Exception:
+        return pd.DataFrame()
 
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_ohlcv(asset_class: str, symbol: str, yf_ticker: str, interval_key: str):
+    """Fast structural candle fetch ONLY. Never touches Dukascopy — see module docstring
+    (Performance Architecture) for why this separation is what fixes the load-time bug.
+
+    Each asset class has exactly one explicit primary path and, where it makes sense, one
+    genuinely different fallback path — no asset class ever calls the identical fetcher
+    with the identical arguments twice in a row (that was a wasted duplicate retry in an
+    earlier revision for forex, since a failed yfinance call will fail again immediately
+    with the same ticker/interval). Macro assets get their own branch so `source_used` is
+    labeled correctly ("yfinance (macro)") instead of being mislabeled as a "fallback"
+    when yfinance was actually the sole, intended source all along.
+    """
+    cfg = INTERVAL_CONFIG.get(interval_key, INTERVAL_CONFIG["1d"])
+    base_key = cfg["base"]
+    resample_rule = cfg["resample"]
+
+    df = pd.DataFrame()
+    source_used = "unavailable"
+
+    if asset_class == "crypto":
+        df = fetch_binance_klines(symbol, base_key)
+        if not df.empty:
+            source_used = "Binance (live)"
+        else:
+            # Genuine fallback: different source (yfinance) via the crypto->yf ticker
+            # translation, not a repeat of the same call.
+            df = fetch_yfinance_ohlcv(yf_ticker, base_key)
+            if not df.empty:
+                source_used = "yfinance (fallback)"
+
+    elif asset_class == "forex":
+        df = fetch_yfinance_ohlcv(yf_ticker, base_key)
+        if not df.empty:
+            source_used = "yfinance (structural baseline)"
+        # No further retry here: yfinance is the sole forex source, and calling it again
+        # with identical args would just repeat the same empty result for no benefit.
+
+    elif asset_class == "macro":
+        df = fetch_yfinance_ohlcv(yf_ticker, base_key)
+        if not df.empty:
+            source_used = "yfinance (macro)"
+
+    else:
+        # Unrecognized/custom asset class: yfinance is the universal fallback.
+        df = fetch_yfinance_ohlcv(yf_ticker, base_key)
+        if not df.empty:
+            source_used = "yfinance (fallback)"
+
+    if df.empty:
+        return pd.DataFrame(), source_used
+
+    if resample_rule:
+        df = resample_ohlcv(df, resample_rule)
+
+    return df, source_used
+
+def get_last_price(asset_class: str, symbol: str, yf_ticker: str):
+    df, _src = fetch_ohlcv(asset_class, symbol, yf_ticker, "1d")
+    if df.empty:
+        return None
+    return float(df["Close"].iloc[-1])
+
+# ==================================================================================
+# SYNTHETIC VOLUME PROXY — seamless fallback when real volume is missing/zero
+# ==================================================================================
+
+def apply_synthetic_volume_proxy(df: pd.DataFrame):
+    """Fills bars with no real reported volume using a bar-range/volatility-weighted
+    estimate, so VWAP / CVD / Volume Delta / Iceberg detection always have a positive,
+    non-degenerate Volume series to work with. Returns (df, used_synthetic: bool).
+
+    This is explicitly an ESTIMATE, not real traded volume — callers must disclose it
+    to the user (see the "🧮 Synthetic Volume Proxy" badges in the modules below)
+    rather than presenting it as genuine exchange volume. Any bar that already has real
+    reported volume (> 0) is left untouched; only zero/missing bars are filled.
+    """
+    if df.empty:
+        return df, False
+
+    vol = df["Volume"].fillna(0)
+    real_coverage = float((vol > 0).mean()) if len(vol) else 0.0
+    if real_coverage >= 0.5:
+        return df, False
+
+    out = df.copy()
+    bar_range = (out["High"] - out["Low"]).clip(lower=0)
+    ret_vol = out["Close"].pct_change().abs().fillna(0)
+    raw_proxy = (bar_range * (1.0 + ret_vol * 25.0)).replace([np.inf, -np.inf], 0).fillna(0)
+
+    if raw_proxy.sum() <= 0:
+        raw_proxy = pd.Series(1.0, index=out.index)
+
+    positive_mean = raw_proxy[raw_proxy > 0].mean() if (raw_proxy > 0).any() else 1.0
+    scaled = (raw_proxy / positive_mean) * 1000.0
+    scaled = scaled.replace([np.inf, -np.inf], np.nan)
+    fallback_fill = scaled.mean() if scaled.notna().any() else 1000.0
+    scaled = scaled.fillna(fallback_fill).clip(lower=1.0)
+
+    out["Volume"] = vol.where(vol > 0, scaled)
+    return out, True
+
+# ==================================================================================
+# DUKASCOPY SWFX — OPTIONAL LAZY TICK OVERLAY (volume enrichment + DOM ladder)
+# Fetched separately from the candle pipeline; never blocks candle rendering.
+# ------------------------------------------------------------------
 def _dukascopy_hour_url(symbol: str, dt_utc: datetime) -> str:
     # Dukascopy's month component in the URL path is zero-indexed (Jan = 00).
     return (
@@ -395,8 +577,8 @@ def _dukascopy_hour_url(symbol: str, dt_utc: datetime) -> str:
 @st.cache_data(ttl=300, show_spinner=False)
 def _fetch_dukascopy_hour_raw(symbol: str, dt_utc: datetime) -> bytes:
     """Download one hour's raw .bi5 bytes. Cached for 5 minutes — completed historical
-    hours never change, so once an hour is cached, every subsequent chart refresh, tab
-    switch, or timeframe change reuses it instantly instead of re-hitting the network."""
+    hours never change, so every later reuse (across the volume-overlay path AND the DOM
+    ladder path, and across reruns) is a cache hit rather than a fresh network call."""
     url = _dukascopy_hour_url(symbol, dt_utc)
     try:
         resp = requests.get(url, headers=HTTP_HEADERS, timeout=15)
@@ -446,8 +628,9 @@ def _decode_dukascopy_bi5(raw_bytes: bytes, hour_start_utc: datetime, point_divi
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_dukascopy_ticks(symbol: str, lookback_hours: int) -> pd.DataFrame:
     """Pull the last `lookback_hours` of real SWFX ticks for `symbol`, concurrently.
-    Cached for 5 minutes so repeated calls (e.g. from both the volume-overlay step and
-    the DOM ladder step in the same page render) don't re-download anything."""
+    Cached for 5 minutes on the exact (symbol, lookback_hours) key — the volume-overlay
+    step and the DOM-ladder step both call this with the SAME lookback_hours value, so
+    only the first caller in a rerun actually hits the network; the second is a cache hit."""
     now_utc = datetime.now(timezone.utc)
     current_hour = now_utc.replace(minute=0, second=0, microsecond=0)
     hour_slots = [current_hour - timedelta(hours=h) for h in range(lookback_hours + 1)]
@@ -476,127 +659,52 @@ def fetch_dukascopy_ticks(symbol: str, lookback_hours: int) -> pd.DataFrame:
     return tdf
 
 def overlay_dukascopy_tick_volume(df: pd.DataFrame, ticks: pd.DataFrame, base_key: str) -> pd.DataFrame:
-    """Stitch real Dukascopy tick-derived volume onto a yfinance structural baseline.
+    """Stitch real Dukascopy tick-derived volume onto the baseline candles, overwriting
+    the synthetic proxy (if any) wherever live tick coverage exists. OHLC values are
+    never touched — only Volume.
 
-    The baseline OHLC bars are never touched — only the Volume column is overlaid,
-    wherever live tick coverage exists for that bar. Bars outside the tick lookback
-    window keep whatever yfinance reported (typically 0 for FX, which downstream
-    modules already treat as "no volume data" gracefully).
+    Hardened: timezone mismatches (naive vs. tz-aware indices on either side), resample
+    hiccups on odd/irregular tick data, and missing or misaligned indices are all caught
+    here. On any failure this returns the baseline `df` completely untouched rather than
+    raising — an optional live overlay must never crash the app or block volume from
+    being available (the synthetic proxy / real yfinance volume already on `df` stands).
     """
-    bar_rule_map = {
-        "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h",
-    }
-    rule = bar_rule_map.get(base_key)
-    if rule is None or ticks.empty or df.empty:
+    rule = BAR_RULE_MAP.get(base_key)
+    if rule is None or ticks is None or ticks.empty or df is None or df.empty:
         return df
 
-    tick_vol = ticks["volume"].resample(rule).sum()
-
-    idx = df.index
-    idx_utc = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-    tv_idx = tick_vol.index
-    tick_vol.index = tv_idx.tz_localize("UTC") if tv_idx.tz is None else tv_idx.tz_convert("UTC")
-
     try:
-        tolerance = pd.Timedelta(rule)
+        if "volume" not in ticks.columns:
+            return df
+
+        tick_vol = ticks["volume"].resample(rule).sum()
+
+        idx = df.index
+        idx_utc = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+        tv_idx = tick_vol.index
+        tick_vol.index = tv_idx.tz_localize("UTC") if tv_idx.tz is None else tv_idx.tz_convert("UTC")
+
+        try:
+            tolerance = pd.Timedelta(rule)
+        except Exception:
+            tolerance = None
+
+        aligned = tick_vol.reindex(idx_utc, method="nearest", tolerance=tolerance)
+
+        out = df.copy()
+        vol_arr = aligned.to_numpy()
+        valid = ~pd.isna(vol_arr)
+        valid = valid & (vol_arr > 0)
+        if valid.any():
+            out_vol = out["Volume"].to_numpy(dtype=float)
+            out_vol[valid] = vol_arr[valid]
+            out["Volume"] = out_vol
+        return out
     except Exception:
-        tolerance = None
-
-    aligned = tick_vol.reindex(idx_utc, method="nearest", tolerance=tolerance)
-
-    out = df.copy()
-    vol_arr = aligned.to_numpy()
-    valid = ~pd.isna(vol_arr)
-    valid = valid & (vol_arr > 0)
-    if valid.any():
-        out_vol = out["Volume"].to_numpy(dtype=float)
-        out_vol[valid] = vol_arr[valid]
-        out["Volume"] = out_vol
-    return out
-
-def fetch_yfinance_ohlcv(ticker: str, base_key: str) -> pd.DataFrame:
-    period_map = {
-        "1m": "7d", "5m": "60d", "15m": "60d", "30m": "60d",
-        "1h": "730d", "4h": "730d", "1d": "10y",
-    }
-    interval_map = {
-        "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-        "1h": "60m", "4h": "60m", "1d": "1d",
-    }
-    period = period_map.get(base_key, "1y")
-    yf_interval = interval_map.get(base_key, "1d")
-    try:
-        raw = yf.download(
-            tickers=ticker, period=period, interval=yf_interval,
-            progress=False, auto_adjust=False, threads=False,
-        )
-        if raw is None or raw.empty:
-            return pd.DataFrame()
-        if isinstance(raw.columns, pd.MultiIndex):
-            try:
-                raw.columns = raw.columns.get_level_values(0)
-            except Exception:
-                raw.columns = ["_".join([str(c) for c in col if c]) for col in raw.columns]
-        expected = ["Open", "High", "Low", "Close", "Volume"]
-        for col in expected:
-            if col not in raw.columns:
-                return pd.DataFrame()
-        df = raw[expected].copy()
-        df.index = pd.to_datetime(df.index)
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        df["Volume"] = df["Volume"].fillna(0)
-        if base_key == "4h" and not df.empty:
-            df = resample_ohlcv(df, "4h")
+        # Timezone mismatch, resample hiccup, misaligned/missing index, or any other
+        # unexpected shape issue in the live tick data — never crash, never drop
+        # existing volume. Just skip the overlay for this rerun.
         return df
-    except Exception:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_ohlcv(asset_class: str, symbol: str, yf_ticker: str, interval_key: str):
-    cfg = INTERVAL_CONFIG.get(interval_key, INTERVAL_CONFIG["1d"])
-    base_key = cfg["base"]
-    resample_rule = cfg["resample"]
-
-    df = pd.DataFrame()
-    source_used = "unavailable"
-
-    if asset_class == "crypto":
-        df = fetch_binance_klines(symbol, base_key)
-        if not df.empty:
-            source_used = "Binance (live)"
-
-    elif asset_class == "forex":
-        # STRUCTURAL baseline always comes from yfinance — guarantees 200+ bars on
-        # every timeframe, exactly like the macro asset class, so the ML Classifier /
-        # FVG / Liquidity Pool modules are never starved of history.
-        df = fetch_yfinance_ohlcv(yf_ticker, base_key)
-        if not df.empty:
-            source_used = "yfinance (structural baseline)"
-            overlay_hours = TICK_OVERLAY_LOOKBACK_HOURS.get(base_key)
-            if overlay_hours:
-                ticks = fetch_dukascopy_ticks(symbol, overlay_hours)
-                if not ticks.empty:
-                    df = overlay_dukascopy_tick_volume(df, ticks, base_key)
-                    source_used = "yfinance (structure) + Dukascopy SWFX (tick-volume overlay)"
-
-    if df.empty:
-        df = fetch_yfinance_ohlcv(yf_ticker, base_key)
-        if not df.empty:
-            source_used = "yfinance (fallback)"
-
-    if df.empty:
-        return pd.DataFrame(), source_used
-
-    if resample_rule:
-        df = resample_ohlcv(df, resample_rule)
-
-    return df, source_used
-
-def get_last_price(asset_class: str, symbol: str, yf_ticker: str):
-    df, _src = fetch_ohlcv(asset_class, symbol, yf_ticker, "1d")
-    if df.empty:
-        return None
-    return float(df["Close"].iloc[-1])
 
 # ==================================================================================
 # L2 DOM / LIQUIDITY DEPTH ENGINE
@@ -607,7 +715,7 @@ def fetch_order_book(
     asset_class: str,
     symbol: str,
     depth_limit: int = DEFAULT_BINANCE_DEPTH_LIMIT,
-    dom_lookback_hours: int = DEFAULT_DOM_LOOKBACK_HOURS,
+    dom_lookback_hours: int = DEFAULT_TICK_LOOKBACK_HOURS,
     dom_bucket_pips: float = DEFAULT_DOM_BUCKET_PIPS,
 ) -> pd.DataFrame:
     try:
@@ -811,6 +919,9 @@ def price_axis_range(*series_list, pad_pct: float = 0.08):
         pad = abs(hi) * 0.01 if hi != 0 else 1.0
     return [lo - pad, hi + pad]
 
+def render_status_badge(text: str):
+    st.markdown(f'<span class="info-badge">{text}</span>', unsafe_allow_html=True)
+
 # ==================================================================================
 # MODULE 1 — INSTITUTIONAL ORDER FLOW & LIQUIDITY HEATMAP
 # ==================================================================================
@@ -872,11 +983,10 @@ def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, asset
 
     has_dom = asset_class in ("crypto", "forex") and not order_book_df.empty
     if not has_dom:
-        st.info(
-            "Live order-book / tick-flow depth unavailable for this instrument right now (macro/index "
-            "assets have no public order book, or the live feed is temporarily unreachable) — $ volume "
-            "annotations and institutional wall isolation are skipped. Swing/FVG structure is still fully "
-            "computed from price action below."
+        render_status_badge(
+            "ℹ️ Live order-book / tick-flow depth unavailable right now (macro assets have no public "
+            "order book, live SWFX overlay is disabled, or the feed is temporarily unreachable) — "
+            "$ volume annotations and wall isolation are skipped. Swing/FVG structure below is unaffected."
         )
     else:
         badge_text = "🟢 LIVE L2 DOM CONNECTED" if asset_class == "crypto" else "🟢 LIVE SWFX TICK-FLOW DEPTH"
@@ -1086,7 +1196,12 @@ def render_ml_module(df: pd.DataFrame, label: str):
             labels=["Sell", "Hold", "Buy"], values=[sell_p, hold_p, buy_p],
             marker=dict(colors=["#ef5350", "#f0b90b", "#26a69a"]), hole=0.55,
         ))
-        fig_proba.update_layout(template=PLOTLY_TEMPLATE, height=420, title="Directional Probability", margin=dict(l=10, r=10, t=50, b=10))
+        # Chart-configuration consistency fix: every other chart in the app sets
+        # dragmode="pan"; this donut previously omitted it, which is the fix requested.
+        fig_proba.update_layout(
+            template=PLOTLY_TEMPLATE, height=420, title="Directional Probability",
+            margin=dict(l=10, r=10, t=50, b=10), dragmode="pan",
+        )
         st.plotly_chart(fig_proba, use_container_width=True, config=PLOTLY_CONFIG)
 
     st.caption(f"Model trained on {len(X_train)} bars, validated on {len(X_test)} out-of-sample bars for {label}.")
@@ -1207,7 +1322,7 @@ def compute_volume_delta(df: pd.DataFrame) -> pd.DataFrame:
     out["cvd"] = out["delta"].cumsum()
     return out
 
-def render_volume_delta_module(df: pd.DataFrame, label: str, source_used: str):
+def render_volume_delta_module(df: pd.DataFrame, label: str, source_used: str, volume_is_synthetic: bool = False):
     st.markdown(
         '<div class="module-note">Order-flow reconstruction: buying vs. selling volume estimated '
         'from real exchange-reported volume weighted by intra-bar close position, aggregated into '
@@ -1216,7 +1331,12 @@ def render_volume_delta_module(df: pd.DataFrame, label: str, source_used: str):
     )
 
     if df["Volume"].sum() == 0:
-        st.warning("No volume data returned for this instrument — Volume Delta requires non-zero volume.")
+        render_status_badge("ℹ️ No volume data available for this instrument — Volume Delta will show flat/neutral output.")
+    elif volume_is_synthetic:
+        render_status_badge(
+            "🧮 Using a Synthetic Volume Proxy (bar-range × volatility estimate) — real exchange "
+            "volume was unavailable or zero for most bars. Not genuine traded volume."
+        )
 
     vd = compute_volume_delta(df)
     z_thresh = st.slider("Imbalance Spike Sensitivity (Z-score)", 1.0, 4.0, 2.0, step=0.25, key="vd_z")
@@ -1461,6 +1581,15 @@ def compute_vwap_bands(df: pd.DataFrame):
     out["vwap_l2"] = out["vwap"] - 2 * std
 
     out["twap"] = typical_price.expanding().mean()
+
+    # Final safety net: if Volume was entirely zero/NaN despite upstream handling,
+    # vwap/twap could still be all-NaN after ffill/bfill (nothing to fill from).
+    # Fall back to the typical price itself so the chart and downstream metrics
+    # never render NaN.
+    out["vwap"] = out["vwap"].fillna(typical_price)
+    out["twap"] = out["twap"].fillna(typical_price)
+    for col in ["vwap_u1", "vwap_u2", "vwap_l1", "vwap_l2"]:
+        out[col] = out[col].fillna(out["vwap"])
     return out
 
 def detect_icebergs(df: pd.DataFrame, z_thresh: float = 2.5):
@@ -1473,7 +1602,7 @@ def detect_icebergs(df: pd.DataFrame, z_thresh: float = 2.5):
     icebergs = out[(out["vr_z"] >= z_thresh)]
     return out, icebergs
 
-def render_execution_module(df: pd.DataFrame, label: str):
+def render_execution_module(df: pd.DataFrame, label: str, volume_is_synthetic: bool = False):
     st.markdown(
         '<div class="module-note">Institutional execution benchmarks — VWAP with statistical '
         'deviation bands, TWAP baseline, and detection of probable iceberg / hidden-order clusters.</div>',
@@ -1481,7 +1610,12 @@ def render_execution_module(df: pd.DataFrame, label: str):
     )
 
     if df["Volume"].sum() == 0:
-        st.warning("No volume data returned for this instrument — VWAP and iceberg detection require non-zero volume.")
+        render_status_badge("ℹ️ No volume data available for this instrument — VWAP falls back to typical price.")
+    elif volume_is_synthetic:
+        render_status_badge(
+            "🧮 Using a Synthetic Volume Proxy (bar-range × volatility estimate) — real exchange "
+            "volume was unavailable or zero for most bars. Not genuine traded volume."
+        )
 
     vwap_df = compute_vwap_bands(df)
     z_thresh = st.slider("Iceberg Detection Sensitivity (Z-score)", 1.5, 4.0, 2.5, step=0.25, key="ice_z")
@@ -1562,7 +1696,7 @@ st.sidebar.divider()
 st.sidebar.subheader("Asset Selection")
 asset_category = st.sidebar.selectbox(
     "Asset Category",
-    ["Crypto (Binance)", "Forex (Dukascopy SWFX + yfinance)", "Metals / Macro Index (yfinance)", "Custom Symbol"],
+    ["Crypto (Binance)", "Forex (yfinance + optional SWFX overlay)", "Metals / Macro Index (yfinance)", "Custom Symbol"],
 )
 
 if asset_category == "Crypto (Binance)":
@@ -1572,12 +1706,12 @@ if asset_category == "Crypto (Binance)":
     yf_ticker = binance_to_yf_ticker(symbol)
     primary_source_note = "Primary: Binance REST (klines + L2 depth, 3-endpoint fallback)"
 
-elif asset_category == "Forex (Dukascopy SWFX + yfinance)":
+elif asset_category == "Forex (yfinance + optional SWFX overlay)":
     asset_label = st.sidebar.selectbox("Select Forex Pair", list(FOREX_ASSETS.keys()))
     symbol = FOREX_ASSETS[asset_label]
     asset_class = "forex"
     yf_ticker = forex_to_yf_ticker(symbol)
-    primary_source_note = "Primary: yfinance structural baseline + Dukascopy SWFX tick overlay (DOM / volume)"
+    primary_source_note = "Primary: yfinance structural baseline (always fast) + optional Dukascopy SWFX tick overlay"
 
 elif asset_category == "Metals / Macro Index (yfinance)":
     asset_label = st.sidebar.selectbox("Select Macro Asset", list(MACRO_ASSETS.keys()))
@@ -1598,7 +1732,7 @@ else:
         primary_source_note = "Primary: Binance REST (klines + L2 depth, 3-endpoint fallback)"
     elif asset_class == "forex":
         yf_ticker = forex_to_yf_ticker(symbol)
-        primary_source_note = "Primary: yfinance structural baseline + Dukascopy SWFX tick overlay (DOM / volume)"
+        primary_source_note = "Primary: yfinance structural baseline (always fast) + optional Dukascopy SWFX tick overlay"
     else:
         yf_ticker = symbol
         primary_source_note = "Primary: yfinance (OHLCV + option chains)"
@@ -1607,26 +1741,41 @@ st.sidebar.caption(primary_source_note)
 st.sidebar.divider()
 
 interval = st.sidebar.selectbox("Interval / Timeframe", INTERVAL_CHOICES, index=INTERVAL_CHOICES.index("1d"))
+base_key_selected = INTERVAL_CONFIG.get(interval, INTERVAL_CONFIG["1d"])["base"]
 
 st.sidebar.divider()
 st.sidebar.subheader("DOM / Order-Book Depth")
 
 binance_depth_limit = DEFAULT_BINANCE_DEPTH_LIMIT
-dom_lookback_hours = DEFAULT_DOM_LOOKBACK_HOURS
+tick_lookback_hours = DEFAULT_TICK_LOOKBACK_HOURS
 dom_bucket_pips = DEFAULT_DOM_BUCKET_PIPS
+enable_tick_overlay = False
 
 if asset_class == "crypto":
     binance_depth_limit = st.sidebar.select_slider(
         "Binance Depth Levels", options=[50, 100, 250, 500, 1000], value=DEFAULT_BINANCE_DEPTH_LIMIT,
     )
 elif asset_class == "forex":
-    dom_lookback_hours = st.sidebar.slider(
-        "SWFX Tick Lookback (hours)", min_value=2, max_value=168, value=DEFAULT_DOM_LOOKBACK_HOURS, step=2,
-        help="Wider lookback survives weekend market closures; narrower is more 'live'.",
+    overlay_possible = base_key_selected in TICK_OVERLAY_ELIGIBLE_BASES
+    enable_tick_overlay = st.sidebar.checkbox(
+        "Enable Live SWFX Tick Overlay (Volume + DOM)", value=True,
+        help="Fetches real Dukascopy SWFX ticks as a separate, lazy step AFTER candles "
+             "load — turn off for maximum speed. Only applies to intraday timeframes; "
+             "candles always render from yfinance regardless of this setting.",
+        disabled=not overlay_possible,
     )
-    dom_bucket_pips = st.sidebar.slider(
-        "DOM Bucket Size (pips)", min_value=0.5, max_value=10.0, value=DEFAULT_DOM_BUCKET_PIPS, step=0.5,
-    )
+    if not overlay_possible:
+        st.sidebar.caption("Tick overlay isn't used on daily+ timeframes — candles + synthetic volume proxy cover it.")
+    if enable_tick_overlay and overlay_possible:
+        tick_lookback_hours = st.sidebar.slider(
+            "SWFX Tick Lookback (hours)", min_value=2, max_value=168, value=DEFAULT_TICK_LOOKBACK_HOURS, step=2,
+            help="Wider lookback survives weekend market closures and covers more bars with real "
+                 "volume; narrower is faster and more 'live'. Shared by both the volume overlay and "
+                 "the DOM ladder — only fetched once per rerun.",
+        )
+        dom_bucket_pips = st.sidebar.slider(
+            "DOM Bucket Size (pips)", min_value=0.5, max_value=10.0, value=DEFAULT_DOM_BUCKET_PIPS, step=0.5,
+        )
 else:
     st.sidebar.caption("No order-book depth controls for macro/index assets (no public order book).")
 
@@ -1640,14 +1789,17 @@ st.sidebar.markdown(
     "<div style='font-size:0.75rem; opacity:0.75;'>"
     "<b>Data Engine Routing</b><br>"
     "Crypto/Metals proxy → Binance Public API (3-endpoint fallback)<br>"
-    "Major Forex → yfinance structural baseline (200+ bars guaranteed) + Dukascopy "
-    "SWFX live tick overlay for volume / DOM (intraday)<br>"
+    "Major Forex → yfinance structural baseline ALWAYS (fast, 200+ bars) + optional, "
+    "toggleable Dukascopy SWFX tick overlay for real volume / DOM (intraday only)<br>"
     "Macro/Index/Futures → yfinance<br>"
     "Any source failure → automatic yfinance fallback<br>"
-    "Forex depth ladder is built from real SWFX tick prints (bid/ask price + "
-    "volume), not a native multi-level order book — Dukascopy does not publish "
-    "one publicly.<br>"
-    "All Dukascopy tick downloads are cached 5 minutes so repeated views are instant.<br><br>"
+    "When real volume is missing/zero, a disclosed Synthetic Volume Proxy "
+    "(bar-range × volatility) fills the gap so VWAP/CVD/Iceberg never break — real "
+    "tick volume overwrites it wherever the SWFX overlay has coverage.<br>"
+    "Forex depth ladder is built from real SWFX tick prints (bid/ask price + volume), "
+    "not a native multi-level order book — Dukascopy does not publish one publicly.<br>"
+    "All Dukascopy tick downloads are cached 5 minutes and shared between the volume "
+    "overlay and DOM ladder, so repeated views are instant and never double-fetch.<br><br>"
     "For informational / research purposes only — not investment advice."
     "</div>",
     unsafe_allow_html=True,
@@ -1660,18 +1812,9 @@ st.sidebar.markdown(
 st.title("📊 Institutional Quantitative Trading Terminal")
 st.caption(f"Active Instrument: **{asset_label}** ({symbol}) · Class: {asset_class} · Interval: {interval}")
 
+# Step 1 — FAST structural candle fetch. Never touches Dukascopy for any asset class.
 with st.spinner(f"Fetching market data for {symbol}..."):
     main_df, source_used = fetch_ohlcv(asset_class, symbol, yf_ticker, interval)
-
-order_book_df = pd.DataFrame()
-if asset_class in ("crypto", "forex"):
-    with st.spinner("Fetching live order book / tick-flow depth..."):
-        order_book_df = fetch_order_book(
-            asset_class, symbol,
-            depth_limit=binance_depth_limit,
-            dom_lookback_hours=dom_lookback_hours,
-            dom_bucket_pips=dom_bucket_pips,
-        )
 
 if main_df.empty:
     st.error(
@@ -1680,21 +1823,72 @@ if main_df.empty:
     )
     st.stop()
 
+# Step 2 — Synthetic volume proxy applied immediately (local compute, no network) so
+# every downstream module always has a usable, non-degenerate Volume column regardless
+# of whether the optional tick overlay below succeeds, is enabled, or is even applicable.
+volume_is_synthetic = False
+if asset_class == "forex":
+    main_df, volume_is_synthetic = apply_synthetic_volume_proxy(main_df)
+
+# Step 3 — OPTIONAL, separate, lazy Dukascopy tick overlay. Only runs for forex, only
+# when the sidebar toggle is on, and only on intraday timeframes. This is intentionally
+# AFTER candles are already valid and renderable, under its own clearly-labeled spinner.
+# Every network/parse call here is independently wrapped in try/except: a hiccup in the
+# optional overlay must never crash the app or discard candles that already rendered.
+order_book_df = pd.DataFrame()
+if asset_class == "crypto":
+    with st.spinner("Fetching live Binance order book..."):
+        try:
+            order_book_df = fetch_order_book(asset_class, symbol, depth_limit=binance_depth_limit)
+        except Exception:
+            order_book_df = pd.DataFrame()
+
+elif asset_class == "forex" and enable_tick_overlay and base_key_selected in TICK_OVERLAY_ELIGIBLE_BASES:
+    with st.spinner("Fetching live SWFX tick-flow overlay (volume + DOM)..."):
+        try:
+            ticks = fetch_dukascopy_ticks(symbol, tick_lookback_hours)
+        except Exception:
+            ticks = pd.DataFrame()
+
+        if not ticks.empty:
+            overlaid_df = overlay_dukascopy_tick_volume(main_df, ticks, base_key_selected)
+            if overlaid_df is not None and not overlaid_df.empty:
+                main_df = overlaid_df
+                source_used += " + Dukascopy SWFX tick overlay"
+
+        try:
+            order_book_df = fetch_order_book(
+                asset_class, symbol,
+                dom_lookback_hours=tick_lookback_hours,
+                dom_bucket_pips=dom_bucket_pips,
+            )
+        except Exception:
+            order_book_df = pd.DataFrame()
+
 if len(main_df) < 20:
     st.warning("Very limited data returned for this selection — consider a lower-granularity interval.")
 
 if asset_class == "crypto":
     dom_badge = "🟢 LIVE L2 DOM" if not order_book_df.empty else "🔴 L2 DOM UNAVAILABLE"
 elif asset_class == "forex":
-    dom_badge = "🟢 LIVE SWFX TICK-FLOW DEPTH" if not order_book_df.empty else "🔴 DEPTH UNAVAILABLE"
+    if not enable_tick_overlay:
+        dom_badge = "⚪ TICK OVERLAY DISABLED (candles still live via yfinance)"
+    elif base_key_selected not in TICK_OVERLAY_ELIGIBLE_BASES:
+        dom_badge = "⚪ NOT APPLICABLE ON THIS TIMEFRAME"
+    elif not order_book_df.empty:
+        dom_badge = "🟢 LIVE SWFX TICK-FLOW DEPTH"
+    else:
+        dom_badge = "🔴 DEPTH UNAVAILABLE"
 else:
     dom_badge = "⚪ NO L2 DOM (macro asset)"
 
-st.markdown(
+badges_html = (
     f'<span class="source-badge">📡 CANDLES: {source_used.upper()}</span>'
-    f'<span class="source-badge">{dom_badge}</span>',
-    unsafe_allow_html=True,
+    f'<span class="source-badge">{dom_badge}</span>'
 )
+if volume_is_synthetic:
+    badges_html += '<span class="source-badge">🧮 SYNTHETIC VOLUME PROXY ACTIVE</span>'
+st.markdown(badges_html, unsafe_allow_html=True)
 
 # Snapshot metrics
 last_row = main_df.iloc[-1]
@@ -1743,7 +1937,7 @@ with tab3:
 
 with tab4:
     try:
-        render_volume_delta_module(main_df, asset_label, source_used)
+        render_volume_delta_module(main_df, asset_label, source_used, volume_is_synthetic)
     except Exception as e:
         st.error(f"Volume Delta module encountered an error: {e}")
 
@@ -1755,7 +1949,7 @@ with tab5:
 
 with tab6:
     try:
-        render_execution_module(main_df, asset_label)
+        render_execution_module(main_df, asset_label, volume_is_synthetic)
     except Exception as e:
         st.error(f"Execution Algorithms module encountered an error: {e}")
 
