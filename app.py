@@ -1,7 +1,7 @@
 """
 ==================================================================================
 INSTITUTIONAL QUANTITATIVE TRADING TERMINAL
-Hybrid Multi-Source L2 DOM Data Engine — Binance | Dukascopy SWFX | yfinance
+Hybrid Multi-Source Data Engine — Binance | Dukascopy SWFX + yfinance | yfinance
 ==================================================================================
 A single-file, production-ready Streamlit application implementing six
 institutional-grade quantitative trading modules, backed by a hybrid data engine
@@ -9,32 +9,41 @@ that routes each asset class to the venue best suited to serve real market data
 without requiring the user to hold API keys:
 
     Crypto & Metals proxy   -> Binance Public REST API   (klines + depth, 3-endpoint fallback)
-    Major Forex pairs       -> Dukascopy SWFX             (public tick-data feed, no key)
+    Major Forex pairs       -> HYBRID: yfinance structural baseline (guarantees 200+ bars on
+                                every timeframe) + Dukascopy SWFX live tick overlay (real
+                                bid/ask volume stitched onto the baseline candles, and a
+                                tick-derived DOM/liquidity ladder)
     Macro / Index / Futures -> yfinance                   (OHLCV + option chains)
     Universal fallback      -> yfinance                   (any source failure)
 
-NOTE ON DUKASCOPY SWFX DATA:
-Dukascopy publishes free, no-key-required historical/live TICK data for its SWFX
-feed at datafeed.dukascopy.com (LZMA-compressed ".bi5" files, one per
-symbol/hour, each containing raw bid/ask price + bid/ask volume ticks). This is
-genuine exchange-sourced Forex data, but it is important to be precise about
-what it is:
-  - It is a TICK feed (best bid / best ask per trade tick), not a multi-level
-    order book snapshot. Dukascopy does not publish a public, key-free,
-    multi-level Level 2 depth-of-market feed (real DOM ladders are only
-    available inside the JForex platform to funded account holders).
-  - This engine reconstructs OHLC candles directly from real ticks, and builds
-    a live "liquidity depth" ladder by aggregating real tick bid/ask prices and
-    traded volumes into price buckets around the current market — i.e. genuine
-    SWFX trade-flow/liquidity data, presented as a DOM-style ladder, rather than
-    an exchange-published resting-order book. This is labelled honestly in the
-    UI ("SWFX Tick-Flow Depth") wherever it's shown, exactly as GEX module 5
-    already labels simulated vs. live options data.
-  - Because reconstructing daily+ history from per-hour tick files would require
-    thousands of live HTTP requests, Dukascopy is used here for intraday bases
-    (1m/5m/15m/30m/1h/4h) where live SWFX liquidity actually matters most. Daily
-    and longer bases route through the existing yfinance fallback, exactly the
-    same "any source gap -> yfinance" pattern already used elsewhere in this app.
+WHY A HYBRID PIPELINE FOR FOREX:
+Dukascopy's free, no-key-required SWFX feed (datafeed.dukascopy.com, LZMA-compressed
+".bi5" files, one per symbol/hour) is genuine exchange-sourced tick data — but it is a
+TICK feed (best bid/ask per print), not a bar-history service, and reconstructing deep
+OHLC history from it means one live HTTP request per hour of history. Earlier revisions
+of this engine used Dukascopy ticks as the PRIMARY candle source, which meant thin or
+just-opened trading sessions (or transient fetch gaps) could starve the chart down to a
+handful of bars — breaking the ML Classifier, FVG detection, and Liquidity Pool modules,
+which all need a real history to work with.
+
+This revision inverts that: for forex, the STRUCTURAL candle history (Open/High/Low/
+Close, used by every module for price action, indicators, and ML features) always comes
+from yfinance, exactly the same reliable, deep-history source already used for macro
+assets — so bar counts are never starved. Real Dukascopy SWFX ticks are then stitched on
+TOP of that baseline purely as an enrichment layer:
+  - Volume overlay: real tick-derived traded volume is resampled onto the same bar grid
+    and substituted into the Volume column wherever live tick coverage exists, so Volume
+    Delta / CVD and VWAP get genuine forex order-flow volume instead of yfinance's usually
+    empty FX volume field.
+  - DOM/liquidity ladder: recent real tick bid/ask prices and volumes are bucketed into
+    price levels to build a live "SWFX Tick-Flow Depth" ladder for Module 1 (bank-wall
+    isolation, Bank Anchor PnL Tracker). This is honestly labelled as tick-derived depth,
+    not a native multi-level order book — Dukascopy does not publish one publicly (see the
+    depth engine section below for the full explanation).
+
+Both the raw ".bi5" hourly downloads and the tick-parsing pipeline are wrapped in
+`st.cache_data(ttl=300)` so that historical hours (which never change) are fetched once
+and reused instantly across chart refreshes, timeframe switches, and tab changes.
 
 Modules:
   1. Institutional Order Flow & Liquidity Heatmap (BSL/SSL, FVGs, live $ volume
@@ -225,10 +234,11 @@ BINANCE_DEPTH_ENDPOINTS = [
 
 DUKASCOPY_BASE_URL = "https://datafeed.dukascopy.com/datafeed"
 
-# Max historical hours of raw tick files pulled per intraday base timeframe.
-# Kept modest because each hour is a separate live HTTP request; deeper history
-# for daily+ charts is served by the yfinance fallback instead (see module docstring).
-DUKASCOPY_LOOKBACK_HOURS = {
+# How many hours of real Dukascopy SWFX ticks are pulled to build the volume-overlay
+# and DOM ladder layers, per intraday base timeframe. This ONLY controls the enrichment
+# layer now — the structural candle history always comes from yfinance (see docstring),
+# so these values can stay modest without ever starving the chart of bars.
+TICK_OVERLAY_LOOKBACK_HOURS = {
     "1m": 6,
     "5m": 24,
     "15m": 48,
@@ -236,6 +246,10 @@ DUKASCOPY_LOOKBACK_HOURS = {
     "1h": 120,
     "4h": 168,
 }
+
+DEFAULT_DOM_LOOKBACK_HOURS = 72
+DEFAULT_DOM_BUCKET_PIPS = 2.0
+DEFAULT_BINANCE_DEPTH_LIMIT = 1000
 
 # ==================================================================================
 # ASSET UNIVERSE
@@ -367,6 +381,8 @@ def fetch_binance_klines(symbol: str, base_key: str, limit: int = 1000) -> pd.Da
 
 # ------------------------------------------------------------------
 # Dukascopy SWFX — raw tick feed fetcher (public, no API key needed)
+# Used ONLY as an enrichment layer (volume overlay + DOM ladder), never
+# as the structural candle source — see module docstring.
 # ------------------------------------------------------------------
 
 def _dukascopy_hour_url(symbol: str, dt_utc: datetime) -> str:
@@ -376,7 +392,11 @@ def _dukascopy_hour_url(symbol: str, dt_utc: datetime) -> str:
         f"{dt_utc.month - 1:02d}/{dt_utc.day:02d}/{dt_utc.hour:02d}h_ticks.bi5"
     )
 
+@st.cache_data(ttl=300, show_spinner=False)
 def _fetch_dukascopy_hour_raw(symbol: str, dt_utc: datetime) -> bytes:
+    """Download one hour's raw .bi5 bytes. Cached for 5 minutes — completed historical
+    hours never change, so once an hour is cached, every subsequent chart refresh, tab
+    switch, or timeframe change reuses it instantly instead of re-hitting the network."""
     url = _dukascopy_hour_url(symbol, dt_utc)
     try:
         resp = requests.get(url, headers=HTTP_HEADERS, timeout=15)
@@ -423,9 +443,11 @@ def _decode_dukascopy_bi5(raw_bytes: bytes, hour_start_utc: datetime, point_divi
         })
     return ticks
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_dukascopy_ticks(symbol: str, lookback_hours: int) -> pd.DataFrame:
-    """Pull the last `lookback_hours` of real SWFX ticks for `symbol`, concurrently."""
+    """Pull the last `lookback_hours` of real SWFX ticks for `symbol`, concurrently.
+    Cached for 5 minutes so repeated calls (e.g. from both the volume-overlay step and
+    the DOM ladder step in the same page render) don't re-download anything."""
     now_utc = datetime.now(timezone.utc)
     current_hour = now_utc.replace(minute=0, second=0, microsecond=0)
     hour_slots = [current_hour - timedelta(hours=h) for h in range(lookback_hours + 1)]
@@ -453,32 +475,44 @@ def fetch_dukascopy_ticks(symbol: str, lookback_hours: int) -> pd.DataFrame:
     tdf["volume"] = tdf["ask_volume"] + tdf["bid_volume"]
     return tdf
 
-def fetch_dukascopy_ohlc(symbol: str, base_key: str) -> pd.DataFrame:
-    """Build real OHLCV candles for `base_key` from genuine Dukascopy SWFX ticks."""
-    lookback_hours = DUKASCOPY_LOOKBACK_HOURS.get(base_key)
-    if lookback_hours is None:
-        # Daily+ bases are intentionally routed to the yfinance fallback — see
-        # the module docstring for why (thousands of per-hour requests would
-        # otherwise be needed to reconstruct months/years of daily bars).
-        return pd.DataFrame()
+def overlay_dukascopy_tick_volume(df: pd.DataFrame, ticks: pd.DataFrame, base_key: str) -> pd.DataFrame:
+    """Stitch real Dukascopy tick-derived volume onto a yfinance structural baseline.
 
-    ticks = fetch_dukascopy_ticks(symbol, lookback_hours)
-    if ticks.empty:
-        return pd.DataFrame()
-
+    The baseline OHLC bars are never touched — only the Volume column is overlaid,
+    wherever live tick coverage exists for that bar. Bars outside the tick lookback
+    window keep whatever yfinance reported (typically 0 for FX, which downstream
+    modules already treat as "no volume data" gracefully).
+    """
     bar_rule_map = {
         "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h",
     }
     rule = bar_rule_map.get(base_key)
-    if rule is None:
-        return pd.DataFrame()
+    if rule is None or ticks.empty or df.empty:
+        return df
 
-    ohlc = ticks["mid"].resample(rule).ohlc()
-    vol = ticks["volume"].resample(rule).sum()
-    df = pd.concat([ohlc, vol.rename("Volume")], axis=1)
-    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
-    return df[["Open", "High", "Low", "Close", "Volume"]]
+    tick_vol = ticks["volume"].resample(rule).sum()
+
+    idx = df.index
+    idx_utc = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+    tv_idx = tick_vol.index
+    tick_vol.index = tv_idx.tz_localize("UTC") if tv_idx.tz is None else tv_idx.tz_convert("UTC")
+
+    try:
+        tolerance = pd.Timedelta(rule)
+    except Exception:
+        tolerance = None
+
+    aligned = tick_vol.reindex(idx_utc, method="nearest", tolerance=tolerance)
+
+    out = df.copy()
+    vol_arr = aligned.to_numpy()
+    valid = ~pd.isna(vol_arr)
+    valid = valid & (vol_arr > 0)
+    if valid.any():
+        out_vol = out["Volume"].to_numpy(dtype=float)
+        out_vol[valid] = vol_arr[valid]
+        out["Volume"] = out_vol
+    return out
 
 def fetch_yfinance_ohlcv(ticker: str, base_key: str) -> pd.DataFrame:
     period_map = {
@@ -530,10 +564,20 @@ def fetch_ohlcv(asset_class: str, symbol: str, yf_ticker: str, interval_key: str
         df = fetch_binance_klines(symbol, base_key)
         if not df.empty:
             source_used = "Binance (live)"
+
     elif asset_class == "forex":
-        df = fetch_dukascopy_ohlc(symbol, base_key)
+        # STRUCTURAL baseline always comes from yfinance — guarantees 200+ bars on
+        # every timeframe, exactly like the macro asset class, so the ML Classifier /
+        # FVG / Liquidity Pool modules are never starved of history.
+        df = fetch_yfinance_ohlcv(yf_ticker, base_key)
         if not df.empty:
-            source_used = "Dukascopy SWFX (live ticks)"
+            source_used = "yfinance (structural baseline)"
+            overlay_hours = TICK_OVERLAY_LOOKBACK_HOURS.get(base_key)
+            if overlay_hours:
+                ticks = fetch_dukascopy_ticks(symbol, overlay_hours)
+                if not ticks.empty:
+                    df = overlay_dukascopy_tick_volume(df, ticks, base_key)
+                    source_used = "yfinance (structure) + Dukascopy SWFX (tick-volume overlay)"
 
     if df.empty:
         df = fetch_yfinance_ohlcv(yf_ticker, base_key)
@@ -559,10 +603,16 @@ def get_last_price(asset_class: str, symbol: str, yf_ticker: str):
 # ==================================================================================
 
 @st.cache_data(ttl=15, show_spinner=False)
-def fetch_order_book(asset_class: str, symbol: str) -> pd.DataFrame:
+def fetch_order_book(
+    asset_class: str,
+    symbol: str,
+    depth_limit: int = DEFAULT_BINANCE_DEPTH_LIMIT,
+    dom_lookback_hours: int = DEFAULT_DOM_LOOKBACK_HOURS,
+    dom_bucket_pips: float = DEFAULT_DOM_BUCKET_PIPS,
+) -> pd.DataFrame:
     try:
         if asset_class == "crypto":
-            params = {"symbol": symbol.upper(), "limit": 1000}
+            params = {"symbol": symbol.upper(), "limit": depth_limit}
             for url in BINANCE_DEPTH_ENDPOINTS:
                 try:
                     resp = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=6)
@@ -589,16 +639,16 @@ def fetch_order_book(asset_class: str, symbol: str) -> pd.DataFrame:
             # window of actual bid/ask ticks and traded volumes is bucketed into price
             # levels, producing a real, live, trade-flow-derived depth structure (see
             # module docstring for the honest distinction vs. a native L2 snapshot).
-            ticks = fetch_dukascopy_ticks(symbol, lookback_hours=72)
+            ticks = fetch_dukascopy_ticks(symbol, lookback_hours=dom_lookback_hours)
             if ticks.empty:
                 return pd.DataFrame()
 
-            recent = ticks.tail(2000).copy()
+            recent = ticks.tail(4000).copy()
             if recent.empty:
                 return pd.DataFrame()
 
             pip = 0.01 if "JPY" in symbol.upper() else 0.0001
-            bucket_size = pip * 2  # 2-pip aggregation buckets
+            bucket_size = pip * max(dom_bucket_pips, 0.1)
 
             recent["bid_bucket"] = (recent["bid"] / bucket_size).round() * bucket_size
             recent["ask_bucket"] = (recent["ask"] / bucket_size).round() * bucket_size
@@ -1495,7 +1545,7 @@ def render_execution_module(df: pd.DataFrame, label: str):
 # ==================================================================================
 
 st.sidebar.markdown("## 📊 Institutional Quant Terminal")
-st.sidebar.caption("Hybrid Multi-Source L2 DOM Data Engine")
+st.sidebar.caption("Hybrid Multi-Source Data Engine")
 
 theme_choice = st.sidebar.radio(
     "🎨 Theme", ["Dark Theme", "Light Theme"], index=0, horizontal=True, key="theme_choice",
@@ -1512,7 +1562,7 @@ st.sidebar.divider()
 st.sidebar.subheader("Asset Selection")
 asset_category = st.sidebar.selectbox(
     "Asset Category",
-    ["Crypto (Binance)", "Forex (Dukascopy SWFX)", "Metals / Macro Index (yfinance)", "Custom Symbol"],
+    ["Crypto (Binance)", "Forex (Dukascopy SWFX + yfinance)", "Metals / Macro Index (yfinance)", "Custom Symbol"],
 )
 
 if asset_category == "Crypto (Binance)":
@@ -1522,12 +1572,12 @@ if asset_category == "Crypto (Binance)":
     yf_ticker = binance_to_yf_ticker(symbol)
     primary_source_note = "Primary: Binance REST (klines + L2 depth, 3-endpoint fallback)"
 
-elif asset_category == "Forex (Dukascopy SWFX)":
+elif asset_category == "Forex (Dukascopy SWFX + yfinance)":
     asset_label = st.sidebar.selectbox("Select Forex Pair", list(FOREX_ASSETS.keys()))
     symbol = FOREX_ASSETS[asset_label]
     asset_class = "forex"
     yf_ticker = forex_to_yf_ticker(symbol)
-    primary_source_note = "Primary: Dukascopy SWFX (live tick feed → OHLC + tick-flow depth, intraday)"
+    primary_source_note = "Primary: yfinance structural baseline + Dukascopy SWFX tick overlay (DOM / volume)"
 
 elif asset_category == "Metals / Macro Index (yfinance)":
     asset_label = st.sidebar.selectbox("Select Macro Asset", list(MACRO_ASSETS.keys()))
@@ -1548,7 +1598,7 @@ else:
         primary_source_note = "Primary: Binance REST (klines + L2 depth, 3-endpoint fallback)"
     elif asset_class == "forex":
         yf_ticker = forex_to_yf_ticker(symbol)
-        primary_source_note = "Primary: Dukascopy SWFX (live tick feed → OHLC + tick-flow depth, intraday)"
+        primary_source_note = "Primary: yfinance structural baseline + Dukascopy SWFX tick overlay (DOM / volume)"
     else:
         yf_ticker = symbol
         primary_source_note = "Primary: yfinance (OHLCV + option chains)"
@@ -1557,6 +1607,28 @@ st.sidebar.caption(primary_source_note)
 st.sidebar.divider()
 
 interval = st.sidebar.selectbox("Interval / Timeframe", INTERVAL_CHOICES, index=INTERVAL_CHOICES.index("1d"))
+
+st.sidebar.divider()
+st.sidebar.subheader("DOM / Order-Book Depth")
+
+binance_depth_limit = DEFAULT_BINANCE_DEPTH_LIMIT
+dom_lookback_hours = DEFAULT_DOM_LOOKBACK_HOURS
+dom_bucket_pips = DEFAULT_DOM_BUCKET_PIPS
+
+if asset_class == "crypto":
+    binance_depth_limit = st.sidebar.select_slider(
+        "Binance Depth Levels", options=[50, 100, 250, 500, 1000], value=DEFAULT_BINANCE_DEPTH_LIMIT,
+    )
+elif asset_class == "forex":
+    dom_lookback_hours = st.sidebar.slider(
+        "SWFX Tick Lookback (hours)", min_value=2, max_value=168, value=DEFAULT_DOM_LOOKBACK_HOURS, step=2,
+        help="Wider lookback survives weekend market closures; narrower is more 'live'.",
+    )
+    dom_bucket_pips = st.sidebar.slider(
+        "DOM Bucket Size (pips)", min_value=0.5, max_value=10.0, value=DEFAULT_DOM_BUCKET_PIPS, step=0.5,
+    )
+else:
+    st.sidebar.caption("No order-book depth controls for macro/index assets (no public order book).")
 
 st.sidebar.divider()
 if st.sidebar.button("🔄 Refresh All Data (Clear Cache)", use_container_width=True):
@@ -1568,12 +1640,14 @@ st.sidebar.markdown(
     "<div style='font-size:0.75rem; opacity:0.75;'>"
     "<b>Data Engine Routing</b><br>"
     "Crypto/Metals proxy → Binance Public API (3-endpoint fallback)<br>"
-    "Major Forex (intraday) → Dukascopy SWFX live tick feed<br>"
-    "Major Forex (daily+) / Macro/Index/Futures → yfinance<br>"
+    "Major Forex → yfinance structural baseline (200+ bars guaranteed) + Dukascopy "
+    "SWFX live tick overlay for volume / DOM (intraday)<br>"
+    "Macro/Index/Futures → yfinance<br>"
     "Any source failure → automatic yfinance fallback<br>"
     "Forex depth ladder is built from real SWFX tick prints (bid/ask price + "
     "volume), not a native multi-level order book — Dukascopy does not publish "
-    "one publicly.<br><br>"
+    "one publicly.<br>"
+    "All Dukascopy tick downloads are cached 5 minutes so repeated views are instant.<br><br>"
     "For informational / research purposes only — not investment advice."
     "</div>",
     unsafe_allow_html=True,
@@ -1592,7 +1666,12 @@ with st.spinner(f"Fetching market data for {symbol}..."):
 order_book_df = pd.DataFrame()
 if asset_class in ("crypto", "forex"):
     with st.spinner("Fetching live order book / tick-flow depth..."):
-        order_book_df = fetch_order_book(asset_class, symbol)
+        order_book_df = fetch_order_book(
+            asset_class, symbol,
+            depth_limit=binance_depth_limit,
+            dom_lookback_hours=dom_lookback_hours,
+            dom_bucket_pips=dom_bucket_pips,
+        )
 
 if main_df.empty:
     st.error(
