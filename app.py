@@ -22,11 +22,13 @@ the exact call wrapped by the "Fetching market data..." spinner on every page lo
 every timeframe change. That's what made the UI feel stuck.
 
 This revision fully decouples the two:
-  1. `fetch_ohlcv()` for forex now ONLY calls yfinance, exactly once. It never touches
-     Dukascopy, and it never issues a second, identical yfinance call for the same
-     ticker/interval (a wasted duplicate retry that existed in an earlier revision).
-     This is the same call used for every asset class, so "Fetching market data..." is
-     always just one fast, cached yfinance/Binance request — no network fan-out, ever.
+  1. `fetch_ohlcv()` for forex now ONLY calls yfinance. It never touches Dukascopy. This
+     is the same call used for every asset class, so "Fetching market data..." is always
+     just one fast, cached yfinance/Binance request — no network fan-out, ever. The
+     fallback path is also asset-aware now: forex never retries yfinance a second time
+     with the same arguments (that was a pointless duplicate call) — it only falls back
+     to yfinance if the primary route WASN'T already yfinance (i.e. for crypto, if
+     Binance failed).
   2. Dukascopy tick fetching (used for both the real-volume overlay and the DOM ladder)
      happens afterwards, under its own separate spinner, and ONLY when the sidebar
      "Enable Live SWFX Tick Overlay" toggle is on and the selected timeframe is intraday
@@ -59,21 +61,6 @@ yellow warning) is shown wherever it's in effect, and any real Dukascopy tick vo
 fetched afterwards overwrites the synthetic estimate bar-by-bar wherever real coverage
 exists. This guarantees every bar has a positive Volume value, so VWAP/CVD/Volume Delta/
 Iceberg detection never divide by zero or degrade to all-NaN.
-
-PRODUCTION HARDENING NOTES (this revision):
-  - `overlay_dukascopy_tick_volume()` is now wrapped in its own try/except so timezone
-    mismatches, resample hiccups, or a misaligned/missing index degrade gracefully to
-    "keep the baseline volume" instead of crashing the whole page. The call site in the
-    main flow also wraps the tick fetch and order-book fetch in try/except for the same
-    reason — a live network hiccup on the optional overlay step must never take down the
-    candles that already rendered successfully.
-  - `fetch_ohlcv()` no longer issues a wasted, identical duplicate yfinance retry for
-    forex (same ticker, same interval, guaranteed to return the same empty result). Macro
-    assets now have their own explicit branch so they are correctly labeled
-    "yfinance (macro)" instead of being mislabeled "yfinance (fallback)" when yfinance was
-    actually the primary (and only) source for that asset class all along.
-  - The ML probability donut chart now sets `dragmode="pan"` like every other chart in
-    the app, for a consistent interaction model across all six modules.
 
 Modules:
   1. Institutional Order Flow & Liquidity Heatmap (BSL/SSL, FVGs, live $ volume
@@ -466,46 +453,35 @@ def fetch_ohlcv(asset_class: str, symbol: str, yf_ticker: str, interval_key: str
     """Fast structural candle fetch ONLY. Never touches Dukascopy — see module docstring
     (Performance Architecture) for why this separation is what fixes the load-time bug.
 
-    Each asset class has exactly one explicit primary path and, where it makes sense, one
-    genuinely different fallback path — no asset class ever calls the identical fetcher
-    with the identical arguments twice in a row (that was a wasted duplicate retry in an
-    earlier revision for forex, since a failed yfinance call will fail again immediately
-    with the same ticker/interval). Macro assets get their own branch so `source_used` is
-    labeled correctly ("yfinance (macro)") instead of being mislabeled as a "fallback"
-    when yfinance was actually the sole, intended source all along.
-    """
+    Fallback logic is asset-aware: forex's primary route already IS yfinance, so if it
+    comes back empty there is no point calling fetch_yfinance_ohlcv() a second time with
+    identical arguments — it will just fail again. The generic "any source failure ->
+    yfinance" fallback below now only fires for asset classes whose primary route was
+    NOT yfinance (i.e. crypto, when all three Binance endpoints failed)."""
     cfg = INTERVAL_CONFIG.get(interval_key, INTERVAL_CONFIG["1d"])
     base_key = cfg["base"]
     resample_rule = cfg["resample"]
 
     df = pd.DataFrame()
     source_used = "unavailable"
+    primary_was_yfinance = False
 
     if asset_class == "crypto":
         df = fetch_binance_klines(symbol, base_key)
         if not df.empty:
             source_used = "Binance (live)"
-        else:
-            # Genuine fallback: different source (yfinance) via the crypto->yf ticker
-            # translation, not a repeat of the same call.
-            df = fetch_yfinance_ohlcv(yf_ticker, base_key)
-            if not df.empty:
-                source_used = "yfinance (fallback)"
-
     elif asset_class == "forex":
         df = fetch_yfinance_ohlcv(yf_ticker, base_key)
+        primary_was_yfinance = True
         if not df.empty:
             source_used = "yfinance (structural baseline)"
-        # No further retry here: yfinance is the sole forex source, and calling it again
-        # with identical args would just repeat the same empty result for no benefit.
-
-    elif asset_class == "macro":
-        df = fetch_yfinance_ohlcv(yf_ticker, base_key)
-        if not df.empty:
-            source_used = "yfinance (macro)"
-
     else:
-        # Unrecognized/custom asset class: yfinance is the universal fallback.
+        df = fetch_yfinance_ohlcv(yf_ticker, base_key)
+        primary_was_yfinance = True
+        if not df.empty:
+            source_used = "yfinance"
+
+    if df.empty and not primary_was_yfinance:
         df = fetch_yfinance_ohlcv(yf_ticker, base_key)
         if not df.empty:
             source_used = "yfinance (fallback)"
@@ -661,22 +637,14 @@ def fetch_dukascopy_ticks(symbol: str, lookback_hours: int) -> pd.DataFrame:
 def overlay_dukascopy_tick_volume(df: pd.DataFrame, ticks: pd.DataFrame, base_key: str) -> pd.DataFrame:
     """Stitch real Dukascopy tick-derived volume onto the baseline candles, overwriting
     the synthetic proxy (if any) wherever live tick coverage exists. OHLC values are
-    never touched — only Volume.
-
-    Hardened: timezone mismatches (naive vs. tz-aware indices on either side), resample
-    hiccups on odd/irregular tick data, and missing or misaligned indices are all caught
-    here. On any failure this returns the baseline `df` completely untouched rather than
-    raising — an optional live overlay must never crash the app or block volume from
-    being available (the synthetic proxy / real yfinance volume already on `df` stands).
-    """
+    never touched — only Volume. Wrapped in try/except by the caller so a malformed
+    tick batch (bad timezone, empty resample, etc.) degrades gracefully instead of
+    crashing the app or wiping out the candles already on screen."""
     rule = BAR_RULE_MAP.get(base_key)
-    if rule is None or ticks is None or ticks.empty or df is None or df.empty:
+    if rule is None or ticks.empty or df.empty:
         return df
 
     try:
-        if "volume" not in ticks.columns:
-            return df
-
         tick_vol = ticks["volume"].resample(rule).sum()
 
         idx = df.index
@@ -701,9 +669,8 @@ def overlay_dukascopy_tick_volume(df: pd.DataFrame, ticks: pd.DataFrame, base_ke
             out["Volume"] = out_vol
         return out
     except Exception:
-        # Timezone mismatch, resample hiccup, misaligned/missing index, or any other
-        # unexpected shape issue in the live tick data — never crash, never drop
-        # existing volume. Just skip the overlay for this rerun.
+        # Any alignment/merge failure falls back to the candles as they already are
+        # (real volume or synthetic proxy) rather than raising or clearing the chart.
         return df
 
 # ==================================================================================
@@ -1196,8 +1163,6 @@ def render_ml_module(df: pd.DataFrame, label: str):
             labels=["Sell", "Hold", "Buy"], values=[sell_p, hold_p, buy_p],
             marker=dict(colors=["#ef5350", "#f0b90b", "#26a69a"]), hole=0.55,
         ))
-        # Chart-configuration consistency fix: every other chart in the app sets
-        # dragmode="pan"; this donut previously omitted it, which is the fix requested.
         fig_proba.update_layout(
             template=PLOTLY_TEMPLATE, height=420, title="Directional Probability",
             margin=dict(l=10, r=10, t=50, b=10), dragmode="pan",
@@ -1228,9 +1193,11 @@ def render_correlation_module(symbol: str, yf_ticker: str, asset_class: str, lab
 
     lookback = st.slider("Correlation Lookback (Days)", 30, 730, 180, step=10, key="corr_lookback")
 
+    # Labels aligned 1:1 with MACRO_ASSETS naming so badges/legends read consistently
+    # across the Macro asset picker and this module's correlation matrix.
     base_macro = {
         "US Dollar Index (DXY)": "DX-Y.NYB",
-        "US 10Y Yield": "^TNX",
+        "US 10-Year Treasury Yield": "^TNX",
         "Bitcoin (BTC/USD)": "BTC-USD",
     }
 
@@ -1792,7 +1759,8 @@ st.sidebar.markdown(
     "Major Forex → yfinance structural baseline ALWAYS (fast, 200+ bars) + optional, "
     "toggleable Dukascopy SWFX tick overlay for real volume / DOM (intraday only)<br>"
     "Macro/Index/Futures → yfinance<br>"
-    "Any source failure → automatic yfinance fallback<br>"
+    "Any source failure → automatic yfinance fallback (crypto only — forex's primary IS "
+    "yfinance already, so it is never retried a second time with identical arguments)<br>"
     "When real volume is missing/zero, a disclosed Synthetic Volume Proxy "
     "(bar-range × volatility) fills the gap so VWAP/CVD/Iceberg never break — real "
     "tick volume overwrites it wherever the SWFX overlay has coverage.<br>"
@@ -1832,30 +1800,21 @@ if asset_class == "forex":
 
 # Step 3 — OPTIONAL, separate, lazy Dukascopy tick overlay. Only runs for forex, only
 # when the sidebar toggle is on, and only on intraday timeframes. This is intentionally
-# AFTER candles are already valid and renderable, under its own clearly-labeled spinner.
-# Every network/parse call here is independently wrapped in try/except: a hiccup in the
-# optional overlay must never crash the app or discard candles that already rendered.
+# AFTER candles are already valid and renderable, under its own clearly-labeled spinner,
+# and wrapped in try/except so a Dukascopy hiccup never takes candles off the screen.
 order_book_df = pd.DataFrame()
 if asset_class == "crypto":
     with st.spinner("Fetching live Binance order book..."):
-        try:
-            order_book_df = fetch_order_book(asset_class, symbol, depth_limit=binance_depth_limit)
-        except Exception:
-            order_book_df = pd.DataFrame()
-
+        order_book_df = fetch_order_book(asset_class, symbol, depth_limit=binance_depth_limit)
 elif asset_class == "forex" and enable_tick_overlay and base_key_selected in TICK_OVERLAY_ELIGIBLE_BASES:
     with st.spinner("Fetching live SWFX tick-flow overlay (volume + DOM)..."):
         try:
             ticks = fetch_dukascopy_ticks(symbol, tick_lookback_hours)
         except Exception:
             ticks = pd.DataFrame()
-
         if not ticks.empty:
-            overlaid_df = overlay_dukascopy_tick_volume(main_df, ticks, base_key_selected)
-            if overlaid_df is not None and not overlaid_df.empty:
-                main_df = overlaid_df
-                source_used += " + Dukascopy SWFX tick overlay"
-
+            main_df = overlay_dukascopy_tick_volume(main_df, ticks, base_key_selected)
+            source_used += " + Dukascopy SWFX tick overlay"
         try:
             order_book_df = fetch_order_book(
                 asset_class, symbol,
