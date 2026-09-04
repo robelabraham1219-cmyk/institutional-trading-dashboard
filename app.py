@@ -1,63 +1,39 @@
 """
 ==================================================================================
-INSTITUTIONAL QUANTITATIVE TRADING TERMINAL
-Tradovate Live Data Engine — REST Auth + WebSocket L2 DOM / Quote / Chart Stream
+TRADOVATE INSTITUTIONAL QUANTITATIVE TRADING TERMINAL
+Live Tradovate REST + WebSocket Engine — Multi-Contract Streaming
 ==================================================================================
-A single-file, production-ready Streamlit application implementing six
-institutional-grade quantitative trading modules, backed entirely by the
-Tradovate Trading API (Demo or Live environment):
+Streams real-time quotes, Level 2 DOM, tick trades, and multi-timeframe candles
+for five major futures contracts (NQ, ES, MNQ, MES, CL) directly from the
+Tradovate Trading API, feeding six institutional quant analytics modules.
 
-    Authentication   -> POST {rest}/auth/accesstoken   (REST, username/password/API key)
-    Real-time Quotes -> WS   md/subscribeQuote          (best bid/ask, last, volume)
-    Real-time DOM    -> WS   md/subscribeDOM            (full Level 2 price ladder)
-    Real-time Chart  -> WS   md/getChart                (historical + live bar stream)
+DEPENDENCY NOTE: this build intentionally uses only the libraries listed in
+requirements.txt (streamlit, pandas, numpy, plotly, requests, websocket-client,
+scikit-learn) — no yfinance, no python-dotenv. Two consequences worth knowing:
+  - Module 3 (Cross-Asset Correlation) correlates the five Tradovate-streamed
+    contracts against EACH OTHER (their own live daily bars), not against
+    yfinance macro series (DXY/10Y yield) like an earlier version of this app
+    did — there is no macro data source wired in without yfinance.
+  - Module 5 (GEX) is a pure Black-Scholes simulation calibrated off each
+    contract's live Tradovate spot price. There is no live listed-options
+    chain source without yfinance, so no "live proxy chain" fallback exists
+    in this build — the UI labels it as simulated, clearly, at all times.
+  - Credentials are entered each session via the sidebar UI only; there is no
+    .env file support in this build (no python-dotenv dependency).
 
-IMPORTANT — READ BEFORE DEPLOYING WITH REAL CREDENTIALS
----------------------------------------------------------------------------------
-Tradovate's `/auth/accesstoken` endpoint requires FOUR credential fields, not
-just a username/password:
-    name (username), password, appId, appVersion, cid (API Key/Client ID),
-    sec (API Secret), and optionally deviceId.
-`cid`/`sec` are issued to you by Tradovate under Settings -> API Access on the
-account you authenticate with. A bare username+password without cid/sec will
-be rejected by the endpoint ("Access is denied"). The sidebar below collects
-all of these fields (or reads them from a `.env` file) — this is not optional
-scaffolding, it is how the endpoint actually works.
-
-The WebSocket wire protocol used by Tradovate (`wss://demo.tradovateapi.com/v1/websocket`)
-is a lightweight SockJS-style text framing:
-    - First frame received after connect is the literal string "o" (open).
-    - Every outbound request is a single text frame of the form:
-          "<endpoint>\\n<requestId>\\n<query>\\n<jsonBody>"
-      e.g.  "md/subscribeDOM\\n3\\n\\n{\"symbol\":\"ESZ5\"}"
-    - The very first request must be authorization:
-          "authorize\\n1\\n\\n<accessToken>"
-    - Inbound frames are prefixed by a single type character:
-          "o" = open, "h" = heartbeat, "a" = array of JSON messages,
-          "c" = close (server is terminating the session).
-    - "a" frames carry a JSON array, each element shaped like
-          {"s": <status>, "i": <requestId>, "d": <payload>}   (responses)
-      or  {"e": "md", "d": {...}}                             (data events)
-    - The client must not let the socket go idle — this engine replies to each
-      "h" heartbeat by sending a keep-alive frame back immediately, which is
-      the behavior Tradovate's own reference clients use.
-
-Because Streamlit re-executes the whole script on every rerun, a naive
-`websockets.connect()` call inside the script body would reconnect (and lose
-the DOM/quote state) on every single interaction. This engine instead runs the
-WebSocket client on a persistent background thread (stored in
-`st.session_state`, survives reruns) with its own asyncio event loop, and
-exposes a thread-safe snapshot of the latest quote / DOM / chart bars that the
-main Streamlit thread reads on every rerun. A small auto-refresh loop keeps
-the UI polling that snapshot at a configurable interval so the terminal feels
-"live" without needing server-push into the browser.
+WEBSOCKET PROTOCOL: Tradovate's `wss://{env}.tradovateapi.com/v1/websocket`
+uses SockJS-style text framing — "o" (open), "h" (heartbeat), "a" (JSON array
+of messages), "c" (close). Requests are single text frames shaped
+`<endpoint>\\n<requestId>\\n<query>\\n<jsonBody>`, and the first request after
+open must be `authorize\\n<id>\\n\\n<accessToken>`. This engine keeps one
+persistent WebSocket connection alive on a background thread (survives
+Streamlit reruns) and multiplexes subscriptions for all five contracts across
+it: md/subscribeQuote, md/subscribeDOM, and md/getChart per contract.
 ==================================================================================
 """
 
 import json
 import math
-import os
-import queue
 import threading
 import time
 import uuid
@@ -73,172 +49,77 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 import streamlit as st
-import websocket  # websocket-client package (sync, thread-friendly)
-import yfinance as yf
+import websocket  # websocket-client package
 
-from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-load_dotenv()
-
 # ==================================================================================
-# PAGE CONFIG & GLOBAL STYLE
+# PAGE CONFIG & STYLE
 # ==================================================================================
 
 st.set_page_config(
-    page_title="Institutional Quant Terminal — Tradovate",
+    page_title="Tradovate Institutional Quant Terminal",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-DARK_CSS = """
+APP_CSS = """
 <style>
     .stApp { background-color: #0b0e14; color: #e6e6e6; }
     section[data-testid="stSidebar"] { background-color: #0f1420; border-right: 1px solid #1f2937; }
     div[data-testid="stMetric"] {
-        background-color: #131722;
-        border: 1px solid #1f2937;
-        border-radius: 10px;
-        padding: 12px 16px;
+        background-color: #131722; border: 1px solid #1f2937; border-radius: 10px; padding: 12px 16px;
     }
     div[data-testid="stMetricValue"] { color: #f0b90b; }
     h1, h2, h3 { color: #f0f0f0; }
     .stTabs [data-baseweb="tab-list"] { gap: 6px; }
-    .stTabs [data-baseweb="tab"] {
-        background-color: #131722;
-        border-radius: 8px 8px 0 0;
-        padding: 8px 16px;
-        color: #cfd3dc;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #1f2937;
-        color: #f0b90b;
-        font-weight: 600;
-    }
+    .stTabs [data-baseweb="tab"] { background-color: #131722; border-radius: 8px 8px 0 0; padding: 8px 16px; color: #cfd3dc; }
+    .stTabs [aria-selected="true"] { background-color: #1f2937; color: #f0b90b; font-weight: 600; }
     .module-note {
-        background-color: #131722;
-        border-left: 3px solid #f0b90b;
-        padding: 10px 14px;
-        border-radius: 4px;
-        font-size: 0.85rem;
-        color: #b8bdc9;
-        margin-bottom: 10px;
+        background-color: #131722; border-left: 3px solid #f0b90b; padding: 10px 14px;
+        border-radius: 4px; font-size: 0.85rem; color: #b8bdc9; margin-bottom: 10px;
     }
     .source-badge {
-        display: inline-block;
-        background-color: #1f2937;
-        color: #f0b90b;
-        border-radius: 6px;
-        padding: 3px 10px;
-        font-size: 0.75rem;
-        font-weight: 600;
-        margin-right: 6px;
+        display: inline-block; background-color: #1f2937; color: #f0b90b; border-radius: 6px;
+        padding: 3px 10px; font-size: 0.75rem; font-weight: 600; margin-right: 6px;
     }
-    .stButton>button {
-        background-color: #f0b90b;
-        color: #0b0e14;
-        border: none;
-        font-weight: 600;
-        border-radius: 6px;
+    .conn-banner-up {
+        background-color: #0d2b1e; border: 1px solid #1e7d4b; color: #4ade80;
+        border-radius: 8px; padding: 10px 16px; font-weight: 700; margin-bottom: 12px;
     }
+    .conn-banner-down {
+        background-color: #2b0d0d; border: 1px solid #7d1e1e; color: #f87171;
+        border-radius: 8px; padding: 10px 16px; font-weight: 700; margin-bottom: 12px;
+    }
+    .stButton>button { background-color: #f0b90b; color: #0b0e14; border: none; font-weight: 600; border-radius: 6px; }
     thead tr th { background-color: #1f2937 !important; color: #f0b90b !important; }
 </style>
 """
-
-LIGHT_CSS = """
-<style>
-    .stApp { background-color: #f8f9fa; color: #1a1d23; }
-    section[data-testid="stSidebar"] { background-color: #ffffff; border-right: 1px solid #e2e5ea; }
-    div[data-testid="stMetric"] {
-        background-color: #ffffff;
-        border: 1px solid #e2e5ea;
-        border-radius: 10px;
-        padding: 12px 16px;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-    }
-    div[data-testid="stMetricValue"] { color: #b8860b; }
-    h1, h2, h3 { color: #1a1d23; }
-    .stTabs [data-baseweb="tab-list"] { gap: 6px; }
-    .stTabs [data-baseweb="tab"] {
-        background-color: #ffffff;
-        border-radius: 8px 8px 0 0;
-        padding: 8px 16px;
-        color: #4a4f5a;
-        border: 1px solid #e2e5ea;
-        border-bottom: none;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #eef0f3;
-        color: #b8860b;
-        font-weight: 600;
-    }
-    .module-note {
-        background-color: #ffffff;
-        border-left: 3px solid #b8860b;
-        padding: 10px 14px;
-        border-radius: 4px;
-        font-size: 0.85rem;
-        color: #4a4f5a;
-        margin-bottom: 10px;
-        border: 1px solid #e2e5ea;
-    }
-    .source-badge {
-        display: inline-block;
-        background-color: #eef0f3;
-        color: #8a6400;
-        border-radius: 6px;
-        padding: 3px 10px;
-        font-size: 0.75rem;
-        font-weight: 600;
-        margin-right: 6px;
-    }
-    .stButton>button {
-        background-color: #b8860b;
-        color: #ffffff;
-        border: none;
-        font-weight: 600;
-        border-radius: 6px;
-    }
-    thead tr th { background-color: #eef0f3 !important; color: #8a6400 !important; }
-</style>
-"""
-
+st.markdown(APP_CSS, unsafe_allow_html=True)
 PLOTLY_TEMPLATE = "plotly_dark"
 PURPLE_WALL = "#ba68c8"
 PLOTLY_CONFIG = {"scrollZoom": False, "displayModeBar": True, "responsive": True}
 
 # ==================================================================================
-# TRADOVATE ENDPOINT CONSTANTS
+# TRADOVATE CONSTANTS
 # ==================================================================================
 
 TRADOVATE_ENVIRONMENTS = {
-    "Demo": {
-        "rest": "https://demo.tradovateapi.com/v1",
-        "ws": "wss://demo.tradovateapi.com/v1/websocket",
-    },
-    "Live": {
-        "rest": "https://live.tradovateapi.com/v1",
-        "ws": "wss://live.tradovateapi.com/v1/websocket",
-    },
+    "Demo": {"rest": "https://demo.tradovateapi.com/v1", "ws": "wss://demo.tradovateapi.com/v1/websocket"},
+    "Live": {"rest": "https://live.tradovateapi.com/v1", "ws": "wss://live.tradovateapi.com/v1/websocket"},
 }
 
 DEFAULT_APP_ID = "InstitutionalQuantTerminal"
 DEFAULT_APP_VERSION = "1.0"
+HTTP_HEADERS_BASE = {"Content-Type": "application/json", "Accept": "application/json"}
 
-HTTP_HEADERS_BASE = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-}
+# Fixed universe per the spec: NQ, ES, MNQ, MES, CL
+CONTRACT_ROOTS = ["NQ", "ES", "MNQ", "MES", "CL"]
 
-# Timeframe -> Tradovate chartDescription for md/getChart. Tradovate's chart
-# API buckets time-based bars under underlyingType "MinuteBar" (elementSize =
-# number of minutes per bar) and calendar-day bars under "DailyBar". Verify
-# these enum values against the API Reference in your Tradovate account if
-# your account's chart service version differs.
 TRADOVATE_BAR_CONFIG = {
     "1m":  {"underlyingType": "MinuteBar", "elementSize": 1},
     "5m":  {"underlyingType": "MinuteBar", "elementSize": 5},
@@ -248,53 +129,10 @@ TRADOVATE_BAR_CONFIG = {
     "4h":  {"underlyingType": "MinuteBar", "elementSize": 240},
     "1d":  {"underlyingType": "DailyBar", "elementSize": 1},
 }
-
 INTERVAL_CHOICES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
-
+AUTO_REFRESH_SECONDS = 3  # fixed internal poll rate (no sidebar control per spec)
 # ==================================================================================
-# FUTURES CONTRACT UNIVERSE
-# ==================================================================================
-# Tradovate contracts are month-coded (e.g. "ESZ5"). We resolve the live
-# front-month contract for each root symbol at runtime via the REST
-# /contract/suggest endpoint rather than hardcoding expiring month codes.
-
-FUTURES_ROOTS = {
-    "E-mini S&P 500 (ES)": "ES",
-    "Micro E-mini S&P 500 (MES)": "MES",
-    "E-mini Nasdaq-100 (NQ)": "NQ",
-    "Micro E-mini Nasdaq-100 (MNQ)": "MNQ",
-    "E-mini Dow (YM)": "YM",
-    "Crude Oil (CL)": "CL",
-    "Micro Crude Oil (MCL)": "MCL",
-    "Gold (GC)": "GC",
-    "Micro Gold (MGC)": "MGC",
-    "Silver (SI)": "SI",
-    "10-Year T-Note (ZN)": "ZN",
-    "30-Year T-Bond (ZB)": "ZB",
-    "Euro FX (6E)": "6E",
-    "British Pound (6B)": "6B",
-    "Japanese Yen (6J)": "6J",
-}
-
-# Macro/options-proxy map used only by Module 5 (Tradovate does not expose a
-# public listed-options chain endpoint for these futures roots in this app;
-# see the GEX module docstring for exactly what is live vs. simulated).
-FUTURES_OPTIONS_PROXY_MAP = {
-    "ES": "SPY", "MES": "SPY", "NQ": "QQQ", "MNQ": "QQQ", "YM": "DIA",
-    "CL": "USO", "MCL": "USO", "GC": "GLD", "MGC": "GLD", "SI": "SLV",
-    "ZN": "IEF", "ZB": "TLT", "6E": "FXE", "6B": "FXB", "6J": "FXY",
-}
-
-# Macro anchors used by Module 3 correlation matrix (yfinance — Tradovate has
-# no Treasury-yield-index or DXY product, so these stay on the macro/index feed
-# exactly like the original app's "any source gap -> yfinance" pattern).
-MACRO_ANCHOR_TICKERS = {
-    "US Dollar Index (DXY)": "DX-Y.NYB",
-    "US 10Y Yield": "^TNX",
-    "S&P 500 Index": "^GSPC",
-}
-# ==================================================================================
-# TRADOVATE REST SESSION — AUTHENTICATION, TOKEN REFRESH, CONTRACT RESOLUTION
+# TRADOVATE REST SESSION
 # ==================================================================================
 
 class TradovateAuthError(Exception):
@@ -302,101 +140,70 @@ class TradovateAuthError(Exception):
 
 
 class TradovateSession:
-    """Owns REST authentication state for one Tradovate account.
+    """REST authentication + contract lookup for one Tradovate account.
+    cid/sec default to the Demo placeholder "0" when not supplied, matching
+    Tradovate's Demo behavior for accounts without a paid API Access
+    subscription (not guaranteed for every account — see sidebar caption)."""
 
-    Handles the initial /auth/accesstoken call, tracks the access token's
-    expiration, and exposes a `ensure_valid()` method the rest of the app
-    calls before any REST/WS action so an expired/near-expired Demo token
-    (Demo tokens are valid up to 14 days, per Tradovate's Demo policy) is
-    silently refreshed as long as the same credentials are still valid in
-    the sidebar — no restart, no broken UI, matching the "graceful
-    re-authentication" requirement.
-    """
-
-    def __init__(self, environment: str, name: str, password: str, app_id: str,
-                 app_version: str, cid: str, sec: str, device_id: str):
+    def __init__(self, environment: str, name: str, password: str, api_key: str, app_id: str):
         self.environment = environment
         self.name = name
         self.password = password
+        self.cid = api_key if api_key else "0"
+        self.sec = "0"
         self.app_id = app_id or DEFAULT_APP_ID
-        self.app_version = app_version or DEFAULT_APP_VERSION
-        # Tradovate's Demo environment accepts the placeholder credential
-        # "0" for cid/sec on some accounts in lieu of a paid API Access
-        # subscription's real Client ID/Secret pair — default to "0" here
-        # whenever the field is left blank so Demo users aren't blocked on
-        # provisioning real API keys just to try the app. NOTE: this is not
-        # guaranteed to work for every account; if Demo still rejects the
-        # request, that means your account requires real cid/sec values (see
-        # the sidebar warning and the accesstoken error message returned).
-        self.cid = cid if cid not in (None, "") else "0"
-        self.sec = sec if sec not in (None, "") else "0"
-        self.device_id = device_id or str(uuid.uuid4())
+        self.app_version = DEFAULT_APP_VERSION
+        self.device_id = str(uuid.uuid4())
 
         self.rest_base = TRADOVATE_ENVIRONMENTS[environment]["rest"]
         self.ws_url = TRADOVATE_ENVIRONMENTS[environment]["ws"]
 
         self.access_token = None
-        self.md_access_token = None
-        self.expiration_time = None  # datetime, UTC
-        self.user_id = None
+        self.expiration_time = None
         self.has_market_data = None
         self.last_error = None
 
-    # ---- credential identity, used to detect sidebar changes needing re-auth ----
     def credential_fingerprint(self):
-        return (self.environment, self.name, self.password, self.app_id,
-                self.app_version, self.cid, self.sec)
+        return (self.environment, self.name, self.password, self.cid, self.app_id)
 
     def authenticate(self):
-        """POST /auth/accesstoken. Raises TradovateAuthError on failure."""
         url = f"{self.rest_base}/auth/accesstoken"
         body = {
-            "name": self.name,
-            "password": self.password,
-            "appId": self.app_id,
-            "appVersion": self.app_version,
-            "cid": self.cid,
-            "sec": self.sec,
+            "name": self.name, "password": self.password, "appId": self.app_id,
+            "appVersion": self.app_version, "cid": self.cid, "sec": self.sec,
             "deviceId": self.device_id,
         }
         try:
             resp = requests.post(url, json=body, headers=HTTP_HEADERS_BASE, timeout=10)
         except Exception as e:
-            self.last_error = f"Network error contacting {url}: {e}"
+            self.last_error = f"Could not reach Tradovate ({url}): {e}"
             raise TradovateAuthError(self.last_error)
 
         try:
             data = resp.json()
         except Exception:
-            self.last_error = f"Non-JSON response from accesstoken endpoint (HTTP {resp.status_code})."
+            self.last_error = f"Tradovate returned a non-JSON response (HTTP {resp.status_code})."
             raise TradovateAuthError(self.last_error)
 
         if resp.status_code != 200 or "accessToken" not in data:
             err_text = data.get("errorText") or data.get("error") or json.dumps(data)
-            self.last_error = f"Tradovate authentication failed: {err_text}"
+            self.last_error = f"Authentication rejected: {err_text}"
             raise TradovateAuthError(self.last_error)
 
         self.access_token = data["accessToken"]
-        self.md_access_token = data.get("mdAccessToken", self.access_token)
-        self.user_id = data.get("userId")
-        self.has_market_data = data.get("hasMarketData", None)
-
+        self.has_market_data = data.get("hasMarketData")
         exp_raw = data.get("expirationTime")
-        if exp_raw:
-            try:
-                self.expiration_time = pd.to_datetime(exp_raw, utc=True).to_pydatetime()
-            except Exception:
-                self.expiration_time = datetime.now(timezone.utc) + timedelta(hours=8)
-        else:
+        try:
+            self.expiration_time = pd.to_datetime(exp_raw, utc=True).to_pydatetime() if exp_raw else \
+                datetime.now(timezone.utc) + timedelta(hours=8)
+        except Exception:
             self.expiration_time = datetime.now(timezone.utc) + timedelta(hours=8)
-
         self.last_error = None
         return data
 
     def is_token_valid(self) -> bool:
         if not self.access_token or not self.expiration_time:
             return False
-        # Refresh 5 minutes before actual expiry to avoid racing a stream drop.
         return datetime.now(timezone.utc) < (self.expiration_time - timedelta(minutes=5))
 
     def ensure_valid(self):
@@ -407,147 +214,138 @@ class TradovateSession:
     def auth_headers(self):
         return {**HTTP_HEADERS_BASE, "Authorization": f"Bearer {self.access_token}"}
 
-    # ------------------------------------------------------------------
-    # Contract resolution — front-month lookup via /contract/suggest
-    # ------------------------------------------------------------------
     def find_front_month_contract(self, root_symbol: str):
-        """Resolve a root future (e.g. 'ES') to its current front-month
-        tradable contract name (e.g. 'ESZ5') and contractId via the
-        /contract/suggest REST endpoint."""
         self.ensure_valid()
         url = f"{self.rest_base}/contract/suggest"
         try:
-            resp = requests.get(
-                url, params={"t": root_symbol, "l": 5},
-                headers=self.auth_headers(), timeout=10,
-            )
+            resp = requests.get(url, params={"t": root_symbol, "l": 5}, headers=self.auth_headers(), timeout=10)
             resp.raise_for_status()
             candidates = resp.json()
         except Exception as e:
             raise TradovateAuthError(f"Contract lookup failed for {root_symbol}: {e}")
-
         if not isinstance(candidates, list) or not candidates:
             raise TradovateAuthError(
-                f"No tradable contracts returned for root '{root_symbol}'. "
-                "Confirm this symbol is enabled on your account's exchange permissions."
+                f"No tradable contract found for root '{root_symbol}' — check exchange "
+                f"permissions/entitlements on this account."
             )
-        # /contract/suggest returns candidates ordered by relevance; the first
-        # entry is Tradovate's own best/front-month match for the root.
         best = candidates[0]
-        return {
-            "id": best.get("id"),
-            "name": best.get("name"),
-        }
+        return {"id": best.get("id"), "name": best.get("name")}
 
 
 # ==================================================================================
-# LIVE MARKET DATA STATE — thread-safe snapshot shared with the Streamlit thread
+# LIVE MARKET DATA STATE — multi-contract, thread-safe
 # ==================================================================================
 
 class LiveMarketState:
-    """Container mutated by the background WS thread and read (copy-on-read)
-    by the Streamlit main thread. All mutation goes through a single lock."""
+    """One shared object per connected session. Mutated by the background WS
+    thread, read (copy-on-read) by the Streamlit main thread on every rerun."""
 
-    def __init__(self, max_bars: int = 3000):
+    def __init__(self, contracts: dict, max_bars: int = 3000):
+        # contracts: {root_symbol: {"id":..., "name":...}}
         self.lock = threading.Lock()
         self.connected = False
         self.authorized = False
         self.last_error = None
-        self.contract_name = None
-        self.contract_id = None
-
-        self.quote = {}  # bidPrice, bidSize, askPrice, askSize, last, volume, tradeDate...
-        self.dom_bids = []   # list of {"price":..., "qty":...}
-        self.dom_asks = []
-        self.trade_ticks = deque(maxlen=5000)  # {"price","qty","side","timestamp"}
-
-        self.bars = {tf: pd.DataFrame() for tf in INTERVAL_CHOICES}
+        self.contracts = contracts
         self.max_bars = max_bars
-        self.last_update_ts = {tf: None for tf in INTERVAL_CHOICES}
 
-    def snapshot_quote(self):
-        with self.lock:
-            return dict(self.quote)
+        self._quote = {root: {} for root in contracts}
+        self._dom_bids = {root: [] for root in contracts}
+        self._dom_asks = {root: [] for root in contracts}
+        self._ticks = {root: deque(maxlen=4000) for root in contracts}
+        self._bars = {root: {} for root in contracts}  # root -> {timeframe: df}
 
-    def snapshot_dom(self):
+    # -- mutation (worker thread only) --
+    def set_quote(self, root, updates):
         with self.lock:
-            bids = pd.DataFrame(self.dom_bids)
-            asks = pd.DataFrame(self.dom_asks)
+            self._quote.setdefault(root, {}).update(updates)
+
+    def push_tick(self, root, tick):
+        with self.lock:
+            self._ticks.setdefault(root, deque(maxlen=4000)).append(tick)
+
+    def set_dom(self, root, bids=None, asks=None):
+        with self.lock:
+            if bids is not None:
+                self._dom_bids[root] = bids
+            if asks is not None:
+                self._dom_asks[root] = asks
+
+    def merge_bars(self, root, timeframe, new_df):
+        with self.lock:
+            existing = self._bars.setdefault(root, {}).get(timeframe, pd.DataFrame())
+            if existing.empty:
+                merged = new_df
+            else:
+                merged = pd.concat([existing, new_df])
+                merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+            if len(merged) > self.max_bars:
+                merged = merged.iloc[-self.max_bars:]
+            self._bars[root][timeframe] = merged
+
+    # -- snapshot (Streamlit thread only) --
+    def snapshot_quote(self, root):
+        with self.lock:
+            return dict(self._quote.get(root, {}))
+
+    def snapshot_dom(self, root):
+        with self.lock:
+            bids = list(self._dom_bids.get(root, []))
+            asks = list(self._dom_asks.get(root, []))
         frames = []
-        if not bids.empty:
-            bids = bids.rename(columns={"price": "price", "qty": "qty"})
-            bids["side"] = "bid"
-            frames.append(bids)
-        if not asks.empty:
-            asks = asks.rename(columns={"price": "price", "qty": "qty"})
-            asks["side"] = "ask"
-            frames.append(asks)
+        if bids:
+            b = pd.DataFrame(bids); b["side"] = "bid"; frames.append(b)
+        if asks:
+            a = pd.DataFrame(asks); a["side"] = "ask"; frames.append(a)
         if not frames:
             return pd.DataFrame(columns=["price", "qty", "side"])
         return pd.concat(frames, ignore_index=True)
 
-    def snapshot_bars(self, timeframe: str):
+    def snapshot_bars(self, root, timeframe):
         with self.lock:
-            df = self.bars.get(timeframe, pd.DataFrame())
+            df = self._bars.get(root, {}).get(timeframe, pd.DataFrame())
             return df.copy() if not df.empty else df
 
-    def snapshot_ticks(self):
+    def snapshot_ticks(self, root):
         with self.lock:
-            return list(self.trade_ticks)
+            return list(self._ticks.get(root, []))
 
     def status(self):
         with self.lock:
-            return {
-                "connected": self.connected,
-                "authorized": self.authorized,
-                "last_error": self.last_error,
-                "contract_name": self.contract_name,
-            }
+            return {"connected": self.connected, "authorized": self.authorized, "last_error": self.last_error}
 # ==================================================================================
-# BACKGROUND WEBSOCKET WORKER — persists across Streamlit reruns
+# BACKGROUND WEBSOCKET WORKER — one connection, multiplexed across 5 contracts
 # ==================================================================================
 
 class MarketDataWorker(threading.Thread):
-    """Runs one persistent Tradovate WebSocket connection on a background
-    thread. Streamlit's script re-executes on every user interaction, so this
-    worker (and the LiveMarketState it feeds) is stashed in st.session_state
-    and only created once per contract selection — it is NOT recreated on
-    every rerun, which is what makes the "real-time" DOM/quote/chart actually
-    real-time instead of a fresh reconnect-and-lose-state every click.
-    """
+    """Persistent Tradovate WebSocket connection covering all five contracts:
+    subscribes md/subscribeQuote + md/subscribeDOM for every contract immediately
+    on authorization, and md/getChart(daily) for every contract so correlation
+    always has data. Additional timeframes for the currently *focused* contract
+    are requested on demand via `ensure_chart()` from the Streamlit thread."""
 
-    def __init__(self, session: TradovateSession, state: LiveMarketState,
-                 contract_name: str, contract_id, timeframes):
+    def __init__(self, session: TradovateSession, state: LiveMarketState):
         super().__init__(daemon=True)
         self.session = session
         self.state = state
-        self.contract_name = contract_name
-        self.contract_id = contract_id
-        self.timeframes = list(timeframes)
-
         self.ws = None
         self._req_id = 0
         self._req_lock = threading.Lock()
-        self._auth_req_id = None
-        self._quote_req_id = None
-        self._dom_req_id = None
-        self._chart_req_ids = {}   # request id -> timeframe
-        self._stop_event = threading.Event()
         self._send_lock = threading.Lock()
+        self._auth_req_id = None
+        self._chart_req_ids = {}       # req_id -> (root, timeframe)
+        self._subscribed_charts = set()  # {(root, timeframe)}
+        self._stop_event = threading.Event()
+        self._id_to_root = {v["id"]: root for root, v in state.contracts.items()}
 
-        self.state.contract_name = contract_name
-        self.state.contract_id = contract_id
-
-    # ---------------------------------------------------------------- utils
     def _next_id(self):
         with self._req_lock:
             self._req_id += 1
             return self._req_id
 
-    def _send(self, endpoint: str, body=None):
+    def _send(self, endpoint, body=None):
         req_id = self._next_id()
-        body_str = json.dumps(body) if body is not None else ""
-        frame = f"{endpoint}\n{req_id}\n\n{body_str}"
+        frame = f"{endpoint}\n{req_id}\n\n{json.dumps(body) if body is not None else ''}"
         try:
             with self._send_lock:
                 if self.ws is not None:
@@ -557,6 +355,29 @@ class MarketDataWorker(threading.Thread):
                 self.state.last_error = f"Send failed on '{endpoint}': {e}"
         return req_id
 
+    def ensure_chart(self, root: str, timeframe: str):
+        """Callable from the Streamlit main thread. No-op if already subscribed."""
+        key = (root, timeframe)
+        if key in self._subscribed_charts:
+            return
+        if root not in self.state.contracts:
+            return
+        cfg = TRADOVATE_BAR_CONFIG.get(timeframe)
+        if cfg is None:
+            return
+        contract_name = self.state.contracts[root]["name"]
+        body = {
+            "symbol": contract_name,
+            "chartDescription": {
+                "underlyingType": cfg["underlyingType"], "elementSize": cfg["elementSize"],
+                "elementSizeUnit": "UnderlyingUnits", "withHistogram": False,
+            },
+            "timeRange": {"asMuchAsElements": 2000},
+        }
+        req_id = self._send("md/getChart", body)
+        self._chart_req_ids[req_id] = key
+        self._subscribed_charts.add(key)
+
     def stop(self):
         self._stop_event.set()
         try:
@@ -565,7 +386,6 @@ class MarketDataWorker(threading.Thread):
         except Exception:
             pass
 
-    # -------------------------------------------------------------- run loop
     def run(self):
         backoff = 2
         while not self._stop_event.is_set():
@@ -573,47 +393,31 @@ class MarketDataWorker(threading.Thread):
                 self.session.ensure_valid()
             except TradovateAuthError as e:
                 with self.state.lock:
-                    self.state.last_error = f"Auth refresh failed: {e}"
-                time.sleep(min(backoff, 30))
-                backoff = min(backoff * 2, 30)
+                    self.state.last_error = f"Token refresh failed: {e}"
+                time.sleep(min(backoff, 30)); backoff = min(backoff * 2, 30)
                 continue
 
             self.ws = websocket.WebSocketApp(
-                self.session.ws_url,
-                on_open=self._on_open,
-                on_message=self._on_message,
-                on_error=self._on_error,
-                on_close=self._on_close,
+                self.session.ws_url, on_open=self._on_open, on_message=self._on_message,
+                on_error=self._on_error, on_close=self._on_close,
             )
             with self.state.lock:
                 self.state.connected = False
                 self.state.authorized = False
-
-            # run_forever blocks until the socket closes/errors; Tradovate's
-            # server-side heartbeat ("h" frames) keeps the connection alive so
-            # we disable the library's own ping and rely on Tradovate's frame
-            # protocol instead.
             self.ws.run_forever(ping_interval=0)
 
             if self._stop_event.is_set():
                 break
-            # Unexpected disconnect — re-authenticate (token may have been the
-            # cause) and reconnect with backoff.
             time.sleep(min(backoff, 30))
             backoff = min(backoff * 2, 30)
 
-    # ------------------------------------------------------------- handlers
     def _on_open(self, ws):
         with self.state.lock:
             self.state.connected = True
-        # First frame from the server is a bare "o"; per Tradovate's own
-        # reference clients the authorize call is sent immediately after
-        # socket open rather than waiting for a distinct application-level ack.
         self._auth_req_id = self._next_id()
-        frame = f"authorize\n{self._auth_req_id}\n\n{self.session.access_token}"
         try:
             with self._send_lock:
-                ws.send(frame)
+                ws.send(f"authorize\n{self._auth_req_id}\n\n{self.session.access_token}")
         except Exception as e:
             with self.state.lock:
                 self.state.last_error = f"Authorize send failed: {e}"
@@ -622,17 +426,13 @@ class MarketDataWorker(threading.Thread):
         with self.state.lock:
             self.state.last_error = f"WebSocket error: {error}"
 
-    def _on_close(self, ws, close_status_code, close_msg):
+    def _on_close(self, ws, code, msg):
         with self.state.lock:
             self.state.connected = False
             self.state.authorized = False
 
     def _on_message(self, ws, message):
-        if message == "o":
-            return  # open frame already handled in _on_open
-        if message == "h":
-            return  # heartbeat — Tradovate's server keeps pinging; no reply required
-        if not message:
+        if message in ("o", "h", ""):
             return
         type_char, payload = message[0], message[1:]
         if type_char == "c":
@@ -649,151 +449,90 @@ class MarketDataWorker(threading.Thread):
             self._handle_event(item)
 
     def _handle_event(self, item: dict):
-        # -- application-level RPC responses (subscribe acks, chart snapshots)
         if "i" in item and "s" in item:
-            req_id = item.get("i")
-            status = item.get("s")
-            data = item.get("d", {})
-
+            req_id, status, data = item.get("i"), item.get("s"), item.get("d", {})
             if req_id == self._auth_req_id:
                 if status == 200:
                     with self.state.lock:
                         self.state.authorized = True
-                    self._subscribe_all()
+                    self._subscribe_baseline()
                 else:
                     with self.state.lock:
                         self.state.last_error = f"Authorization rejected (status {status}): {data}"
                 return
-
             if req_id in self._chart_req_ids:
-                self._ingest_chart_payload(self._chart_req_ids[req_id], data)
+                root, tf = self._chart_req_ids[req_id]
+                self._ingest_chart_payload(root, tf, data)
                 return
-
             if status != 200:
                 with self.state.lock:
                     self.state.last_error = f"Request {req_id} failed (status {status}): {data}"
             return
 
-        # -- streaming market-data events (quotes, DOM, live chart updates)
         if item.get("e") == "md":
             d = item.get("d", {})
             self._ingest_quotes(d.get("quotes", []))
             self._ingest_doms(d.get("doms", []))
-            for tf, req_id in self._chart_req_ids.items():
-                pass  # live chart pushes arrive keyed by request id below
-            if "charts" in d:
-                # live chart pushes reuse the original getChart request id
-                for chart in d.get("charts", []):
-                    cid = chart.get("id") or chart.get("reqId")
-                    tf = self._chart_req_ids.get(cid)
-                    if tf:
-                        self._ingest_chart_payload(tf, {"charts": [chart]})
+            for chart in d.get("charts", []):
+                cid = chart.get("id") or chart.get("reqId")
+                key = self._chart_req_ids.get(cid)
+                if key:
+                    self._ingest_chart_payload(key[0], key[1], {"charts": [chart]})
 
-    # ------------------------------------------------------------ ingestion
     def _ingest_quotes(self, quotes):
-        if not quotes:
-            return
         for q in quotes:
-            if str(q.get("contractId")) != str(self.contract_id) and self.contract_id is not None:
+            root = self._id_to_root.get(q.get("contractId"))
+            if root is None:
                 continue
             entries = q.get("entries", {})
             snap = {}
-            bid = entries.get("Bid", {})
-            offer = entries.get("Offer", {})
-            trade = entries.get("Trade", {})
-            if bid:
-                snap["bidPrice"] = bid.get("price")
-                snap["bidSize"] = bid.get("size")
-            if offer:
-                snap["askPrice"] = offer.get("price")
-                snap["askSize"] = offer.get("size")
-            if trade:
-                snap["last"] = trade.get("price")
-                snap["lastSize"] = trade.get("size")
-                with self.state.lock:
-                    self.state.trade_ticks.append({
-                        "price": trade.get("price"),
-                        "qty": trade.get("size", 0) or 0,
-                        "timestamp": datetime.now(timezone.utc),
-                    })
+            if entries.get("Bid"):
+                snap["bidPrice"] = entries["Bid"].get("price"); snap["bidSize"] = entries["Bid"].get("size")
+            if entries.get("Offer"):
+                snap["askPrice"] = entries["Offer"].get("price"); snap["askSize"] = entries["Offer"].get("size")
+            if entries.get("Trade"):
+                trade = entries["Trade"]
+                snap["last"] = trade.get("price"); snap["lastSize"] = trade.get("size")
+                self.state.push_tick(root, {
+                    "price": trade.get("price"), "qty": trade.get("size", 0) or 0,
+                    "timestamp": datetime.now(timezone.utc),
+                })
             if snap:
-                with self.state.lock:
-                    self.state.quote.update(snap)
+                self.state.set_quote(root, snap)
 
     def _ingest_doms(self, doms):
-        if not doms:
-            return
         for dom in doms:
-            if str(dom.get("contractId")) != str(self.contract_id) and self.contract_id is not None:
+            root = self._id_to_root.get(dom.get("contractId"))
+            if root is None:
                 continue
-            bids = [{"price": lvl.get("price"), "qty": lvl.get("size", 0)}
-                    for lvl in dom.get("bids", []) if lvl.get("price") is not None]
-            asks = [{"price": lvl.get("price"), "qty": lvl.get("size", 0)}
-                    for lvl in dom.get("offers", []) if lvl.get("price") is not None]
-            with self.state.lock:
-                if bids:
-                    self.state.dom_bids = bids
-                if asks:
-                    self.state.dom_asks = asks
+            bids = [{"price": l.get("price"), "qty": l.get("size", 0)} for l in dom.get("bids", []) if l.get("price") is not None]
+            asks = [{"price": l.get("price"), "qty": l.get("size", 0)} for l in dom.get("offers", []) if l.get("price") is not None]
+            self.state.set_dom(root, bids=bids or None, asks=asks or None)
 
-    def _ingest_chart_payload(self, timeframe, data):
-        charts = data.get("charts", [])
-        if not charts:
-            return
+    def _ingest_chart_payload(self, root, timeframe, data):
         rows = []
-        for chart in charts:
+        for chart in data.get("charts", []):
             for bar in chart.get("bars", []):
-                ts = bar.get("timestamp")
                 try:
-                    idx = pd.to_datetime(ts, utc=True)
+                    idx = pd.to_datetime(bar.get("timestamp"), utc=True)
                 except Exception:
                     continue
                 up_vol = bar.get("upVolume", 0) or 0
                 down_vol = bar.get("downVolume", 0) or 0
                 vol = bar.get("volume", up_vol + down_vol) or (up_vol + down_vol)
-                rows.append({
-                    "timestamp": idx,
-                    "Open": bar.get("open"), "High": bar.get("high"),
-                    "Low": bar.get("low"), "Close": bar.get("close"),
-                    "Volume": vol,
-                })
+                rows.append({"timestamp": idx, "Open": bar.get("open"), "High": bar.get("high"),
+                             "Low": bar.get("low"), "Close": bar.get("close"), "Volume": vol})
         if not rows:
             return
         new_df = pd.DataFrame(rows).dropna(subset=["Open", "High", "Low", "Close"])
         new_df = new_df.drop_duplicates(subset="timestamp").set_index("timestamp").sort_index()
+        self.state.merge_bars(root, timeframe, new_df)
 
-        with self.state.lock:
-            existing = self.state.bars.get(timeframe, pd.DataFrame())
-            if existing.empty:
-                merged = new_df
-            else:
-                merged = pd.concat([existing, new_df])
-                merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-            if len(merged) > self.state.max_bars:
-                merged = merged.iloc[-self.state.max_bars:]
-            self.state.bars[timeframe] = merged
-            self.state.last_update_ts[timeframe] = datetime.now(timezone.utc)
-
-    # ------------------------------------------------------------ subscribe
-    def _subscribe_all(self):
-        self._quote_req_id = self._send("md/subscribeQuote", {"symbol": self.contract_name})
-        self._dom_req_id = self._send("md/subscribeDOM", {"symbol": self.contract_name})
-        for tf in self.timeframes:
-            cfg = TRADOVATE_BAR_CONFIG.get(tf)
-            if cfg is None:
-                continue
-            body = {
-                "symbol": self.contract_name,
-                "chartDescription": {
-                    "underlyingType": cfg["underlyingType"],
-                    "elementSize": cfg["elementSize"],
-                    "elementSizeUnit": "UnderlyingUnits",
-                    "withHistogram": False,
-                },
-                "timeRange": {"asMuchAsElements": 2000},
-            }
-            req_id = self._send("md/getChart", body)
-            self._chart_req_ids[req_id] = tf
+    def _subscribe_baseline(self):
+        for root, info in self.state.contracts.items():
+            self._send("md/subscribeQuote", {"symbol": info["name"]})
+            self._send("md/subscribeDOM", {"symbol": info["name"]})
+            self.ensure_chart(root, "1d")  # always keep daily bars for correlation
 # ==================================================================================
 # SHARED TECHNICAL UTILITIES
 # ==================================================================================
@@ -1212,92 +951,77 @@ def render_ml_module(df: pd.DataFrame, label: str):
 # ==================================================================================
 # MODULE 3 — CROSS-ASSET CORRELATION & MACRO YIELD MATRIX
 # ==================================================================================
+# No external macro/yield data source is wired into this build (no yfinance
+# dependency — see the file header). Instead, this module correlates the five
+# live Tradovate-streamed contracts (NQ, ES, MNQ, MES, CL) against each other
+# using their own live daily bars — genuine cross-asset structure (equity
+# index vs. crude oil co-movement, ES vs. its own micro NQ, etc.), just without
+# a standalone DXY/10Y-yield macro anchor.
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_macro_series(yf_ticker: str, lookback_days: int = 180) -> pd.Series:
-    try:
-        raw = yf.download(tickers=yf_ticker, period="2y", interval="1d", progress=False, auto_adjust=False, threads=False)
-        if raw is None or raw.empty:
-            return pd.Series(dtype=float)
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        df = raw[["Close"]].dropna()
-        cutoff = df.index.max() - pd.Timedelta(days=lookback_days)
-        df = df[df.index >= cutoff]
-        return df["Close"]
-    except Exception:
-        return pd.Series(dtype=float)
-
-def render_correlation_module(daily_bars: pd.DataFrame, label: str):
+def render_correlation_module(daily_bars_by_root: dict, focus_root: str):
     st.markdown(
-        '<div class="module-note">Cross-asset relationships between the active Tradovate contract '
-        '(from its live-streamed daily bars) and key macro drivers — the US Dollar Index and 10-Year '
-        'Treasury Yields — plus the S&amp;P 500 as a broad-market anchor.</div>',
+        '<div class="module-note">Cross-asset correlation across all five live-streamed Tradovate '
+        'contracts (NQ, ES, MNQ, MES, CL), computed from their own live daily bars.</div>',
         unsafe_allow_html=True,
     )
 
-    lookback = st.slider("Correlation Lookback (Days)", 30, 730, 180, step=10, key="corr_lookback")
+    lookback = st.slider("Correlation Lookback (Days)", 10, 365, 90, step=5, key="corr_lookback")
 
-    if daily_bars.empty:
-        st.info("Waiting on the Tradovate daily-bar chart subscription to populate before correlations can be computed.")
-        return
+    series_dict = {}
+    missing = []
+    for root, df in daily_bars_by_root.items():
+        if df.empty:
+            missing.append(root)
+            continue
+        cutoff = df.index.max() - pd.Timedelta(days=lookback)
+        s = df[df.index >= cutoff]["Close"]
+        s.index = s.index.tz_localize(None) if s.index.tz is not None else s.index
+        if not s.empty:
+            series_dict[root] = s
 
-    cutoff = daily_bars.index.max() - pd.Timedelta(days=lookback)
-    active_series = daily_bars[daily_bars.index >= cutoff]["Close"]
-    active_series.index = active_series.index.tz_localize(None) if active_series.index.tz is not None else active_series.index
-
-    series_dict = {label: active_series} if not active_series.empty else {}
-    fetch_errors = []
-    for m_label, tk in MACRO_ANCHOR_TICKERS.items():
-        s = fetch_macro_series(tk, lookback)
-        if s.empty:
-            fetch_errors.append(m_label)
-        else:
-            s.index = s.index.tz_localize(None) if s.index.tz is not None else s.index
-            series_dict[m_label] = s
-
-    if fetch_errors:
-        st.warning(f"Could not retrieve live macro data for: {', '.join(fetch_errors)}.")
+    if missing:
+        st.info(f"Still waiting on daily bars for: {', '.join(missing)} (subscribed automatically for all five contracts).")
 
     if len(series_dict) < 2:
-        st.error("Insufficient data available to compute correlations right now.")
+        st.warning("Need daily bars for at least two contracts to compute correlations — give the "
+                    "chart subscriptions a few more seconds.")
         return
 
     combined = pd.DataFrame(series_dict).dropna(how="all").ffill().dropna()
-
-    if combined.empty or len(combined) < 10:
-        st.warning("Not enough overlapping historical data across assets for this lookback window yet.")
+    if combined.empty or len(combined) < 5:
+        st.warning("Not enough overlapping daily history across contracts yet for this lookback window.")
         return
 
     corr_matrix = combined.corr()
-
     fig_heat = go.Figure(go.Heatmap(
         z=corr_matrix.values, x=corr_matrix.columns, y=corr_matrix.columns,
         colorscale="RdBu", zmin=-1, zmax=1, zmid=0,
         text=np.round(corr_matrix.values, 2), texttemplate="%{text}",
     ))
-    fig_heat.update_layout(template=PLOTLY_TEMPLATE, height=460, title="Cross-Asset Correlation Matrix", margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
+    fig_heat.update_layout(template=PLOTLY_TEMPLATE, height=420, title="Cross-Contract Correlation Matrix",
+                            margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
     st.plotly_chart(fig_heat, use_container_width=True, config=PLOTLY_CONFIG)
 
-    st.subheader(f"Rolling 30-Day Correlation vs {label}")
-    if label in combined.columns:
-        rolling_window = min(30, max(5, len(combined) // 3))
+    if focus_root in combined.columns:
+        st.subheader(f"Rolling Correlation vs {focus_root}")
+        rolling_window = min(20, max(5, len(combined) // 3))
         fig_roll = go.Figure()
         for col in combined.columns:
-            if col == label:
+            if col == focus_root:
                 continue
-            rolling_corr = combined[label].rolling(rolling_window).corr(combined[col])
-            fig_roll.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr, mode="lines", name=f"{label} vs {col}"))
+            rolling_corr = combined[focus_root].rolling(rolling_window).corr(combined[col])
+            fig_roll.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr, mode="lines", name=f"{focus_root} vs {col}"))
         fig_roll.add_hline(y=0, line_dash="dot", line_color="#666")
-        fig_roll.update_layout(template=PLOTLY_TEMPLATE, height=420, title=f"Rolling {rolling_window}-Day Correlation", margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
+        fig_roll.update_layout(template=PLOTLY_TEMPLATE, height=400, title=f"Rolling {rolling_window}-Day Correlation",
+                                margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
         st.plotly_chart(fig_roll, use_container_width=True, config=PLOTLY_CONFIG)
 
-    with st.expander("📈 Normalized Price Performance (Rebased to 100)"):
+    with st.expander("📈 Normalized Performance (Rebased to 100)"):
         rebased = combined / combined.iloc[0] * 100
         fig_reb = go.Figure()
         for col in rebased.columns:
             fig_reb.add_trace(go.Scatter(x=rebased.index, y=rebased[col], mode="lines", name=col))
-        fig_reb.update_layout(template=PLOTLY_TEMPLATE, height=420, margin=dict(l=10, r=10, t=30, b=10), dragmode="pan")
+        fig_reb.update_layout(template=PLOTLY_TEMPLATE, height=380, margin=dict(l=10, r=10, t=30, b=10), dragmode="pan")
         st.plotly_chart(fig_reb, use_container_width=True, config=PLOTLY_CONFIG)
 # ==================================================================================
 # MODULE 4 — VOLUME DELTA & FOOTPRINT IMBALANCE
@@ -1446,13 +1170,11 @@ def render_volume_delta_module(df: pd.DataFrame, label: str, live_ticks: list, t
 # ==================================================================================
 # MODULE 5 — OPTIONS GAMMA EXPOSURE (GEX) & MAX PAIN ENGINE
 # ==================================================================================
-# NOTE: Tradovate's public API surface used by this app (auth + md/* websocket
-# services) does not expose a listed-options chain endpoint for CME futures
-# options. This module keeps the original app's honest fallback pattern: it
-# uses a live, liquid equity-ETF options proxy (via yfinance) for the futures
-# root you're viewing (e.g. ES -> SPY, GC -> GLD) when one exists, and falls
-# back to a labeled Black-Scholes simulation calibrated off the live Tradovate
-# spot price otherwise. This is disclosed in the UI exactly as it was before.
+# No live listed-options chain source is wired into this build (no yfinance
+# dependency). This module is a pure Black-Scholes gamma-exposure simulation
+# calibrated off each contract's live Tradovate spot price — the UI labels it
+# as simulated at all times; it is a structural/educational GEX surface, not
+# live open-interest data.
 
 def bs_gamma(spot, strike, t_years, iv, r=0.045):
     try:
@@ -1501,97 +1223,24 @@ def compute_max_pain_from_sim(gex_df: pd.DataFrame):
     except Exception:
         return None, pd.DataFrame()
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_options_chain(proxy_symbol: str):
-    try:
-        tk = yf.Ticker(proxy_symbol)
-        expiries = tk.options
-        if not expiries:
-            return None
-        expiry = expiries[0]
-        chain = tk.option_chain(expiry)
-        calls, puts = chain.calls.copy(), chain.puts.copy()
-        hist = tk.history(period="5d")
-        if hist.empty:
-            return None
-        proxy_spot = float(hist["Close"].iloc[-1])
-        return calls, puts, expiry, proxy_spot
-    except Exception:
-        return None
-
-def gex_from_chain(calls: pd.DataFrame, puts: pd.DataFrame, spot: float, days_to_expiry: int):
-    t_years = max(days_to_expiry, 1) / 365.0
-    contract_mult = 100
-
-    def process(chain, sign):
-        c = chain.copy()
-        c["impliedVolatility"] = c["impliedVolatility"].replace(0, np.nan)
-        med_iv = c["impliedVolatility"].median()
-        c["impliedVolatility"] = c["impliedVolatility"].fillna(med_iv if pd.notna(med_iv) else 0.2)
-        c["openInterest"] = c["openInterest"].fillna(0)
-        c["gamma"] = c.apply(lambda r: bs_gamma(spot, r["strike"], t_years, max(r["impliedVolatility"], 0.01)), axis=1)
-        c["gex"] = sign * c["gamma"] * c["openInterest"] * contract_mult * spot * spot * 0.01
-        return c[["strike", "openInterest", "gex"]]
-
-    c_proc = process(calls, 1)
-    p_proc = process(puts, -1)
-    merged = pd.merge(c_proc, p_proc, on="strike", how="outer", suffixes=("_call", "_put")).fillna(0)
-    merged["net_gex"] = merged["gex_call"] + merged["gex_put"]
-    merged = merged.rename(columns={"gex_call": "call_gex", "gex_put": "put_gex"})
-    return merged.sort_values("strike").reset_index(drop=True)
-
-def compute_max_pain(calls: pd.DataFrame, puts: pd.DataFrame):
-    try:
-        strikes = sorted(set(calls["strike"]).union(set(puts["strike"])))
-        pain = []
-        for s in strikes:
-            call_loss = ((s - calls["strike"]).clip(lower=0) * calls["openInterest"].fillna(0)).sum()
-            put_loss = ((puts["strike"] - s).clip(lower=0) * puts["openInterest"].fillna(0)).sum()
-            pain.append(call_loss + put_loss)
-        pain_df = pd.DataFrame({"strike": strikes, "total_pain": pain})
-        max_pain_strike = pain_df.loc[pain_df["total_pain"].idxmin(), "strike"]
-        return max_pain_strike, pain_df
-    except Exception:
-        return None, pd.DataFrame()
-
-def render_gex_module(root_symbol: str, live_spot: float, label: str):
+def render_gex_module(root_symbol: str, live_spot, label: str):
     st.markdown(
-        '<div class="module-note">Gamma Exposure (GEX) profile identifying dealer positioning, '
-        'volatility pin zones, and the gamma flip level.</div>',
+        '<div class="module-note">Simulated Gamma Exposure (GEX) profile — Black-Scholes gamma '
+        'model calibrated off the live Tradovate spot price — identifying illustrative dealer '
+        'positioning, volatility pin zones, and the gamma flip level.</div>',
         unsafe_allow_html=True,
     )
+    st.markdown('<span class="source-badge">🟡 SIMULATED (no live options chain source in this build)</span>', unsafe_allow_html=True)
 
-    proxy = FUTURES_OPTIONS_PROXY_MAP.get(root_symbol)
-    chain_result = fetch_options_chain(proxy) if proxy else None
+    if not live_spot:
+        st.error(f"No live Tradovate spot price yet for {label} to calibrate the GEX simulation.")
+        return
 
-    if chain_result is not None:
-        calls, puts, expiry, proxy_spot = chain_result
-        try:
-            dte = max((pd.to_datetime(expiry) - pd.Timestamp.now()).days, 1)
-        except Exception:
-            dte = 30
-        gex_df = gex_from_chain(calls, puts, proxy_spot, dte)
-        max_pain, pain_df = compute_max_pain(calls, puts)
-        spot_for_display = live_spot if live_spot else proxy_spot
-        source_label = (
-            f"Live listed options on proxy ETF {proxy} (expiry {expiry}) — futures options chains are "
-            f"not exposed by the Tradovate API surface used here, so gamma/OI structure is sourced from "
-            f"the correlated, highly liquid options-listed proxy; strikes shown are the proxy's own price "
-            f"scale, not the futures price scale."
-        )
-    else:
-        spot_for_display = live_spot
-        if not spot_for_display:
-            st.error(f"No live Tradovate spot price yet for {label} to calibrate the GEX engine.")
-            return
-        dte = st.slider("Simulated Days to Expiry", 1, 90, 30, key="gex_dte")
-        iv_assumed = st.slider("Assumed Implied Volatility (%)", 5, 80, 18, key="gex_iv") / 100
-        n_strikes = st.slider("Strike Range (± strikes around spot)", 10, 40, 25, key="gex_strikes")
-        gex_df = simulate_gex(spot_for_display, n_strikes=n_strikes, iv=iv_assumed, days_to_expiry=dte)
-        max_pain, pain_df = compute_max_pain_from_sim(gex_df)
-        source_label = f"Simulated GEX engine (Black-Scholes gamma model) calibrated off the live Tradovate spot for {label} — no proxy configured for this root."
-
-    st.caption(f"Data source: {source_label}")
+    dte = st.slider("Simulated Days to Expiry", 1, 90, 30, key="gex_dte")
+    iv_assumed = st.slider("Assumed Implied Volatility (%)", 5, 80, 18, key="gex_iv") / 100
+    n_strikes = st.slider("Strike Range (± strikes around spot)", 10, 40, 25, key="gex_strikes")
+    gex_df = simulate_gex(live_spot, n_strikes=n_strikes, iv=iv_assumed, days_to_expiry=dte)
+    max_pain, pain_df = compute_max_pain_from_sim(gex_df)
 
     net_gex_total = gex_df["net_gex"].sum()
     flip_candidates = gex_df.sort_values("strike").copy()
@@ -1600,32 +1249,32 @@ def render_gex_module(root_symbol: str, live_spot: float, label: str):
     gamma_flip = float(sign_changes["strike"].iloc[0]) if not sign_changes.empty else float(gex_df["strike"].median())
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Reference Spot", f"{spot_for_display:,.2f}")
-    c2.metric("Net GEX", f"{net_gex_total:,.0f}")
-    c3.metric("Max Pain Strike", f"{max_pain:,.2f}" if max_pain is not None else "N/A")
+    c1.metric("Live Spot", f"{live_spot:,.2f}")
+    c2.metric("Net GEX (simulated)", f"{net_gex_total:,.0f}")
+    c3.metric("Max Pain Strike (simulated)", f"{max_pain:,.2f}" if max_pain is not None else "N/A")
 
     fig = go.Figure()
     fig.add_trace(go.Bar(x=gex_df["strike"], y=gex_df["call_gex"], name="Call GEX", marker_color="#26a69a"))
     fig.add_trace(go.Bar(x=gex_df["strike"], y=gex_df["put_gex"], name="Put GEX", marker_color="#ef5350"))
-    fig.add_vline(x=spot_for_display, line_dash="dash", line_color="#f0b90b", annotation_text="Spot", annotation_position="top")
+    fig.add_vline(x=live_spot, line_dash="dash", line_color="#f0b90b", annotation_text="Spot", annotation_position="top")
     fig.add_vline(x=gamma_flip, line_dash="dot", line_color="#00e5ff", annotation_text="Gamma Flip", annotation_position="bottom")
     if max_pain is not None:
         fig.add_vline(x=max_pain, line_dash="dashdot", line_color=PURPLE_WALL, annotation_text="Max Pain", annotation_position="top")
 
     fig.update_layout(
         template=PLOTLY_TEMPLATE, height=560, barmode="relative",
-        title=f"{label} — Gamma Exposure Profile by Strike",
+        title=f"{label} — Simulated Gamma Exposure Profile by Strike",
         xaxis_title="Strike", yaxis_title="Gamma Exposure",
         margin=dict(l=10, r=10, t=50, b=10), dragmode="pan",
     )
     st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
-    interpretation = (
-        "Positive net GEX suggests dealers are net long gamma → they hedge by buying dips / selling rallies. "
-        "Negative net GEX suggests dealers are net short gamma → hedging flows can amplify moves, "
-        "increasing realized volatility, especially below the gamma flip level."
+    st.info(
+        "Positive net GEX suggests dealers are net long gamma → they hedge by buying dips / selling "
+        "rallies. Negative net GEX suggests dealers are net short gamma → hedging flows can amplify "
+        "moves, increasing realized volatility, especially below the gamma flip level. This entire "
+        "surface is simulated from assumed volatility/OI shape, not sourced from a real options market."
     )
-    st.info(interpretation)
 # ==================================================================================
 # MODULE 6 — INSTITUTIONAL EXECUTION ALGORITHMS (VWAP / TWAP / ICEBERG)
 # ==================================================================================
@@ -1739,256 +1388,132 @@ def render_execution_module(df: pd.DataFrame, order_book_df: pd.DataFrame, label
         else:
             st.info("No statistically significant iceberg clusters detected at the current sensitivity level.")
 # ==================================================================================
-# SIDEBAR — THEME, TRADOVATE CREDENTIALS, CONTRACT & INTERVAL SELECTION
+# SIDEBAR — ONLY: Environment, Username, Password, API Key/App ID, Connect button
 # ==================================================================================
 
-st.sidebar.markdown("## 📊 Institutional Quant Terminal")
-st.sidebar.caption("Live Tradovate REST + WebSocket Data Engine")
+st.sidebar.markdown("## 📊 Tradovate Quant Terminal")
 
-theme_choice = st.sidebar.radio(
-    "🎨 Theme", ["Dark Theme", "Light Theme"], index=0, horizontal=True, key="theme_choice",
+environment = st.sidebar.selectbox("Environment", ["Demo", "Live"], index=0, key="tv_environment")
+tv_name = st.sidebar.text_input("Tradovate Username", key="tv_name")
+tv_password = st.sidebar.text_input("Tradovate Password", type="password", key="tv_password")
+tv_api_key = st.sidebar.text_input(
+    "API Key / App ID (optional)", value="0", key="tv_api_key",
+    help="Demo defaults to \"0\", which some Demo accounts accept without a paid API Access "
+         "subscription. If Demo rejects it, enter the API Key issued under Settings → API Access.",
 )
-if theme_choice == "Dark Theme":
-    st.markdown(DARK_CSS, unsafe_allow_html=True)
-    PLOTLY_TEMPLATE = "plotly_dark"
+connect_clicked = st.sidebar.button("🔌 Connect to Tradovate", use_container_width=True)
+
+# ==================================================================================
+# CONNECTION STATUS BANNER
+# ==================================================================================
+
+st.title("📊 Tradovate Institutional Quantitative Trading Terminal")
+
+state: LiveMarketState = st.session_state.get("tv_state")
+worker: MarketDataWorker = st.session_state.get("tv_worker")
+tv_session: TradovateSession = st.session_state.get("tv_session")
+conn_error = st.session_state.get("tv_conn_error")
+
+is_live = bool(worker and worker.is_alive() and state and state.status()["connected"] and state.status()["authorized"])
+
+if is_live:
+    st.markdown(f'<div class="conn-banner-up">🟢 CONNECTED TO TRADOVATE {environment.upper()}</div>', unsafe_allow_html=True)
 else:
-    st.markdown(LIGHT_CSS, unsafe_allow_html=True)
-    PLOTLY_TEMPLATE = "plotly_white"
+    st.markdown('<div class="conn-banner-down">🔴 DISCONNECTED</div>', unsafe_allow_html=True)
 
-st.sidebar.divider()
-st.sidebar.subheader("🔐 Tradovate Account")
-
-environment = st.sidebar.selectbox(
-    "Environment", ["Demo", "Live"], index=0, key="tv_environment",
-    help="Demo tokens are valid up to 14 days; this app re-authenticates automatically once you "
-         "update credentials below after an expiration.",
-)
-
-with st.sidebar.expander("Credentials (or set via .env)", expanded=True):
-    tv_name = st.text_input("Username", value=os.getenv("TRADOVATE_USERNAME", ""), key="tv_name")
-    tv_password = st.text_input("Password", value=os.getenv("TRADOVATE_PASSWORD", ""), type="password", key="tv_password")
-    # Demo defaults to the "0" placeholder cid/sec so you can try the app
-    # without an API Access subscription. Live always needs your real,
-    # issued Client ID/Secret — "0"/"0" is a Demo-only convenience default.
-    cid_default = os.getenv("TRADOVATE_CID", "0" if environment == "Demo" else "")
-    sec_default = os.getenv("TRADOVATE_SECRET", "0" if environment == "Demo" else "")
-    tv_cid = st.text_input("API Key (cid)", value=cid_default, key="tv_cid")
-    tv_sec = st.text_input("API Secret (sec)", value=sec_default, type="password", key="tv_sec")
-    tv_app_id = st.text_input("App ID", value=os.getenv("TRADOVATE_APP_ID", DEFAULT_APP_ID), key="tv_app_id")
-    tv_app_version = st.text_input("App Version", value=os.getenv("TRADOVATE_APP_VERSION", DEFAULT_APP_VERSION), key="tv_app_version")
-    if environment == "Demo":
-        st.caption(
-            "Demo pre-fills cid/sec with the placeholder value \"0\", which some Tradovate Demo "
-            "accounts accept without a paid API Access subscription. This is not guaranteed for every "
-            "account — if authentication fails with \"Access is denied\" or an invalid-credentials "
-            "error, your account requires a real cid/sec pair from Settings → API Access."
-        )
-    else:
-        st.caption(
-            "Live requires your real, issued API Key/Secret (cid/sec) from Tradovate → Settings → "
-            "API Access. The \"0\" Demo placeholder does not apply here."
-        )
-
-# Demo: username + password are enough to attempt auth (cid/sec fall back to
-# the "0" placeholder above). Live: cid/sec must be real, non-empty values.
-if environment == "Demo":
-    credentials_complete = all([tv_name, tv_password])
-else:
-    credentials_complete = all([tv_name, tv_password, tv_cid, tv_sec])
-
-st.sidebar.divider()
-st.sidebar.subheader("Contract Selection")
-
-root_choice = st.sidebar.selectbox("Futures Root", list(FUTURES_ROOTS.keys()), key="root_choice")
-root_symbol = FUTURES_ROOTS[root_choice]
-use_custom_root = st.sidebar.checkbox("Use custom root symbol instead", value=False, key="use_custom_root")
-if use_custom_root:
-    root_symbol = st.sidebar.text_input("Custom Root Symbol", value=root_symbol, key="custom_root").strip().upper()
-    root_choice = f"Custom: {root_symbol}"
-
-interval = st.sidebar.selectbox("Primary Chart Interval", INTERVAL_CHOICES, index=INTERVAL_CHOICES.index("5m"), key="interval_choice")
-
-st.sidebar.divider()
-auto_refresh = st.sidebar.checkbox("🔴 Live Auto-Refresh", value=True, key="auto_refresh")
-refresh_secs = st.sidebar.slider("Refresh Interval (seconds)", 2, 15, 3, key="refresh_secs")
-
-col_reconnect, col_reset = st.sidebar.columns(2)
-force_reconnect = col_reconnect.button("🔄 Reconnect", use_container_width=True)
-force_reset = col_reset.button("🧹 Full Reset", use_container_width=True)
-
-st.sidebar.divider()
-st.sidebar.markdown(
-    "<div style='font-size:0.75rem; opacity:0.75;'>"
-    "<b>Data Engine Routing</b><br>"
-    "Authentication → Tradovate REST /auth/accesstoken<br>"
-    "Real-time Quotes & Trades → WS md/subscribeQuote<br>"
-    "Real-time Level 2 DOM → WS md/subscribeDOM<br>"
-    "Candles (all timeframes) → WS md/getChart, live-updating<br>"
-    "Options GEX (Module 5) → yfinance equity-ETF proxy or Black-Scholes simulation "
-    "(Tradovate API surface used here has no futures-options chain endpoint)<br>"
-    "Macro anchors (Module 3: DXY, 10Y yield) → yfinance<br><br>"
-    "For informational / research purposes only — not investment advice. "
-    "Demo-environment trading only reflects simulated fills."
-    "</div>",
-    unsafe_allow_html=True,
-)
-
-if force_reset:
-    for key in ["tv_session", "tv_state", "tv_worker", "tv_contract_cache"]:
-        st.session_state.pop(key, None)
-    st.cache_data.clear()
-    st.rerun()
+if conn_error:
+    st.error(f"⚠️ {conn_error}")
+elif state and state.status()["last_error"]:
+    st.warning(f"⚠️ {state.status()['last_error']}")
 
 # ==================================================================================
-# AUTHENTICATION LIFECYCLE
+# CONNECT ACTION — everything wrapped so failures show as banners, never a traceback
 # ==================================================================================
 
-st.title("📊 Institutional Quantitative Trading Terminal — Tradovate")
-
-if not credentials_complete:
-    if environment == "Demo":
-        st.warning(
-            "Enter your Tradovate **Username and Password** in the sidebar (or provide them via a "
-            "`.env` file) to authenticate and start streaming. cid/sec default to the Demo "
-            "placeholder \"0\" automatically."
-        )
+if connect_clicked:
+    st.session_state["tv_conn_error"] = None
+    if not tv_name or not tv_password:
+        st.session_state["tv_conn_error"] = "Username and Password are required."
     else:
-        st.warning(
-            "Enter your Tradovate **Username, Password, API Key (cid), and API Secret (sec)** in the "
-            "sidebar (or provide them via a `.env` file) — Live requires real API keys, unlike Demo."
-        )
+        try:
+            with st.spinner("Authenticating with Tradovate..."):
+                new_session = TradovateSession(
+                    environment=environment, name=tv_name, password=tv_password,
+                    api_key=tv_api_key, app_id=DEFAULT_APP_ID,
+                )
+                new_session.authenticate()
+
+            with st.spinner("Resolving front-month contracts for NQ, ES, MNQ, MES, CL..."):
+                contracts = {}
+                for root in CONTRACT_ROOTS:
+                    contracts[root] = new_session.find_front_month_contract(root)
+
+            old_worker = st.session_state.get("tv_worker")
+            if old_worker is not None:
+                old_worker.stop()
+
+            new_state = LiveMarketState(contracts=contracts)
+            new_worker = MarketDataWorker(session=new_session, state=new_state)
+            new_worker.start()
+
+            st.session_state["tv_session"] = new_session
+            st.session_state["tv_state"] = new_state
+            st.session_state["tv_worker"] = new_worker
+            st.session_state["tv_conn_error"] = None
+            if new_session.has_market_data is False:
+                st.session_state["tv_conn_error"] = (
+                    "Connected, but this account reports hasMarketData=false — quotes/DOM will not "
+                    "stream until a market data entitlement is enabled, even though candles/auth work."
+                )
+            st.rerun()
+        except TradovateAuthError as e:
+            st.session_state["tv_conn_error"] = str(e)
+        except Exception as e:
+            st.session_state["tv_conn_error"] = f"Unexpected error while connecting: {e}"
+
+if not is_live:
+    st.info("Enter your credentials in the sidebar and click **Connect to Tradovate** to start streaming.")
+    st.caption(
+        "Once connected, quotes, Level 2 DOM, tick trades, and multi-timeframe candles stream "
+        "automatically in the background for NQ, ES, MNQ, MES, and CL."
+    )
     st.stop()
 
-fingerprint = (environment, tv_name, tv_password, tv_app_id, tv_app_version, tv_cid, tv_sec)
-existing_session = st.session_state.get("tv_session")
-need_new_session = (
-    existing_session is None
-    or existing_session.credential_fingerprint() != fingerprint
-    or force_reconnect
-)
-
-if need_new_session:
-    new_session = TradovateSession(
-        environment=environment, name=tv_name, password=tv_password,
-        app_id=tv_app_id, app_version=tv_app_version, cid=tv_cid, sec=tv_sec,
-        device_id=st.session_state.get("tv_device_id", str(uuid.uuid4())),
-    )
-    st.session_state["tv_device_id"] = new_session.device_id
-    try:
-        with st.spinner("Authenticating with Tradovate..."):
-            new_session.authenticate()
-    except TradovateAuthError as e:
-        st.error(f"❌ {e}")
-        st.stop()
-    st.session_state["tv_session"] = new_session
-    # credentials or environment changed -> any live worker is stale, tear it down
-    old_worker = st.session_state.pop("tv_worker", None)
-    if old_worker is not None:
-        old_worker.stop()
-    st.session_state.pop("tv_state", None)
-    st.session_state.pop("tv_contract_cache", None)
-
-tv_session = st.session_state["tv_session"]
-
-if not tv_session.is_token_valid():
-    try:
-        with st.spinner("Refreshing expired Tradovate session token..."):
-            tv_session.authenticate()
-    except TradovateAuthError as e:
-        st.error(f"❌ Token refresh failed: {e}")
-        st.stop()
-
-if tv_session.has_market_data is False:
-    st.warning(
-        "⚠️ This Tradovate account reports `hasMarketData: false`. Real-time quotes/DOM will not "
-        "stream until a market data subscription is enabled on the account, even though candles and "
-        "authentication will otherwise work normally."
-    )
-
 # ==================================================================================
-# CONTRACT RESOLUTION (front-month lookup, cached per root+environment)
+# CONTRACT FOCUS & INTERVAL (main area — sidebar is reserved for connection controls)
 # ==================================================================================
 
-contract_cache = st.session_state.setdefault("tv_contract_cache", {})
-cache_key = f"{environment}:{root_symbol}"
+focus_col, interval_col = st.columns([2, 1])
+focus_root = focus_col.selectbox("Focused Contract", CONTRACT_ROOTS, key="focus_root")
+interval = interval_col.selectbox("Chart Interval", INTERVAL_CHOICES, index=INTERVAL_CHOICES.index("5m"), key="interval_choice")
 
-if cache_key not in contract_cache or force_reconnect:
-    try:
-        with st.spinner(f"Resolving front-month contract for {root_symbol}..."):
-            contract_cache[cache_key] = tv_session.find_front_month_contract(root_symbol)
-    except TradovateAuthError as e:
-        st.error(f"❌ {e}")
-        st.stop()
+try:
+    worker.ensure_chart(focus_root, interval)
+except Exception:
+    pass  # non-fatal — chart will simply be empty until the next successful subscribe
 
-contract_info = contract_cache[cache_key]
-contract_name = contract_info["name"]
-contract_id = contract_info["id"]
-asset_label = f"{root_choice} — {contract_name}"
+contract_name = state.contracts[focus_root]["name"]
+main_df = state.snapshot_bars(focus_root, interval)
+order_book_df = state.snapshot_dom(focus_root)
+quote_snapshot = state.snapshot_quote(focus_root)
+live_ticks = state.snapshot_ticks(focus_root)
+daily_bars_by_root = {root: state.snapshot_bars(root, "1d") for root in CONTRACT_ROOTS}
 
-# ==================================================================================
-# WORKER LIFECYCLE — persistent background WebSocket thread across reruns
-# ==================================================================================
-
-timeframes_needed = sorted(set([interval, "1d"]))
-worker: MarketDataWorker = st.session_state.get("tv_worker")
-
-need_new_worker = (
-    worker is None
-    or not worker.is_alive()
-    or worker.contract_name != contract_name
-    or sorted(worker.timeframes) != timeframes_needed
-    or force_reconnect
-)
-
-if need_new_worker:
-    if worker is not None:
-        worker.stop()
-    live_state = LiveMarketState()
-    new_worker = MarketDataWorker(
-        session=tv_session, state=live_state, contract_name=contract_name,
-        contract_id=contract_id, timeframes=timeframes_needed,
-    )
-    new_worker.start()
-    st.session_state["tv_worker"] = new_worker
-    st.session_state["tv_state"] = live_state
-
-worker = st.session_state["tv_worker"]
-live_state: LiveMarketState = st.session_state["tv_state"]
-
-status = live_state.status()
-main_df = live_state.snapshot_bars(interval)
-daily_df = live_state.snapshot_bars("1d")
-order_book_df = live_state.snapshot_dom()
-quote_snapshot = live_state.snapshot_quote()
-live_ticks = live_state.snapshot_ticks()
-
-conn_badge = "🟢 WS CONNECTED" if status["connected"] else "🔴 WS DISCONNECTED"
-auth_badge = "🟢 AUTHORIZED" if status["authorized"] else "🟡 AUTHORIZING…"
-st.caption(f"Active Contract: **{asset_label}** · Environment: {environment} · Interval: {interval}")
+st.caption(f"Focused Contract: **{focus_root}** ({contract_name}) · Environment: {environment} · Interval: {interval}")
 st.markdown(
-    f'<span class="source-badge">{conn_badge}</span>'
-    f'<span class="source-badge">{auth_badge}</span>'
     f'<span class="source-badge">📡 CANDLES: TRADOVATE md/getChart (LIVE)</span>'
-    f'<span class="source-badge">{"🟢 LIVE L2 DOM" if not order_book_df.empty else "🔴 DOM AWAITING FIRST SNAPSHOT"}</span>',
+    f'<span class="source-badge">{"🟢 LIVE L2 DOM" if not order_book_df.empty else "🟡 DOM AWAITING FIRST SNAPSHOT"}</span>',
     unsafe_allow_html=True,
 )
-if status["last_error"]:
-    st.error(f"⚠️ {status['last_error']}")
 
 if main_df.empty:
-    st.info(
-        f"Waiting on the first `md/getChart` bar snapshot for **{contract_name}** ({interval})... "
-        "this normally arrives within a few seconds of authorization. The page will keep refreshing."
-    )
-    if auto_refresh:
-        time.sleep(refresh_secs)
-        st.rerun()
-    st.stop()
+    st.info(f"Waiting on the first live bar snapshot for **{contract_name}** ({interval})...")
+    time.sleep(AUTO_REFRESH_SECONDS)
+    st.rerun()
 
 if len(main_df) < 20:
     st.warning("Limited bar history streamed so far for this interval — some modules need more bars to compute.")
 
-# Snapshot metrics
 last_row = main_df.iloc[-1]
 prev_row = main_df.iloc[-2] if len(main_df) > 1 else last_row
 chg = safe_pct(last_row["Close"], prev_row["Close"])
@@ -1997,9 +1522,7 @@ display_price = live_last if live_last is not None else last_row["Close"]
 
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Last Price", f"{display_price:,.2f}", f"{chg:.2f}%")
-m2.metric("Bid / Ask", (
-    f"{quote_snapshot.get('bidPrice', '—')} / {quote_snapshot.get('askPrice', '—')}"
-))
+m2.metric("Bid / Ask", f"{quote_snapshot.get('bidPrice', '—')} / {quote_snapshot.get('askPrice', '—')}")
 m3.metric("Session High", f"{main_df['High'].max():,.2f}")
 m4.metric("Session Low", f"{main_df['Low'].min():,.2f}")
 m5.metric("Bars Loaded", f"{len(main_df):,}")
@@ -2007,68 +1530,57 @@ m5.metric("Bars Loaded", f"{len(main_df):,}")
 st.divider()
 
 # ==================================================================================
-# TAB NAVIGATION — 6 MODULES
+# TAB NAVIGATION — 6 MODULES (each wrapped so a module error is a banner, not a crash)
 # ==================================================================================
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "🌊 Liquidity & Order Flow",
-    "🤖 ML Classifier",
-    "🔗 Cross-Asset Correlation",
-    "📊 Volume Delta / CVD",
-    "🎯 Options GEX & Max Pain",
-    "⚙️ VWAP / TWAP / Iceberg",
+    "🌊 Liquidity & Order Flow", "🤖 ML Classifier", "🔗 Cross-Asset Correlation",
+    "📊 Volume Delta / CVD", "🎯 Options GEX & Max Pain", "⚙️ VWAP / TWAP / Iceberg",
 ])
 
 with tab1:
     try:
-        render_liquidity_module(main_df, order_book_df, asset_label, dom_is_live=status["authorized"])
+        render_liquidity_module(main_df, order_book_df, focus_root, dom_is_live=is_live)
     except Exception as e:
         st.error(f"Liquidity module encountered an error: {e}")
 
 with tab2:
     try:
-        render_ml_module(main_df, asset_label)
+        render_ml_module(main_df, focus_root)
     except Exception as e:
         st.error(f"ML Classifier module encountered an error: {e}")
 
 with tab3:
     try:
-        render_correlation_module(daily_df, asset_label)
+        render_correlation_module(daily_bars_by_root, focus_root)
     except Exception as e:
         st.error(f"Correlation module encountered an error: {e}")
 
 with tab4:
     try:
-        render_volume_delta_module(main_df, asset_label, live_ticks, ticks_available=len(live_ticks) > 20)
+        render_volume_delta_module(main_df, focus_root, live_ticks, ticks_available=len(live_ticks) > 20)
     except Exception as e:
         st.error(f"Volume Delta module encountered an error: {e}")
 
 with tab5:
     try:
-        render_gex_module(root_symbol, float(display_price) if display_price else None, asset_label)
+        render_gex_module(focus_root, float(display_price) if display_price else None, focus_root)
     except Exception as e:
         st.error(f"GEX module encountered an error: {e}")
 
 with tab6:
     try:
-        render_execution_module(main_df, order_book_df, asset_label)
+        render_execution_module(main_df, order_book_df, focus_root)
     except Exception as e:
         st.error(f"Execution Algorithms module encountered an error: {e}")
 
 st.divider()
 st.caption(
-    "⚠️ Disclaimer: This dashboard is provided for research and educational purposes only. "
-    "It does not constitute financial advice. Trading futures involves substantial risk of loss."
+    "⚠️ Disclaimer: research/educational purposes only — not investment advice. "
+    "Trading futures involves substantial risk of loss."
 )
 
-# ==================================================================================
-# LIVE AUTO-REFRESH LOOP
-# ==================================================================================
-# Streamlit has no native server-push; this simple sleep+rerun loop polls the
-# background worker's shared state at `refresh_secs` intervals so the UI feels
-# live without requiring an extra streamlit-autorefresh dependency. The
-# WebSocket connection itself is NOT affected by this — it keeps streaming on
-# its own background thread regardless of how often the page reruns.
-if auto_refresh:
-    time.sleep(refresh_secs)
-    st.rerun()
+# Live polling loop — background WebSocket thread keeps streaming regardless;
+# this just keeps the displayed snapshot fresh.
+time.sleep(AUTO_REFRESH_SECONDS)
+st.rerun()
