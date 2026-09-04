@@ -1,84 +1,68 @@
 """
 ==================================================================================
 INSTITUTIONAL QUANTITATIVE TRADING TERMINAL
-Hybrid Multi-Source Data Engine — Binance | yfinance (+ optional Dukascopy SWFX overlay)
+Tradovate Live Data Engine — REST Auth + WebSocket L2 DOM / Quote / Chart Stream
 ==================================================================================
 A single-file, production-ready Streamlit application implementing six
-institutional-grade quantitative trading modules, backed by a hybrid data engine
-that routes each asset class to the venue best suited to serve real market data
-without requiring the user to hold API keys:
+institutional-grade quantitative trading modules, backed entirely by the
+Tradovate Trading API (Demo or Live environment):
 
-    Crypto & Metals proxy   -> Binance Public REST API   (klines + depth, 3-endpoint fallback)
-    Major Forex pairs       -> yfinance structural baseline (ALWAYS, fast, guarantees 200+
-                                bars) + OPTIONAL Dukascopy SWFX live tick overlay for real
-                                volume / DOM, fetched as a separate, toggleable, lazy step
-    Macro / Index / Futures -> yfinance                   (OHLCV + option chains)
-    Universal fallback      -> yfinance                   (any source failure)
+    Authentication   -> POST {rest}/auth/accesstoken   (REST, username/password/API key)
+    Real-time Quotes -> WS   md/subscribeQuote          (best bid/ask, last, volume)
+    Real-time DOM    -> WS   md/subscribeDOM            (full Level 2 price ladder)
+    Real-time Chart  -> WS   md/getChart                (historical + live bar stream)
 
-PERFORMANCE ARCHITECTURE (why "Fetching market data..." is now fast):
-Earlier revisions called the Dukascopy SWFX tick downloader (`fetch_dukascopy_ticks`,
-which fans out up to ~168 concurrent HTTP requests) INSIDE `fetch_ohlcv()` — i.e. inside
-the exact call wrapped by the "Fetching market data..." spinner on every page load and
-every timeframe change. That's what made the UI feel stuck.
+IMPORTANT — READ BEFORE DEPLOYING WITH REAL CREDENTIALS
+---------------------------------------------------------------------------------
+Tradovate's `/auth/accesstoken` endpoint requires FOUR credential fields, not
+just a username/password:
+    name (username), password, appId, appVersion, cid (API Key/Client ID),
+    sec (API Secret), and optionally deviceId.
+`cid`/`sec` are issued to you by Tradovate under Settings -> API Access on the
+account you authenticate with. A bare username+password without cid/sec will
+be rejected by the endpoint ("Access is denied"). The sidebar below collects
+all of these fields (or reads them from a `.env` file) — this is not optional
+scaffolding, it is how the endpoint actually works.
 
-This revision fully decouples the two:
-  1. `fetch_ohlcv()` for forex now ONLY calls yfinance. It never touches Dukascopy. This
-     is the same call used for every asset class, so "Fetching market data..." is always
-     just one fast, cached yfinance/Binance request — no network fan-out, ever. The
-     fallback path is also asset-aware now: forex never retries yfinance a second time
-     with the same arguments (that was a pointless duplicate call) — it only falls back
-     to yfinance if the primary route WASN'T already yfinance (i.e. for crypto, if
-     Binance failed).
-  2. Dukascopy tick fetching (used for both the real-volume overlay and the DOM ladder)
-     happens afterwards, under its own separate spinner, and ONLY when the sidebar
-     "Enable Live SWFX Tick Overlay" toggle is on and the selected timeframe is intraday
-     (daily+ timeframes never needed it and now explicitly skip it). Both the volume
-     overlay and the DOM ladder pull from the SAME cached `fetch_dukascopy_ticks()` call
-     (identical symbol + lookback-hours cache key), so there is only ever one network
-     batch per rerun, not two.
-  3. Every `.bi5` hourly download and the tick-parsing step are `st.cache_data(ttl=300)`,
-     so once an hour's ticks are fetched they are reused instantly across refreshes.
+The WebSocket wire protocol used by Tradovate (`wss://demo.tradovateapi.com/v1/websocket`)
+is a lightweight SockJS-style text framing:
+    - First frame received after connect is the literal string "o" (open).
+    - Every outbound request is a single text frame of the form:
+          "<endpoint>\\n<requestId>\\n<query>\\n<jsonBody>"
+      e.g.  "md/subscribeDOM\\n3\\n\\n{\"symbol\":\"ESZ5\"}"
+    - The very first request must be authorization:
+          "authorize\\n1\\n\\n<accessToken>"
+    - Inbound frames are prefixed by a single type character:
+          "o" = open, "h" = heartbeat, "a" = array of JSON messages,
+          "c" = close (server is terminating the session).
+    - "a" frames carry a JSON array, each element shaped like
+          {"s": <status>, "i": <requestId>, "d": <payload>}   (responses)
+      or  {"e": "md", "d": {...}}                             (data events)
+    - The client must not let the socket go idle — this engine replies to each
+      "h" heartbeat by sending a keep-alive frame back immediately, which is
+      the behavior Tradovate's own reference clients use.
 
-Honest caveat: Streamlit executes a script top-to-bottom on every rerun and paints the
-page only once that run finishes — there's no true background/async rendering without
-extra infrastructure (e.g. st.fragment + session-state polling, or a websocket bridge),
-which this single-file app does not attempt to fake. What's guaranteed here is that the
-Dukascopy fan-out is no longer on the *candle* critical path, is user-toggleable, is
-skipped automatically on timeframes that don't need it, and is cached — so the heaviest
-part of a load is, at worst, one clearly-labeled optional spinner instead of blocking
-candle rendering entirely.
-
-VOLUME ROBUSTNESS (why VWAP/CVD/Iceberg no longer break on forex):
-yfinance reports zero (or missing) volume for most FX pairs, and Dukascopy's real tick
-volume only covers a recent rolling window. Rather than let downstream math divide by a
-column that's sometimes entirely zero, a Synthetic Volume Proxy
-(`apply_synthetic_volume_proxy`) is applied immediately after the baseline candles are
-fetched — before any module sees the data — whenever real reported volume is missing on
-more than half the bars. It is a bar-range/volatility-weighted estimate
-((High-Low) scaled by the bar's absolute return), NOT real traded volume, and it is
-always disclosed as such: a neutral "🧮 Synthetic Volume Proxy" badge (not a jarring
-yellow warning) is shown wherever it's in effect, and any real Dukascopy tick volume
-fetched afterwards overwrites the synthetic estimate bar-by-bar wherever real coverage
-exists. This guarantees every bar has a positive Volume value, so VWAP/CVD/Volume Delta/
-Iceberg detection never divide by zero or degrade to all-NaN.
-
-Modules:
-  1. Institutional Order Flow & Liquidity Heatmap (BSL/SSL, FVGs, live $ volume
-     annotations from the L2 DOM, institutional bank-wall isolation, and a
-     Bank Anchor PnL Tracker)
-  2. Quantitative Machine Learning Classifier (RandomForest direction model)
-  3. Cross-Asset Correlation & Macro Yield Matrix
-  4. Volume Delta / Cumulative Volume Delta (CVD) Footprint Analysis
-  5. Options Gamma Exposure (GEX) & Max Pain Engine (live chain or simulation)
-  6. Institutional Execution Algorithms (VWAP / TWAP / Iceberg Detection)
+Because Streamlit re-executes the whole script on every rerun, a naive
+`websockets.connect()` call inside the script body would reconnect (and lose
+the DOM/quote state) on every single interaction. This engine instead runs the
+WebSocket client on a persistent background thread (stored in
+`st.session_state`, survives reruns) with its own asyncio event loop, and
+exposes a thread-safe snapshot of the latest quote / DOM / chart bars that the
+main Streamlit thread reads on every rerun. A small auto-refresh loop keeps
+the UI polling that snapshot at a configurable interval so the terminal feels
+"live" without needing server-push into the browser.
 ==================================================================================
 """
 
-import lzma
+import json
 import math
-import struct
+import os
+import queue
+import threading
+import time
+import uuid
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 warnings.filterwarnings("ignore")
@@ -89,19 +73,23 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 import streamlit as st
+import websocket  # websocket-client package (sync, thread-friendly)
 import yfinance as yf
 
+from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+
+load_dotenv()
 
 # ==================================================================================
 # PAGE CONFIG & GLOBAL STYLE
 # ==================================================================================
 
 st.set_page_config(
-    page_title="Institutional Quant Terminal",
+    page_title="Institutional Quant Terminal — Tradovate",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -149,17 +137,6 @@ DARK_CSS = """
         font-size: 0.75rem;
         font-weight: 600;
         margin-right: 6px;
-    }
-    .info-badge {
-        display: inline-block;
-        background-color: #16202e;
-        color: #7ea6d8;
-        border: 1px solid #24405e;
-        border-radius: 6px;
-        padding: 4px 12px;
-        font-size: 0.8rem;
-        font-weight: 500;
-        margin-bottom: 8px;
     }
     .stButton>button {
         background-color: #f0b90b;
@@ -219,17 +196,6 @@ LIGHT_CSS = """
         font-weight: 600;
         margin-right: 6px;
     }
-    .info-badge {
-        display: inline-block;
-        background-color: #eef4fb;
-        color: #2f5d8a;
-        border: 1px solid #cfe0f0;
-        border-radius: 6px;
-        padding: 4px 12px;
-        font-size: 0.8rem;
-        font-weight: 500;
-        margin-bottom: 8px;
-    }
     .stButton>button {
         background-color: #b8860b;
         color: #ffffff;
@@ -246,508 +212,636 @@ PURPLE_WALL = "#ba68c8"
 PLOTLY_CONFIG = {"scrollZoom": False, "displayModeBar": True, "responsive": True}
 
 # ==================================================================================
-# DATA ENGINE CONSTANTS — HTTP HEADERS & MULTI-ENDPOINT FALLBACK ROUTING
+# TRADOVATE ENDPOINT CONSTANTS
 # ==================================================================================
 
-HTTP_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
+TRADOVATE_ENVIRONMENTS = {
+    "Demo": {
+        "rest": "https://demo.tradovateapi.com/v1",
+        "ws": "wss://demo.tradovateapi.com/v1/websocket",
+    },
+    "Live": {
+        "rest": "https://live.tradovateapi.com/v1",
+        "ws": "wss://live.tradovateapi.com/v1/websocket",
+    },
 }
 
-BINANCE_KLINES_ENDPOINTS = [
-    "https://api.binance.com/api/v3/klines",
-    "https://data-api.binance.vision/api/v3/klines",
-    "https://api.binance.us/api/v3/klines",
-]
+DEFAULT_APP_ID = "InstitutionalQuantTerminal"
+DEFAULT_APP_VERSION = "1.0"
 
-BINANCE_DEPTH_ENDPOINTS = [
-    "https://api.binance.com/api/v3/depth",
-    "https://data-api.binance.vision/api/v3/depth",
-    "https://api.binance.us/api/v3/depth",
-]
+HTTP_HEADERS_BASE = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
 
-DUKASCOPY_BASE_URL = "https://datafeed.dukascopy.com/datafeed"
+# Timeframe -> Tradovate chartDescription for md/getChart. Tradovate's chart
+# API buckets time-based bars under underlyingType "MinuteBar" (elementSize =
+# number of minutes per bar) and calendar-day bars under "DailyBar". Verify
+# these enum values against the API Reference in your Tradovate account if
+# your account's chart service version differs.
+TRADOVATE_BAR_CONFIG = {
+    "1m":  {"underlyingType": "MinuteBar", "elementSize": 1},
+    "5m":  {"underlyingType": "MinuteBar", "elementSize": 5},
+    "15m": {"underlyingType": "MinuteBar", "elementSize": 15},
+    "30m": {"underlyingType": "MinuteBar", "elementSize": 30},
+    "1h":  {"underlyingType": "MinuteBar", "elementSize": 60},
+    "4h":  {"underlyingType": "MinuteBar", "elementSize": 240},
+    "1d":  {"underlyingType": "DailyBar", "elementSize": 1},
+}
 
-# Base timeframes for which a Dukascopy tick overlay is even meaningful. Daily+ bases
-# are never attempted — yfinance is the sole source there, backstopped by the synthetic
-# volume proxy, so no tick fetch (and no request fan-out) happens on those timeframes.
-TICK_OVERLAY_ELIGIBLE_BASES = {"1m", "5m", "15m", "30m", "1h", "4h"}
-BAR_RULE_MAP = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h"}
-
-DEFAULT_TICK_LOOKBACK_HOURS = 48
-DEFAULT_DOM_BUCKET_PIPS = 2.0
-DEFAULT_BINANCE_DEPTH_LIMIT = 1000
+INTERVAL_CHOICES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 
 # ==================================================================================
-# ASSET UNIVERSE
+# FUTURES CONTRACT UNIVERSE
 # ==================================================================================
+# Tradovate contracts are month-coded (e.g. "ESZ5"). We resolve the live
+# front-month contract for each root symbol at runtime via the REST
+# /contract/suggest endpoint rather than hardcoding expiring month codes.
 
-CRYPTO_ASSETS = {
-    "Bitcoin (BTC/USDT)": "BTCUSDT",
-    "Ethereum (ETH/USDT)": "ETHUSDT",
-    "PAX Gold — Gold Proxy (PAXG/USDT)": "PAXGUSDT",
-    "Solana (SOL/USDT)": "SOLUSDT",
-    "XRP (XRP/USDT)": "XRPUSDT",
-    "BNB (BNB/USDT)": "BNBUSDT",
+FUTURES_ROOTS = {
+    "E-mini S&P 500 (ES)": "ES",
+    "Micro E-mini S&P 500 (MES)": "MES",
+    "E-mini Nasdaq-100 (NQ)": "NQ",
+    "Micro E-mini Nasdaq-100 (MNQ)": "MNQ",
+    "E-mini Dow (YM)": "YM",
+    "Crude Oil (CL)": "CL",
+    "Micro Crude Oil (MCL)": "MCL",
+    "Gold (GC)": "GC",
+    "Micro Gold (MGC)": "MGC",
+    "Silver (SI)": "SI",
+    "10-Year T-Note (ZN)": "ZN",
+    "30-Year T-Bond (ZB)": "ZB",
+    "Euro FX (6E)": "6E",
+    "British Pound (6B)": "6B",
+    "Japanese Yen (6J)": "6J",
 }
 
-FOREX_ASSETS = {
-    "EUR/USD": "EURUSD",
-    "GBP/USD": "GBPUSD",
-    "USD/JPY": "USDJPY",
-    "AUD/USD": "AUDUSD",
-    "USD/CHF": "USDCHF",
-    "USD/CAD": "USDCAD",
+# Macro/options-proxy map used only by Module 5 (Tradovate does not expose a
+# public listed-options chain endpoint for these futures roots in this app;
+# see the GEX module docstring for exactly what is live vs. simulated).
+FUTURES_OPTIONS_PROXY_MAP = {
+    "ES": "SPY", "MES": "SPY", "NQ": "QQQ", "MNQ": "QQQ", "YM": "DIA",
+    "CL": "USO", "MCL": "USO", "GC": "GLD", "MGC": "GLD", "SI": "SLV",
+    "ZN": "IEF", "ZB": "TLT", "6E": "FXE", "6B": "FXB", "6J": "FXY",
 }
 
-MACRO_ASSETS = {
+# Macro anchors used by Module 3 correlation matrix (yfinance — Tradovate has
+# no Treasury-yield-index or DXY product, so these stay on the macro/index feed
+# exactly like the original app's "any source gap -> yfinance" pattern).
+MACRO_ANCHOR_TICKERS = {
     "US Dollar Index (DXY)": "DX-Y.NYB",
-    "US 10-Year Treasury Yield": "^TNX",
-    "Gold Futures (GC=F)": "GC=F",
-    "Silver Futures (SI=F)": "SI=F",
+    "US 10Y Yield": "^TNX",
     "S&P 500 Index": "^GSPC",
 }
-
-OPTIONS_PROXY_MAP = {
-    "GC=F": "GLD",
-    "SI=F": "SLV",
-    "^GSPC": "SPY",
-}
-
-INTERVAL_CHOICES = [
-    "1m", "2m", "3m", "4m", "5m", "15m", "30m", "1h", "2h", "3h", "4h",
-    "1d", "1wk", "1mo", "1y",
-]
-
-INTERVAL_CONFIG = {
-    "1m": {"base": "1m", "resample": None},
-    "2m": {"base": "1m", "resample": "2min"},
-    "3m": {"base": "1m", "resample": "3min"},
-    "4m": {"base": "1m", "resample": "4min"},
-    "5m": {"base": "5m", "resample": None},
-    "15m": {"base": "15m", "resample": None},
-    "30m": {"base": "30m", "resample": None},
-    "1h": {"base": "1h", "resample": None},
-    "2h": {"base": "1h", "resample": "2h"},
-    "3h": {"base": "1h", "resample": "3h"},
-    "4h": {"base": "4h", "resample": None},
-    "1d": {"base": "1d", "resample": None},
-    "1wk": {"base": "1d", "resample": "W"},
-    "1mo": {"base": "1d", "resample": "ME"},
-    "1y": {"base": "1d", "resample": "YE"},
-}
-
-BINANCE_BASE_MAP = {
-    "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d",
-}
-
 # ==================================================================================
-# SYMBOL / TICKER TRANSLATION HELPERS
+# TRADOVATE REST SESSION — AUTHENTICATION, TOKEN REFRESH, CONTRACT RESOLUTION
 # ==================================================================================
 
-def binance_to_yf_ticker(symbol: str) -> str:
-    for quote in ("USDT", "USDC", "BUSD"):
-        if symbol.upper().endswith(quote):
-            base = symbol.upper()[:-len(quote)]
-            return f"{base}-USD"
-    return symbol
+class TradovateAuthError(Exception):
+    pass
 
-def forex_to_yf_ticker(symbol: str) -> str:
-    return f"{symbol.upper()}=X"
 
-def dukascopy_point_divider(symbol: str) -> int:
-    """Dukascopy raw tick prices are integers; divide by this to get the real quote."""
-    return 1000 if "JPY" in symbol.upper() else 100000
+class TradovateSession:
+    """Owns REST authentication state for one Tradovate account.
 
-# ==================================================================================
-# LOW-LEVEL SOURCE FETCHERS
-# ==================================================================================
-
-def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    legacy_alias = {"ME": "M", "YE": "Y"}
-    try:
-        out = df.resample(rule).agg(agg)
-    except Exception:
-        try:
-            out = df.resample(legacy_alias.get(rule, rule)).agg(agg)
-        except Exception:
-            return df
-    return out.dropna(subset=["Open", "High", "Low", "Close"])
-
-def fetch_binance_klines(symbol: str, base_key: str, limit: int = 1000) -> pd.DataFrame:
-    interval = BINANCE_BASE_MAP.get(base_key)
-    if interval is None:
-        return pd.DataFrame()
-
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-    for url in BINANCE_KLINES_ENDPOINTS:
-        try:
-            resp = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=8)
-            resp.raise_for_status()
-            data = resp.json()
-            if not isinstance(data, list) or not data:
-                continue
-            cols = [
-                "open_time", "Open", "High", "Low", "Close", "Volume",
-                "close_time", "qav", "trades", "tbbav", "tbqav", "ignore",
-            ]
-            df = pd.DataFrame(data, columns=cols)
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-            df = df.set_index("open_time")
-            for c in ["Open", "High", "Low", "Close", "Volume"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-            if not df.empty:
-                return df
-        except Exception:
-            continue
-    return pd.DataFrame()
-
-def fetch_yfinance_ohlcv(ticker: str, base_key: str) -> pd.DataFrame:
-    period_map = {
-        "1m": "7d", "5m": "60d", "15m": "60d", "30m": "60d",
-        "1h": "730d", "4h": "730d", "1d": "10y",
-    }
-    interval_map = {
-        "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-        "1h": "60m", "4h": "60m", "1d": "1d",
-    }
-    period = period_map.get(base_key, "1y")
-    yf_interval = interval_map.get(base_key, "1d")
-    try:
-        raw = yf.download(
-            tickers=ticker, period=period, interval=yf_interval,
-            progress=False, auto_adjust=False, threads=False,
-        )
-        if raw is None or raw.empty:
-            return pd.DataFrame()
-        if isinstance(raw.columns, pd.MultiIndex):
-            try:
-                raw.columns = raw.columns.get_level_values(0)
-            except Exception:
-                raw.columns = ["_".join([str(c) for c in col if c]) for col in raw.columns]
-        expected = ["Open", "High", "Low", "Close", "Volume"]
-        for col in expected:
-            if col not in raw.columns:
-                return pd.DataFrame()
-        df = raw[expected].copy()
-        df.index = pd.to_datetime(df.index)
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        df["Volume"] = df["Volume"].fillna(0)
-        if base_key == "4h" and not df.empty:
-            df = resample_ohlcv(df, "4h")
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_ohlcv(asset_class: str, symbol: str, yf_ticker: str, interval_key: str):
-    """Fast structural candle fetch ONLY. Never touches Dukascopy — see module docstring
-    (Performance Architecture) for why this separation is what fixes the load-time bug.
-
-    Fallback logic is asset-aware: forex's primary route already IS yfinance, so if it
-    comes back empty there is no point calling fetch_yfinance_ohlcv() a second time with
-    identical arguments — it will just fail again. The generic "any source failure ->
-    yfinance" fallback below now only fires for asset classes whose primary route was
-    NOT yfinance (i.e. crypto, when all three Binance endpoints failed)."""
-    cfg = INTERVAL_CONFIG.get(interval_key, INTERVAL_CONFIG["1d"])
-    base_key = cfg["base"]
-    resample_rule = cfg["resample"]
-
-    df = pd.DataFrame()
-    source_used = "unavailable"
-    primary_was_yfinance = False
-
-    if asset_class == "crypto":
-        df = fetch_binance_klines(symbol, base_key)
-        if not df.empty:
-            source_used = "Binance (live)"
-    elif asset_class == "forex":
-        df = fetch_yfinance_ohlcv(yf_ticker, base_key)
-        primary_was_yfinance = True
-        if not df.empty:
-            source_used = "yfinance (structural baseline)"
-    else:
-        df = fetch_yfinance_ohlcv(yf_ticker, base_key)
-        primary_was_yfinance = True
-        if not df.empty:
-            source_used = "yfinance"
-
-    if df.empty and not primary_was_yfinance:
-        df = fetch_yfinance_ohlcv(yf_ticker, base_key)
-        if not df.empty:
-            source_used = "yfinance (fallback)"
-
-    if df.empty:
-        return pd.DataFrame(), source_used
-
-    if resample_rule:
-        df = resample_ohlcv(df, resample_rule)
-
-    return df, source_used
-
-def get_last_price(asset_class: str, symbol: str, yf_ticker: str):
-    df, _src = fetch_ohlcv(asset_class, symbol, yf_ticker, "1d")
-    if df.empty:
-        return None
-    return float(df["Close"].iloc[-1])
-
-# ==================================================================================
-# SYNTHETIC VOLUME PROXY — seamless fallback when real volume is missing/zero
-# ==================================================================================
-
-def apply_synthetic_volume_proxy(df: pd.DataFrame):
-    """Fills bars with no real reported volume using a bar-range/volatility-weighted
-    estimate, so VWAP / CVD / Volume Delta / Iceberg detection always have a positive,
-    non-degenerate Volume series to work with. Returns (df, used_synthetic: bool).
-
-    This is explicitly an ESTIMATE, not real traded volume — callers must disclose it
-    to the user (see the "🧮 Synthetic Volume Proxy" badges in the modules below)
-    rather than presenting it as genuine exchange volume. Any bar that already has real
-    reported volume (> 0) is left untouched; only zero/missing bars are filled.
+    Handles the initial /auth/accesstoken call, tracks the access token's
+    expiration, and exposes a `ensure_valid()` method the rest of the app
+    calls before any REST/WS action so an expired/near-expired Demo token
+    (Demo tokens are valid up to 14 days, per Tradovate's Demo policy) is
+    silently refreshed as long as the same credentials are still valid in
+    the sidebar — no restart, no broken UI, matching the "graceful
+    re-authentication" requirement.
     """
-    if df.empty:
-        return df, False
 
-    vol = df["Volume"].fillna(0)
-    real_coverage = float((vol > 0).mean()) if len(vol) else 0.0
-    if real_coverage >= 0.5:
-        return df, False
+    def __init__(self, environment: str, name: str, password: str, app_id: str,
+                 app_version: str, cid: str, sec: str, device_id: str):
+        self.environment = environment
+        self.name = name
+        self.password = password
+        self.app_id = app_id or DEFAULT_APP_ID
+        self.app_version = app_version or DEFAULT_APP_VERSION
+        # Tradovate's Demo environment accepts the placeholder credential
+        # "0" for cid/sec on some accounts in lieu of a paid API Access
+        # subscription's real Client ID/Secret pair — default to "0" here
+        # whenever the field is left blank so Demo users aren't blocked on
+        # provisioning real API keys just to try the app. NOTE: this is not
+        # guaranteed to work for every account; if Demo still rejects the
+        # request, that means your account requires real cid/sec values (see
+        # the sidebar warning and the accesstoken error message returned).
+        self.cid = cid if cid not in (None, "") else "0"
+        self.sec = sec if sec not in (None, "") else "0"
+        self.device_id = device_id or str(uuid.uuid4())
 
-    out = df.copy()
-    bar_range = (out["High"] - out["Low"]).clip(lower=0)
-    ret_vol = out["Close"].pct_change().abs().fillna(0)
-    raw_proxy = (bar_range * (1.0 + ret_vol * 25.0)).replace([np.inf, -np.inf], 0).fillna(0)
+        self.rest_base = TRADOVATE_ENVIRONMENTS[environment]["rest"]
+        self.ws_url = TRADOVATE_ENVIRONMENTS[environment]["ws"]
 
-    if raw_proxy.sum() <= 0:
-        raw_proxy = pd.Series(1.0, index=out.index)
+        self.access_token = None
+        self.md_access_token = None
+        self.expiration_time = None  # datetime, UTC
+        self.user_id = None
+        self.has_market_data = None
+        self.last_error = None
 
-    positive_mean = raw_proxy[raw_proxy > 0].mean() if (raw_proxy > 0).any() else 1.0
-    scaled = (raw_proxy / positive_mean) * 1000.0
-    scaled = scaled.replace([np.inf, -np.inf], np.nan)
-    fallback_fill = scaled.mean() if scaled.notna().any() else 1000.0
-    scaled = scaled.fillna(fallback_fill).clip(lower=1.0)
+    # ---- credential identity, used to detect sidebar changes needing re-auth ----
+    def credential_fingerprint(self):
+        return (self.environment, self.name, self.password, self.app_id,
+                self.app_version, self.cid, self.sec)
 
-    out["Volume"] = vol.where(vol > 0, scaled)
-    return out, True
-
-# ==================================================================================
-# DUKASCOPY SWFX — OPTIONAL LAZY TICK OVERLAY (volume enrichment + DOM ladder)
-# Fetched separately from the candle pipeline; never blocks candle rendering.
-# ------------------------------------------------------------------
-def _dukascopy_hour_url(symbol: str, dt_utc: datetime) -> str:
-    # Dukascopy's month component in the URL path is zero-indexed (Jan = 00).
-    return (
-        f"{DUKASCOPY_BASE_URL}/{symbol.upper()}/{dt_utc.year}/"
-        f"{dt_utc.month - 1:02d}/{dt_utc.day:02d}/{dt_utc.hour:02d}h_ticks.bi5"
-    )
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _fetch_dukascopy_hour_raw(symbol: str, dt_utc: datetime) -> bytes:
-    """Download one hour's raw .bi5 bytes. Cached for 5 minutes — completed historical
-    hours never change, so every later reuse (across the volume-overlay path AND the DOM
-    ladder path, and across reruns) is a cache hit rather than a fresh network call."""
-    url = _dukascopy_hour_url(symbol, dt_utc)
-    try:
-        resp = requests.get(url, headers=HTTP_HEADERS, timeout=15)
-        if resp.status_code != 200 or not resp.content:
-            return b""
-        return resp.content
-    except Exception:
-        return b""
-
-def _decode_dukascopy_bi5(raw_bytes: bytes, hour_start_utc: datetime, point_divider: int):
-    """Decode a Dukascopy .bi5 tick file into a list of tick dicts.
-
-    Each record is 20 bytes, big-endian:
-      int32 ms_offset_from_hour_start, int32 ask_raw, int32 bid_raw,
-      float32 ask_volume, float32 bid_volume
-    The payload is LZMA-compressed.
-    """
-    if not raw_bytes:
-        return []
-    try:
-        decompressed = lzma.decompress(raw_bytes)
-    except Exception:
-        return []
-    record_size = 20
-    n_records = len(decompressed) // record_size
-    if n_records == 0:
-        return []
-    ticks = []
-    for i in range(n_records):
-        chunk = decompressed[i * record_size: (i + 1) * record_size]
-        try:
-            ms_offset, ask_raw, bid_raw, ask_vol, bid_vol = struct.unpack(">iiiff", chunk)
-        except struct.error:
-            continue
-        if ask_raw <= 0 or bid_raw <= 0:
-            continue
-        ts = hour_start_utc + timedelta(milliseconds=ms_offset)
-        ticks.append({
-            "timestamp": ts,
-            "ask": ask_raw / point_divider,
-            "bid": bid_raw / point_divider,
-            "ask_volume": float(ask_vol),
-            "bid_volume": float(bid_vol),
-        })
-    return ticks
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_dukascopy_ticks(symbol: str, lookback_hours: int) -> pd.DataFrame:
-    """Pull the last `lookback_hours` of real SWFX ticks for `symbol`, concurrently.
-    Cached for 5 minutes on the exact (symbol, lookback_hours) key — the volume-overlay
-    step and the DOM-ladder step both call this with the SAME lookback_hours value, so
-    only the first caller in a rerun actually hits the network; the second is a cache hit."""
-    now_utc = datetime.now(timezone.utc)
-    current_hour = now_utc.replace(minute=0, second=0, microsecond=0)
-    hour_slots = [current_hour - timedelta(hours=h) for h in range(lookback_hours + 1)]
-    point_divider = dukascopy_point_divider(symbol)
-
-    all_ticks = []
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        futures = {
-            pool.submit(_fetch_dukascopy_hour_raw, symbol, hs): hs for hs in hour_slots
+    def authenticate(self):
+        """POST /auth/accesstoken. Raises TradovateAuthError on failure."""
+        url = f"{self.rest_base}/auth/accesstoken"
+        body = {
+            "name": self.name,
+            "password": self.password,
+            "appId": self.app_id,
+            "appVersion": self.app_version,
+            "cid": self.cid,
+            "sec": self.sec,
+            "deviceId": self.device_id,
         }
-        for fut in as_completed(futures):
-            hour_start = futures[fut]
-            try:
-                raw = fut.result()
-            except Exception:
-                raw = b""
-            if raw:
-                all_ticks.extend(_decode_dukascopy_bi5(raw, hour_start, point_divider))
-
-    if not all_ticks:
-        return pd.DataFrame()
-
-    tdf = pd.DataFrame(all_ticks).sort_values("timestamp").set_index("timestamp")
-    tdf["mid"] = (tdf["ask"] + tdf["bid"]) / 2.0
-    tdf["volume"] = tdf["ask_volume"] + tdf["bid_volume"]
-    return tdf
-
-def overlay_dukascopy_tick_volume(df: pd.DataFrame, ticks: pd.DataFrame, base_key: str) -> pd.DataFrame:
-    """Stitch real Dukascopy tick-derived volume onto the baseline candles, overwriting
-    the synthetic proxy (if any) wherever live tick coverage exists. OHLC values are
-    never touched — only Volume. Wrapped in try/except by the caller so a malformed
-    tick batch (bad timezone, empty resample, etc.) degrades gracefully instead of
-    crashing the app or wiping out the candles already on screen."""
-    rule = BAR_RULE_MAP.get(base_key)
-    if rule is None or ticks.empty or df.empty:
-        return df
-
-    try:
-        tick_vol = ticks["volume"].resample(rule).sum()
-
-        idx = df.index
-        idx_utc = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-        tv_idx = tick_vol.index
-        tick_vol.index = tv_idx.tz_localize("UTC") if tv_idx.tz is None else tv_idx.tz_convert("UTC")
+        try:
+            resp = requests.post(url, json=body, headers=HTTP_HEADERS_BASE, timeout=10)
+        except Exception as e:
+            self.last_error = f"Network error contacting {url}: {e}"
+            raise TradovateAuthError(self.last_error)
 
         try:
-            tolerance = pd.Timedelta(rule)
+            data = resp.json()
         except Exception:
-            tolerance = None
+            self.last_error = f"Non-JSON response from accesstoken endpoint (HTTP {resp.status_code})."
+            raise TradovateAuthError(self.last_error)
 
-        aligned = tick_vol.reindex(idx_utc, method="nearest", tolerance=tolerance)
+        if resp.status_code != 200 or "accessToken" not in data:
+            err_text = data.get("errorText") or data.get("error") or json.dumps(data)
+            self.last_error = f"Tradovate authentication failed: {err_text}"
+            raise TradovateAuthError(self.last_error)
 
-        out = df.copy()
-        vol_arr = aligned.to_numpy()
-        valid = ~pd.isna(vol_arr)
-        valid = valid & (vol_arr > 0)
-        if valid.any():
-            out_vol = out["Volume"].to_numpy(dtype=float)
-            out_vol[valid] = vol_arr[valid]
-            out["Volume"] = out_vol
-        return out
-    except Exception:
-        # Any alignment/merge failure falls back to the candles as they already are
-        # (real volume or synthetic proxy) rather than raising or clearing the chart.
-        return df
+        self.access_token = data["accessToken"]
+        self.md_access_token = data.get("mdAccessToken", self.access_token)
+        self.user_id = data.get("userId")
+        self.has_market_data = data.get("hasMarketData", None)
+
+        exp_raw = data.get("expirationTime")
+        if exp_raw:
+            try:
+                self.expiration_time = pd.to_datetime(exp_raw, utc=True).to_pydatetime()
+            except Exception:
+                self.expiration_time = datetime.now(timezone.utc) + timedelta(hours=8)
+        else:
+            self.expiration_time = datetime.now(timezone.utc) + timedelta(hours=8)
+
+        self.last_error = None
+        return data
+
+    def is_token_valid(self) -> bool:
+        if not self.access_token or not self.expiration_time:
+            return False
+        # Refresh 5 minutes before actual expiry to avoid racing a stream drop.
+        return datetime.now(timezone.utc) < (self.expiration_time - timedelta(minutes=5))
+
+    def ensure_valid(self):
+        if not self.is_token_valid():
+            self.authenticate()
+        return self.access_token
+
+    def auth_headers(self):
+        return {**HTTP_HEADERS_BASE, "Authorization": f"Bearer {self.access_token}"}
+
+    # ------------------------------------------------------------------
+    # Contract resolution — front-month lookup via /contract/suggest
+    # ------------------------------------------------------------------
+    def find_front_month_contract(self, root_symbol: str):
+        """Resolve a root future (e.g. 'ES') to its current front-month
+        tradable contract name (e.g. 'ESZ5') and contractId via the
+        /contract/suggest REST endpoint."""
+        self.ensure_valid()
+        url = f"{self.rest_base}/contract/suggest"
+        try:
+            resp = requests.get(
+                url, params={"t": root_symbol, "l": 5},
+                headers=self.auth_headers(), timeout=10,
+            )
+            resp.raise_for_status()
+            candidates = resp.json()
+        except Exception as e:
+            raise TradovateAuthError(f"Contract lookup failed for {root_symbol}: {e}")
+
+        if not isinstance(candidates, list) or not candidates:
+            raise TradovateAuthError(
+                f"No tradable contracts returned for root '{root_symbol}'. "
+                "Confirm this symbol is enabled on your account's exchange permissions."
+            )
+        # /contract/suggest returns candidates ordered by relevance; the first
+        # entry is Tradovate's own best/front-month match for the root.
+        best = candidates[0]
+        return {
+            "id": best.get("id"),
+            "name": best.get("name"),
+        }
+
 
 # ==================================================================================
-# L2 DOM / LIQUIDITY DEPTH ENGINE
+# LIVE MARKET DATA STATE — thread-safe snapshot shared with the Streamlit thread
 # ==================================================================================
 
-@st.cache_data(ttl=15, show_spinner=False)
-def fetch_order_book(
-    asset_class: str,
-    symbol: str,
-    depth_limit: int = DEFAULT_BINANCE_DEPTH_LIMIT,
-    dom_lookback_hours: int = DEFAULT_TICK_LOOKBACK_HOURS,
-    dom_bucket_pips: float = DEFAULT_DOM_BUCKET_PIPS,
-) -> pd.DataFrame:
-    try:
-        if asset_class == "crypto":
-            params = {"symbol": symbol.upper(), "limit": depth_limit}
-            for url in BINANCE_DEPTH_ENDPOINTS:
+class LiveMarketState:
+    """Container mutated by the background WS thread and read (copy-on-read)
+    by the Streamlit main thread. All mutation goes through a single lock."""
+
+    def __init__(self, max_bars: int = 3000):
+        self.lock = threading.Lock()
+        self.connected = False
+        self.authorized = False
+        self.last_error = None
+        self.contract_name = None
+        self.contract_id = None
+
+        self.quote = {}  # bidPrice, bidSize, askPrice, askSize, last, volume, tradeDate...
+        self.dom_bids = []   # list of {"price":..., "qty":...}
+        self.dom_asks = []
+        self.trade_ticks = deque(maxlen=5000)  # {"price","qty","side","timestamp"}
+
+        self.bars = {tf: pd.DataFrame() for tf in INTERVAL_CHOICES}
+        self.max_bars = max_bars
+        self.last_update_ts = {tf: None for tf in INTERVAL_CHOICES}
+
+    def snapshot_quote(self):
+        with self.lock:
+            return dict(self.quote)
+
+    def snapshot_dom(self):
+        with self.lock:
+            bids = pd.DataFrame(self.dom_bids)
+            asks = pd.DataFrame(self.dom_asks)
+        frames = []
+        if not bids.empty:
+            bids = bids.rename(columns={"price": "price", "qty": "qty"})
+            bids["side"] = "bid"
+            frames.append(bids)
+        if not asks.empty:
+            asks = asks.rename(columns={"price": "price", "qty": "qty"})
+            asks["side"] = "ask"
+            frames.append(asks)
+        if not frames:
+            return pd.DataFrame(columns=["price", "qty", "side"])
+        return pd.concat(frames, ignore_index=True)
+
+    def snapshot_bars(self, timeframe: str):
+        with self.lock:
+            df = self.bars.get(timeframe, pd.DataFrame())
+            return df.copy() if not df.empty else df
+
+    def snapshot_ticks(self):
+        with self.lock:
+            return list(self.trade_ticks)
+
+    def status(self):
+        with self.lock:
+            return {
+                "connected": self.connected,
+                "authorized": self.authorized,
+                "last_error": self.last_error,
+                "contract_name": self.contract_name,
+            }
+# ==================================================================================
+# BACKGROUND WEBSOCKET WORKER — persists across Streamlit reruns
+# ==================================================================================
+
+class MarketDataWorker(threading.Thread):
+    """Runs one persistent Tradovate WebSocket connection on a background
+    thread. Streamlit's script re-executes on every user interaction, so this
+    worker (and the LiveMarketState it feeds) is stashed in st.session_state
+    and only created once per contract selection — it is NOT recreated on
+    every rerun, which is what makes the "real-time" DOM/quote/chart actually
+    real-time instead of a fresh reconnect-and-lose-state every click.
+    """
+
+    def __init__(self, session: TradovateSession, state: LiveMarketState,
+                 contract_name: str, contract_id, timeframes):
+        super().__init__(daemon=True)
+        self.session = session
+        self.state = state
+        self.contract_name = contract_name
+        self.contract_id = contract_id
+        self.timeframes = list(timeframes)
+
+        self.ws = None
+        self._req_id = 0
+        self._req_lock = threading.Lock()
+        self._auth_req_id = None
+        self._quote_req_id = None
+        self._dom_req_id = None
+        self._chart_req_ids = {}   # request id -> timeframe
+        self._stop_event = threading.Event()
+        self._send_lock = threading.Lock()
+
+        self.state.contract_name = contract_name
+        self.state.contract_id = contract_id
+
+    # ---------------------------------------------------------------- utils
+    def _next_id(self):
+        with self._req_lock:
+            self._req_id += 1
+            return self._req_id
+
+    def _send(self, endpoint: str, body=None):
+        req_id = self._next_id()
+        body_str = json.dumps(body) if body is not None else ""
+        frame = f"{endpoint}\n{req_id}\n\n{body_str}"
+        try:
+            with self._send_lock:
+                if self.ws is not None:
+                    self.ws.send(frame)
+        except Exception as e:
+            with self.state.lock:
+                self.state.last_error = f"Send failed on '{endpoint}': {e}"
+        return req_id
+
+    def stop(self):
+        self._stop_event.set()
+        try:
+            if self.ws is not None:
+                self.ws.close()
+        except Exception:
+            pass
+
+    # -------------------------------------------------------------- run loop
+    def run(self):
+        backoff = 2
+        while not self._stop_event.is_set():
+            try:
+                self.session.ensure_valid()
+            except TradovateAuthError as e:
+                with self.state.lock:
+                    self.state.last_error = f"Auth refresh failed: {e}"
+                time.sleep(min(backoff, 30))
+                backoff = min(backoff * 2, 30)
+                continue
+
+            self.ws = websocket.WebSocketApp(
+                self.session.ws_url,
+                on_open=self._on_open,
+                on_message=self._on_message,
+                on_error=self._on_error,
+                on_close=self._on_close,
+            )
+            with self.state.lock:
+                self.state.connected = False
+                self.state.authorized = False
+
+            # run_forever blocks until the socket closes/errors; Tradovate's
+            # server-side heartbeat ("h" frames) keeps the connection alive so
+            # we disable the library's own ping and rely on Tradovate's frame
+            # protocol instead.
+            self.ws.run_forever(ping_interval=0)
+
+            if self._stop_event.is_set():
+                break
+            # Unexpected disconnect — re-authenticate (token may have been the
+            # cause) and reconnect with backoff.
+            time.sleep(min(backoff, 30))
+            backoff = min(backoff * 2, 30)
+
+    # ------------------------------------------------------------- handlers
+    def _on_open(self, ws):
+        with self.state.lock:
+            self.state.connected = True
+        # First frame from the server is a bare "o"; per Tradovate's own
+        # reference clients the authorize call is sent immediately after
+        # socket open rather than waiting for a distinct application-level ack.
+        self._auth_req_id = self._next_id()
+        frame = f"authorize\n{self._auth_req_id}\n\n{self.session.access_token}"
+        try:
+            with self._send_lock:
+                ws.send(frame)
+        except Exception as e:
+            with self.state.lock:
+                self.state.last_error = f"Authorize send failed: {e}"
+
+    def _on_error(self, ws, error):
+        with self.state.lock:
+            self.state.last_error = f"WebSocket error: {error}"
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        with self.state.lock:
+            self.state.connected = False
+            self.state.authorized = False
+
+    def _on_message(self, ws, message):
+        if message == "o":
+            return  # open frame already handled in _on_open
+        if message == "h":
+            return  # heartbeat — Tradovate's server keeps pinging; no reply required
+        if not message:
+            return
+        type_char, payload = message[0], message[1:]
+        if type_char == "c":
+            with self.state.lock:
+                self.state.last_error = f"Server closed session: {payload}"
+            return
+        if type_char != "a":
+            return
+        try:
+            events = json.loads(payload)
+        except Exception:
+            return
+        for item in events:
+            self._handle_event(item)
+
+    def _handle_event(self, item: dict):
+        # -- application-level RPC responses (subscribe acks, chart snapshots)
+        if "i" in item and "s" in item:
+            req_id = item.get("i")
+            status = item.get("s")
+            data = item.get("d", {})
+
+            if req_id == self._auth_req_id:
+                if status == 200:
+                    with self.state.lock:
+                        self.state.authorized = True
+                    self._subscribe_all()
+                else:
+                    with self.state.lock:
+                        self.state.last_error = f"Authorization rejected (status {status}): {data}"
+                return
+
+            if req_id in self._chart_req_ids:
+                self._ingest_chart_payload(self._chart_req_ids[req_id], data)
+                return
+
+            if status != 200:
+                with self.state.lock:
+                    self.state.last_error = f"Request {req_id} failed (status {status}): {data}"
+            return
+
+        # -- streaming market-data events (quotes, DOM, live chart updates)
+        if item.get("e") == "md":
+            d = item.get("d", {})
+            self._ingest_quotes(d.get("quotes", []))
+            self._ingest_doms(d.get("doms", []))
+            for tf, req_id in self._chart_req_ids.items():
+                pass  # live chart pushes arrive keyed by request id below
+            if "charts" in d:
+                # live chart pushes reuse the original getChart request id
+                for chart in d.get("charts", []):
+                    cid = chart.get("id") or chart.get("reqId")
+                    tf = self._chart_req_ids.get(cid)
+                    if tf:
+                        self._ingest_chart_payload(tf, {"charts": [chart]})
+
+    # ------------------------------------------------------------ ingestion
+    def _ingest_quotes(self, quotes):
+        if not quotes:
+            return
+        for q in quotes:
+            if str(q.get("contractId")) != str(self.contract_id) and self.contract_id is not None:
+                continue
+            entries = q.get("entries", {})
+            snap = {}
+            bid = entries.get("Bid", {})
+            offer = entries.get("Offer", {})
+            trade = entries.get("Trade", {})
+            if bid:
+                snap["bidPrice"] = bid.get("price")
+                snap["bidSize"] = bid.get("size")
+            if offer:
+                snap["askPrice"] = offer.get("price")
+                snap["askSize"] = offer.get("size")
+            if trade:
+                snap["last"] = trade.get("price")
+                snap["lastSize"] = trade.get("size")
+                with self.state.lock:
+                    self.state.trade_ticks.append({
+                        "price": trade.get("price"),
+                        "qty": trade.get("size", 0) or 0,
+                        "timestamp": datetime.now(timezone.utc),
+                    })
+            if snap:
+                with self.state.lock:
+                    self.state.quote.update(snap)
+
+    def _ingest_doms(self, doms):
+        if not doms:
+            return
+        for dom in doms:
+            if str(dom.get("contractId")) != str(self.contract_id) and self.contract_id is not None:
+                continue
+            bids = [{"price": lvl.get("price"), "qty": lvl.get("size", 0)}
+                    for lvl in dom.get("bids", []) if lvl.get("price") is not None]
+            asks = [{"price": lvl.get("price"), "qty": lvl.get("size", 0)}
+                    for lvl in dom.get("offers", []) if lvl.get("price") is not None]
+            with self.state.lock:
+                if bids:
+                    self.state.dom_bids = bids
+                if asks:
+                    self.state.dom_asks = asks
+
+    def _ingest_chart_payload(self, timeframe, data):
+        charts = data.get("charts", [])
+        if not charts:
+            return
+        rows = []
+        for chart in charts:
+            for bar in chart.get("bars", []):
+                ts = bar.get("timestamp")
                 try:
-                    resp = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=6)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    bids = pd.DataFrame(data.get("bids", []), columns=["price", "qty"])
-                    asks = pd.DataFrame(data.get("asks", []), columns=["price", "qty"])
-                    if bids.empty and asks.empty:
-                        continue
-                    bids = bids.astype(float)
-                    asks = asks.astype(float)
-                    bids["side"] = "bid"
-                    asks["side"] = "ask"
-                    combined = pd.concat([bids, asks], ignore_index=True)
-                    if not combined.empty:
-                        return combined
+                    idx = pd.to_datetime(ts, utc=True)
                 except Exception:
                     continue
-            return pd.DataFrame()
+                up_vol = bar.get("upVolume", 0) or 0
+                down_vol = bar.get("downVolume", 0) or 0
+                vol = bar.get("volume", up_vol + down_vol) or (up_vol + down_vol)
+                rows.append({
+                    "timestamp": idx,
+                    "Open": bar.get("open"), "High": bar.get("high"),
+                    "Low": bar.get("low"), "Close": bar.get("close"),
+                    "Volume": vol,
+                })
+        if not rows:
+            return
+        new_df = pd.DataFrame(rows).dropna(subset=["Open", "High", "Low", "Close"])
+        new_df = new_df.drop_duplicates(subset="timestamp").set_index("timestamp").sort_index()
 
-        elif asset_class == "forex":
-            # Dukascopy SWFX has no public, key-free multi-level DOM feed. Instead we
-            # build a genuine liquidity ladder from real recent tick prints: the last
-            # window of actual bid/ask ticks and traded volumes is bucketed into price
-            # levels, producing a real, live, trade-flow-derived depth structure (see
-            # module docstring for the honest distinction vs. a native L2 snapshot).
-            ticks = fetch_dukascopy_ticks(symbol, lookback_hours=dom_lookback_hours)
-            if ticks.empty:
-                return pd.DataFrame()
+        with self.state.lock:
+            existing = self.state.bars.get(timeframe, pd.DataFrame())
+            if existing.empty:
+                merged = new_df
+            else:
+                merged = pd.concat([existing, new_df])
+                merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+            if len(merged) > self.state.max_bars:
+                merged = merged.iloc[-self.state.max_bars:]
+            self.state.bars[timeframe] = merged
+            self.state.last_update_ts[timeframe] = datetime.now(timezone.utc)
 
-            recent = ticks.tail(4000).copy()
-            if recent.empty:
-                return pd.DataFrame()
+    # ------------------------------------------------------------ subscribe
+    def _subscribe_all(self):
+        self._quote_req_id = self._send("md/subscribeQuote", {"symbol": self.contract_name})
+        self._dom_req_id = self._send("md/subscribeDOM", {"symbol": self.contract_name})
+        for tf in self.timeframes:
+            cfg = TRADOVATE_BAR_CONFIG.get(tf)
+            if cfg is None:
+                continue
+            body = {
+                "symbol": self.contract_name,
+                "chartDescription": {
+                    "underlyingType": cfg["underlyingType"],
+                    "elementSize": cfg["elementSize"],
+                    "elementSizeUnit": "UnderlyingUnits",
+                    "withHistogram": False,
+                },
+                "timeRange": {"asMuchAsElements": 2000},
+            }
+            req_id = self._send("md/getChart", body)
+            self._chart_req_ids[req_id] = tf
+# ==================================================================================
+# SHARED TECHNICAL UTILITIES
+# ==================================================================================
 
-            pip = 0.01 if "JPY" in symbol.upper() else 0.0001
-            bucket_size = pip * max(dom_bucket_pips, 0.1)
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(period, min_periods=period).mean()
+    avg_loss = loss.rolling(period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
 
-            recent["bid_bucket"] = (recent["bid"] / bucket_size).round() * bucket_size
-            recent["ask_bucket"] = (recent["ask"] / bucket_size).round() * bucket_size
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high_low = df["High"] - df["Low"]
+    high_close = (df["High"] - df["Close"].shift()).abs()
+    low_close = (df["Low"] - df["Close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period, min_periods=1).mean()
 
-            bid_levels = (
-                recent.groupby("bid_bucket")["bid_volume"].sum()
-                .reset_index().rename(columns={"bid_bucket": "price", "bid_volume": "qty"})
-            )
-            bid_levels["side"] = "bid"
-
-            ask_levels = (
-                recent.groupby("ask_bucket")["ask_volume"].sum()
-                .reset_index().rename(columns={"ask_bucket": "price", "ask_volume": "qty"})
-            )
-            ask_levels["side"] = "ask"
-
-            combined = pd.concat([bid_levels, ask_levels], ignore_index=True)
-            combined = combined[combined["qty"] > 0]
-            return combined[["price", "qty", "side"]]
-
-        else:
-            return pd.DataFrame()
+def safe_pct(a, b):
+    try:
+        if b == 0 or pd.isna(b):
+            return 0.0
+        return (a - b) / abs(b) * 100
     except Exception:
-        return pd.DataFrame()
+        return 0.0
+
+def price_axis_range(*series_list, pad_pct: float = 0.08):
+    values = []
+    for s in series_list:
+        if s is None:
+            continue
+        s = pd.Series(s).dropna()
+        if not s.empty:
+            values.append(s)
+    if not values:
+        return None
+    combined = pd.concat(values)
+    lo = float(combined.min())
+    hi = float(combined.max())
+    if hi <= lo:
+        hi = lo * 1.01 if lo > 0 else lo + 1.0
+    pad = (hi - lo) * pad_pct
+    if pad <= 0:
+        pad = abs(hi) * 0.01 if hi != 0 else 1.0
+    return [lo - pad, hi + pad]
 
 def format_dollars(value: float) -> str:
     try:
@@ -836,59 +930,6 @@ def compute_bank_anchor_pnl(walls_df: pd.DataFrame, current_price: float) -> pd.
 
     out["status"] = out["pnl_pct"].apply(status)
     return out.sort_values("dollar_value", ascending=False)
-
-# ==================================================================================
-# SHARED TECHNICAL UTILITIES
-# ==================================================================================
-
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(period, min_periods=period).mean()
-    avg_loss = loss.rolling(period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
-
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high_low = df["High"] - df["Low"]
-    high_close = (df["High"] - df["Close"].shift()).abs()
-    low_close = (df["Low"] - df["Close"].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(period, min_periods=1).mean()
-
-def safe_pct(a, b):
-    try:
-        if b == 0 or pd.isna(b):
-            return 0.0
-        return (a - b) / abs(b) * 100
-    except Exception:
-        return 0.0
-
-def price_axis_range(*series_list, pad_pct: float = 0.08):
-    values = []
-    for s in series_list:
-        if s is None:
-            continue
-        s = pd.Series(s).dropna()
-        if not s.empty:
-            values.append(s)
-    if not values:
-        return None
-    combined = pd.concat(values)
-    lo = float(combined.min())
-    hi = float(combined.max())
-    if hi <= lo:
-        hi = lo * 1.01 if lo > 0 else lo + 1.0
-    pad = (hi - lo) * pad_pct
-    if pad <= 0:
-        pad = abs(hi) * 0.01 if hi != 0 else 1.0
-    return [lo - pad, hi + pad]
-
-def render_status_badge(text: str):
-    st.markdown(f'<span class="info-badge">{text}</span>', unsafe_allow_html=True)
-
 # ==================================================================================
 # MODULE 1 — INSTITUTIONAL ORDER FLOW & LIQUIDITY HEATMAP
 # ==================================================================================
@@ -925,17 +966,18 @@ def detect_fvg(df: pd.DataFrame):
             })
     return bullish, bearish
 
-def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, asset_class: str, label: str):
+def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, label: str, dom_is_live: bool):
     st.markdown(
         '<div class="module-note">Swing-point liquidity pools (BSL/SSL) and Fair Value Gap '
-        'imbalance zones from price-action structure, dynamically annotated with live resting '
-        '$ order-book / tick-flow depth, institutional bank-wall isolation, and a Bank Anchor '
-        'PnL Tracker.</div>',
+        'imbalance zones from price-action structure, dynamically annotated with the live '
+        'Tradovate Level 2 DOM ($ resting-order depth), institutional bank-wall isolation, and a '
+        'Bank Anchor PnL Tracker.</div>',
         unsafe_allow_html=True,
     )
 
     if len(df) < 15:
-        st.warning("Not enough bars returned for this selection to compute liquidity structure. Try a longer interval.")
+        st.warning("Not enough bars streamed yet for this timeframe to compute liquidity structure. "
+                    "Give the chart subscription a few seconds, or pick a lower-granularity interval.")
         return
 
     c1, c2, c3 = st.columns(3)
@@ -948,17 +990,16 @@ def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, asset
     bullish_fvg, bearish_fvg = detect_fvg(df)
     current_price = float(df["Close"].iloc[-1])
 
-    has_dom = asset_class in ("crypto", "forex") and not order_book_df.empty
+    has_dom = dom_is_live and not order_book_df.empty
     if not has_dom:
-        render_status_badge(
-            "ℹ️ Live order-book / tick-flow depth unavailable right now (macro assets have no public "
-            "order book, live SWFX overlay is disabled, or the feed is temporarily unreachable) — "
-            "$ volume annotations and wall isolation are skipped. Swing/FVG structure below is unaffected."
+        st.info(
+            "Live Tradovate DOM not yet populated for this contract — $ volume annotations and "
+            "institutional wall isolation are skipped until the md/subscribeDOM stream delivers its "
+            "first book snapshot. Swing/FVG structure is still fully computed from streamed price action below."
         )
     else:
-        badge_text = "🟢 LIVE L2 DOM CONNECTED" if asset_class == "crypto" else "🟢 LIVE SWFX TICK-FLOW DEPTH"
         st.markdown(
-            f'<span class="source-badge">{badge_text}</span> '
+            f'<span class="source-badge">🟢 LIVE TRADOVATE L2 DOM</span> '
             f'<span style="color:#8b90a0; font-size:0.8rem;">{len(order_book_df):,} price levels loaded</span>',
             unsafe_allow_html=True,
         )
@@ -1011,7 +1052,7 @@ def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, asset
 
     fig.update_layout(
         template=PLOTLY_TEMPLATE, height=680, xaxis_rangeslider_visible=False, dragmode="pan",
-        title=f"{label} — Liquidity Pools, Fair Value Gaps & Institutional Bank Walls",
+        title=f"{label} — Liquidity Pools, Fair Value Gaps & Institutional Bank Walls (Live Tradovate Feed)",
         margin=dict(l=10, r=10, t=50, b=10),
         yaxis=dict(range=y_range, autorange=False if y_range else True),
     )
@@ -1060,7 +1101,6 @@ def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, asset
             st.dataframe(lvl_df.set_index("Timestamp"), use_container_width=True)
         else:
             st.info("Not enough data to identify swing liquidity levels for the selected window.")
-
 # ==================================================================================
 # MODULE 2 — QUANTITATIVE ML CLASSIFIER
 # ==================================================================================
@@ -1084,13 +1124,14 @@ def build_ml_features(df: pd.DataFrame) -> pd.DataFrame:
 def render_ml_module(df: pd.DataFrame, label: str):
     st.markdown(
         '<div class="module-note">A RandomForest classifier trained live on engineered technical '
-        'features (RSI, ATR, volatility, MA ratios, volume delta, momentum) to estimate the '
-        'probability of the next-N-bar directional move.</div>',
+        'features (RSI, ATR, volatility, MA ratios, volume delta, momentum) built from the streamed '
+        'Tradovate bars, estimating the probability of the next-N-bar directional move.</div>',
         unsafe_allow_html=True,
     )
 
     if len(df) < 80:
-        st.warning("Insufficient historical data for reliable ML training. Select a longer interval / lower timeframe granularity.")
+        st.warning("Insufficient bars streamed yet for reliable ML training. Let the chart subscription "
+                    "accumulate more history, or select a lower-granularity interval.")
         return
 
     horizon = st.slider("Prediction Horizon (bars ahead)", 1, 10, 3, key="ml_horizon")
@@ -1108,7 +1149,7 @@ def render_ml_module(df: pd.DataFrame, label: str):
     data = data.dropna()
 
     if len(data) < 50 or data["target"].nunique() < 2:
-        st.warning("Not enough class diversity in the selected sample to train a robust classifier.")
+        st.warning("Not enough class diversity in the streamed sample yet to train a robust classifier.")
         return
 
     feature_cols = list(feat.columns)
@@ -1163,13 +1204,10 @@ def render_ml_module(df: pd.DataFrame, label: str):
             labels=["Sell", "Hold", "Buy"], values=[sell_p, hold_p, buy_p],
             marker=dict(colors=["#ef5350", "#f0b90b", "#26a69a"]), hole=0.55,
         ))
-        fig_proba.update_layout(
-            template=PLOTLY_TEMPLATE, height=420, title="Directional Probability",
-            margin=dict(l=10, r=10, t=50, b=10), dragmode="pan",
-        )
+        fig_proba.update_layout(template=PLOTLY_TEMPLATE, height=420, title="Directional Probability", margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig_proba, use_container_width=True, config=PLOTLY_CONFIG)
 
-    st.caption(f"Model trained on {len(X_train)} bars, validated on {len(X_test)} out-of-sample bars for {label}.")
+    st.caption(f"Model trained on {len(X_train)} bars, validated on {len(X_test)} out-of-sample bars for {label} (live Tradovate feed).")
 
 # ==================================================================================
 # MODULE 3 — CROSS-ASSET CORRELATION & MACRO YIELD MATRIX
@@ -1177,71 +1215,58 @@ def render_ml_module(df: pd.DataFrame, label: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_macro_series(yf_ticker: str, lookback_days: int = 180) -> pd.Series:
-    df = fetch_yfinance_ohlcv(yf_ticker, "1d")
-    if df.empty:
+    try:
+        raw = yf.download(tickers=yf_ticker, period="2y", interval="1d", progress=False, auto_adjust=False, threads=False)
+        if raw is None or raw.empty:
+            return pd.Series(dtype=float)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        df = raw[["Close"]].dropna()
+        cutoff = df.index.max() - pd.Timedelta(days=lookback_days)
+        df = df[df.index >= cutoff]
+        return df["Close"]
+    except Exception:
         return pd.Series(dtype=float)
-    cutoff = df.index.max() - pd.Timedelta(days=lookback_days)
-    df = df[df.index >= cutoff]
-    return df["Close"]
 
-def render_correlation_module(symbol: str, yf_ticker: str, asset_class: str, label: str):
+def render_correlation_module(daily_bars: pd.DataFrame, label: str):
     st.markdown(
-        '<div class="module-note">Cross-asset relationships between the active instrument, '
-        'the US Dollar Index, 10-Year Treasury Yields, and Bitcoin — key macro drivers.</div>',
+        '<div class="module-note">Cross-asset relationships between the active Tradovate contract '
+        '(from its live-streamed daily bars) and key macro drivers — the US Dollar Index and 10-Year '
+        'Treasury Yields — plus the S&amp;P 500 as a broad-market anchor.</div>',
         unsafe_allow_html=True,
     )
 
     lookback = st.slider("Correlation Lookback (Days)", 30, 730, 180, step=10, key="corr_lookback")
 
-    # Labels aligned 1:1 with MACRO_ASSETS naming so badges/legends read consistently
-    # across the Macro asset picker and this module's correlation matrix.
-    base_macro = {
-        "US Dollar Index (DXY)": "DX-Y.NYB",
-        "US 10-Year Treasury Yield": "^TNX",
-        "Bitcoin (BTC/USD)": "BTC-USD",
-    }
+    if daily_bars.empty:
+        st.info("Waiting on the Tradovate daily-bar chart subscription to populate before correlations can be computed.")
+        return
 
-    is_btc_active = symbol.upper() == "BTCUSDT" or yf_ticker.upper() == "BTC-USD"
-    is_dxy_active = yf_ticker.upper() == "DX-Y.NYB"
-    is_10y_active = yf_ticker.upper() == "^TNX"
+    cutoff = daily_bars.index.max() - pd.Timedelta(days=lookback)
+    active_series = daily_bars[daily_bars.index >= cutoff]["Close"]
+    active_series.index = active_series.index.tz_localize(None) if active_series.index.tz is not None else active_series.index
 
-    if is_btc_active or is_dxy_active or is_10y_active:
-        anchor_label = "Gold Futures (GC=F)"
-        anchor_series = fetch_macro_series("GC=F", lookback)
-    else:
-        anchor_label = label
-        anchor_df, _src = fetch_ohlcv(asset_class, symbol, yf_ticker, "1d")
-        if not anchor_df.empty:
-            cutoff = anchor_df.index.max() - pd.Timedelta(days=lookback)
-            anchor_series = anchor_df[anchor_df.index >= cutoff]["Close"]
-        else:
-            anchor_series = pd.Series(dtype=float)
-
-    series_dict = {}
-    if not anchor_series.empty:
-        series_dict[anchor_label] = anchor_series
-
+    series_dict = {label: active_series} if not active_series.empty else {}
     fetch_errors = []
-    for m_label, tk in base_macro.items():
-        if m_label == anchor_label:
-            continue
+    for m_label, tk in MACRO_ANCHOR_TICKERS.items():
         s = fetch_macro_series(tk, lookback)
         if s.empty:
             fetch_errors.append(m_label)
         else:
+            s.index = s.index.tz_localize(None) if s.index.tz is not None else s.index
             series_dict[m_label] = s
 
     if fetch_errors:
-        st.warning(f"Could not retrieve live data for: {', '.join(fetch_errors)}.")
+        st.warning(f"Could not retrieve live macro data for: {', '.join(fetch_errors)}.")
 
     if len(series_dict) < 2:
-        st.error("Insufficient macro data available to compute correlations right now.")
+        st.error("Insufficient data available to compute correlations right now.")
         return
 
     combined = pd.DataFrame(series_dict).dropna(how="all").ffill().dropna()
 
     if combined.empty or len(combined) < 10:
-        st.warning("Not enough overlapping historical data across assets for this lookback window.")
+        st.warning("Not enough overlapping historical data across assets for this lookback window yet.")
         return
 
     corr_matrix = combined.corr()
@@ -1254,15 +1279,15 @@ def render_correlation_module(symbol: str, yf_ticker: str, asset_class: str, lab
     fig_heat.update_layout(template=PLOTLY_TEMPLATE, height=460, title="Cross-Asset Correlation Matrix", margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
     st.plotly_chart(fig_heat, use_container_width=True, config=PLOTLY_CONFIG)
 
-    st.subheader(f"Rolling 30-Day Correlation vs {anchor_label}")
-    if anchor_label in combined.columns:
+    st.subheader(f"Rolling 30-Day Correlation vs {label}")
+    if label in combined.columns:
         rolling_window = min(30, max(5, len(combined) // 3))
         fig_roll = go.Figure()
         for col in combined.columns:
-            if col == anchor_label:
+            if col == label:
                 continue
-            rolling_corr = combined[anchor_label].rolling(rolling_window).corr(combined[col])
-            fig_roll.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr, mode="lines", name=f"{anchor_label} vs {col}"))
+            rolling_corr = combined[label].rolling(rolling_window).corr(combined[col])
+            fig_roll.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr, mode="lines", name=f"{label} vs {col}"))
         fig_roll.add_hline(y=0, line_dash="dot", line_color="#666")
         fig_roll.update_layout(template=PLOTLY_TEMPLATE, height=420, title=f"Rolling {rolling_window}-Day Correlation", margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
         st.plotly_chart(fig_roll, use_container_width=True, config=PLOTLY_CONFIG)
@@ -1274,12 +1299,14 @@ def render_correlation_module(symbol: str, yf_ticker: str, asset_class: str, lab
             fig_reb.add_trace(go.Scatter(x=rebased.index, y=rebased[col], mode="lines", name=col))
         fig_reb.update_layout(template=PLOTLY_TEMPLATE, height=420, margin=dict(l=10, r=10, t=30, b=10), dragmode="pan")
         st.plotly_chart(fig_reb, use_container_width=True, config=PLOTLY_CONFIG)
-
 # ==================================================================================
 # MODULE 4 — VOLUME DELTA & FOOTPRINT IMBALANCE
 # ==================================================================================
 
-def compute_volume_delta(df: pd.DataFrame) -> pd.DataFrame:
+def compute_volume_delta_bar_heuristic(df: pd.DataFrame) -> pd.DataFrame:
+    """Fallback estimator (no tick stream yet): buy/sell volume split by
+    intra-bar close position, used before enough live trade ticks have
+    accumulated for the tick-rule method below."""
     out = df.copy()
     rng = (out["High"] - out["Low"]).replace(0, np.nan)
     buy_ratio = ((out["Close"] - out["Low"]) / rng).clip(0, 1).fillna(0.5)
@@ -1289,23 +1316,85 @@ def compute_volume_delta(df: pd.DataFrame) -> pd.DataFrame:
     out["cvd"] = out["delta"].cumsum()
     return out
 
-def render_volume_delta_module(df: pd.DataFrame, label: str, source_used: str, volume_is_synthetic: bool = False):
+def compute_volume_delta_from_ticks(df: pd.DataFrame, ticks: list) -> pd.DataFrame:
+    """Real order-flow reconstruction from Tradovate's live Trade prints
+    (md/subscribeQuote 'Trade' entries), classified with the standard tick
+    rule (uptick = buyer-initiated, downtick = seller-initiated, unchanged
+    price inherits the prior tick's side), then binned into the same bars as
+    the streamed OHLCV chart."""
+    out = df.copy()
+    out["buy_volume"] = 0.0
+    out["sell_volume"] = 0.0
+
+    if not ticks:
+        return compute_volume_delta_bar_heuristic(df)
+
+    tick_df = pd.DataFrame(ticks).dropna(subset=["price"])
+    if tick_df.empty:
+        return compute_volume_delta_bar_heuristic(df)
+
+    tick_df = tick_df.sort_values("timestamp")
+    tick_df["price_diff"] = tick_df["price"].diff()
+    side = []
+    last_side = "buy"
+    for d in tick_df["price_diff"]:
+        if pd.isna(d) or d == 0:
+            side.append(last_side)
+        elif d > 0:
+            side.append("buy")
+            last_side = "buy"
+        else:
+            side.append("sell")
+            last_side = "sell"
+    tick_df["side"] = side
+
+    tick_df["timestamp"] = pd.to_datetime(tick_df["timestamp"], utc=True)
+    bin_edges = df.index
+    if bin_edges.tz is None:
+        tick_df["timestamp"] = tick_df["timestamp"].dt.tz_localize(None)
+    tick_df["bar"] = pd.cut(tick_df["timestamp"], bins=list(bin_edges) + [bin_edges[-1] + (bin_edges[-1] - bin_edges[-2] if len(bin_edges) > 1 else pd.Timedelta(minutes=1))],
+                             labels=bin_edges, right=False)
+
+    grouped = tick_df.groupby(["bar", "side"], observed=True)["qty"].sum().unstack(fill_value=0)
+    if "buy" not in grouped.columns:
+        grouped["buy"] = 0
+    if "sell" not in grouped.columns:
+        grouped["sell"] = 0
+
+    grouped.index = pd.to_datetime(grouped.index)
+    out.loc[out.index.isin(grouped.index), "buy_volume"] = grouped.reindex(out.index)["buy"].fillna(0)
+    out.loc[out.index.isin(grouped.index), "sell_volume"] = grouped.reindex(out.index)["sell"].fillna(0)
+
+    # Bars with no live ticks recorded yet (e.g. history back-filled before the
+    # subscription started) still get the heuristic split so the chart has no gaps.
+    no_tick_mask = (out["buy_volume"] + out["sell_volume"]) == 0
+    if no_tick_mask.any():
+        heuristic = compute_volume_delta_bar_heuristic(out.loc[no_tick_mask])
+        out.loc[no_tick_mask, "buy_volume"] = heuristic["buy_volume"]
+        out.loc[no_tick_mask, "sell_volume"] = heuristic["sell_volume"]
+
+    out["delta"] = out["buy_volume"] - out["sell_volume"]
+    out["cvd"] = out["delta"].cumsum()
+    return out
+
+def render_volume_delta_module(df: pd.DataFrame, label: str, live_ticks: list, ticks_available: bool):
     st.markdown(
-        '<div class="module-note">Order-flow reconstruction: buying vs. selling volume estimated '
-        'from real exchange-reported volume weighted by intra-bar close position, aggregated into '
-        'Cumulative Volume Delta (CVD).</div>',
+        '<div class="module-note">Order-flow reconstruction: buying vs. selling volume classified '
+        'directly from live Tradovate trade prints via the tick rule (uptick = buy-initiated, '
+        'downtick = sell-initiated), aggregated into Cumulative Volume Delta (CVD). Falls back to a '
+        'close-position volume heuristic for any bar streamed before the tick subscription had data.</div>',
         unsafe_allow_html=True,
     )
 
     if df["Volume"].sum() == 0:
-        render_status_badge("ℹ️ No volume data available for this instrument — Volume Delta will show flat/neutral output.")
-    elif volume_is_synthetic:
-        render_status_badge(
-            "🧮 Using a Synthetic Volume Proxy (bar-range × volatility estimate) — real exchange "
-            "volume was unavailable or zero for most bars. Not genuine traded volume."
-        )
+        st.warning("No volume streamed yet for this contract/timeframe — Volume Delta requires non-zero volume.")
 
-    vd = compute_volume_delta(df)
+    if ticks_available:
+        st.markdown('<span class="source-badge">🟢 LIVE TICK-RULE CVD</span>', unsafe_allow_html=True)
+    else:
+        st.markdown('<span class="source-badge">🟡 BAR-HEURISTIC CVD (waiting on live ticks)</span>', unsafe_allow_html=True)
+
+    vd = compute_volume_delta_from_ticks(df, live_ticks) if ticks_available else compute_volume_delta_bar_heuristic(df)
     z_thresh = st.slider("Imbalance Spike Sensitivity (Z-score)", 1.0, 4.0, 2.0, step=0.25, key="vd_z")
 
     delta_mean = vd["delta"].mean()
@@ -1320,7 +1409,7 @@ def render_volume_delta_module(df: pd.DataFrame, label: str, source_used: str, v
 
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.25, 0.25], vertical_spacing=0.03,
-        subplot_titles=(f"{label} Price [{source_used}]", "Volume Delta (Buy − Sell)", "Cumulative Volume Delta (CVD)"),
+        subplot_titles=(f"{label} Price [Live Tradovate Feed]", "Volume Delta (Buy − Sell)", "Cumulative Volume Delta (CVD)"),
     )
     fig.add_trace(go.Candlestick(
         x=vd.index, open=vd["Open"], high=vd["High"], low=vd["Low"], close=vd["Close"],
@@ -1357,6 +1446,13 @@ def render_volume_delta_module(df: pd.DataFrame, label: str, source_used: str, v
 # ==================================================================================
 # MODULE 5 — OPTIONS GAMMA EXPOSURE (GEX) & MAX PAIN ENGINE
 # ==================================================================================
+# NOTE: Tradovate's public API surface used by this app (auth + md/* websocket
+# services) does not expose a listed-options chain endpoint for CME futures
+# options. This module keeps the original app's honest fallback pattern: it
+# uses a live, liquid equity-ETF options proxy (via yfinance) for the futures
+# root you're viewing (e.g. ES -> SPY, GC -> GLD) when one exists, and falls
+# back to a labeled Black-Scholes simulation calibrated off the live Tradovate
+# spot price otherwise. This is disclosed in the UI exactly as it was before.
 
 def bs_gamma(spot, strike, t_years, iv, r=0.045):
     try:
@@ -1418,8 +1514,8 @@ def fetch_options_chain(proxy_symbol: str):
         hist = tk.history(period="5d")
         if hist.empty:
             return None
-        spot = float(hist["Close"].iloc[-1])
-        return calls, puts, expiry, spot
+        proxy_spot = float(hist["Close"].iloc[-1])
+        return calls, puts, expiry, proxy_spot
     except Exception:
         return None
 
@@ -1458,36 +1554,42 @@ def compute_max_pain(calls: pd.DataFrame, puts: pd.DataFrame):
     except Exception:
         return None, pd.DataFrame()
 
-def render_gex_module(symbol: str, yf_ticker: str, asset_class: str, label: str):
+def render_gex_module(root_symbol: str, live_spot: float, label: str):
     st.markdown(
         '<div class="module-note">Gamma Exposure (GEX) profile identifying dealer positioning, '
         'volatility pin zones, and the gamma flip level.</div>',
         unsafe_allow_html=True,
     )
 
-    proxy = OPTIONS_PROXY_MAP.get(yf_ticker) if asset_class == "macro" else None
+    proxy = FUTURES_OPTIONS_PROXY_MAP.get(root_symbol)
     chain_result = fetch_options_chain(proxy) if proxy else None
 
     if chain_result is not None:
-        calls, puts, expiry, spot = chain_result
+        calls, puts, expiry, proxy_spot = chain_result
         try:
             dte = max((pd.to_datetime(expiry) - pd.Timestamp.now()).days, 1)
         except Exception:
             dte = 30
-        gex_df = gex_from_chain(calls, puts, spot, dte)
+        gex_df = gex_from_chain(calls, puts, proxy_spot, dte)
         max_pain, pain_df = compute_max_pain(calls, puts)
-        source_label = f"Live listed options — proxy: {proxy} (expiry {expiry})"
+        spot_for_display = live_spot if live_spot else proxy_spot
+        source_label = (
+            f"Live listed options on proxy ETF {proxy} (expiry {expiry}) — futures options chains are "
+            f"not exposed by the Tradovate API surface used here, so gamma/OI structure is sourced from "
+            f"the correlated, highly liquid options-listed proxy; strikes shown are the proxy's own price "
+            f"scale, not the futures price scale."
+        )
     else:
-        spot = get_last_price(asset_class, symbol, yf_ticker)
-        if spot is None:
-            st.error(f"Could not retrieve a live spot price for {label} to calibrate the GEX engine.")
+        spot_for_display = live_spot
+        if not spot_for_display:
+            st.error(f"No live Tradovate spot price yet for {label} to calibrate the GEX engine.")
             return
         dte = st.slider("Simulated Days to Expiry", 1, 90, 30, key="gex_dte")
         iv_assumed = st.slider("Assumed Implied Volatility (%)", 5, 80, 18, key="gex_iv") / 100
         n_strikes = st.slider("Strike Range (± strikes around spot)", 10, 40, 25, key="gex_strikes")
-        gex_df = simulate_gex(spot, n_strikes=n_strikes, iv=iv_assumed, days_to_expiry=dte)
+        gex_df = simulate_gex(spot_for_display, n_strikes=n_strikes, iv=iv_assumed, days_to_expiry=dte)
         max_pain, pain_df = compute_max_pain_from_sim(gex_df)
-        source_label = f"Simulated GEX engine (Black-Scholes gamma model) — no listed options market for {label}"
+        source_label = f"Simulated GEX engine (Black-Scholes gamma model) calibrated off the live Tradovate spot for {label} — no proxy configured for this root."
 
     st.caption(f"Data source: {source_label}")
 
@@ -1498,14 +1600,14 @@ def render_gex_module(symbol: str, yf_ticker: str, asset_class: str, label: str)
     gamma_flip = float(sign_changes["strike"].iloc[0]) if not sign_changes.empty else float(gex_df["strike"].median())
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Spot Price", f"{spot:,.2f}")
+    c1.metric("Reference Spot", f"{spot_for_display:,.2f}")
     c2.metric("Net GEX", f"{net_gex_total:,.0f}")
     c3.metric("Max Pain Strike", f"{max_pain:,.2f}" if max_pain is not None else "N/A")
 
     fig = go.Figure()
     fig.add_trace(go.Bar(x=gex_df["strike"], y=gex_df["call_gex"], name="Call GEX", marker_color="#26a69a"))
     fig.add_trace(go.Bar(x=gex_df["strike"], y=gex_df["put_gex"], name="Put GEX", marker_color="#ef5350"))
-    fig.add_vline(x=spot, line_dash="dash", line_color="#f0b90b", annotation_text="Spot", annotation_position="top")
+    fig.add_vline(x=spot_for_display, line_dash="dash", line_color="#f0b90b", annotation_text="Spot", annotation_position="top")
     fig.add_vline(x=gamma_flip, line_dash="dot", line_color="#00e5ff", annotation_text="Gamma Flip", annotation_position="bottom")
     if max_pain is not None:
         fig.add_vline(x=max_pain, line_dash="dashdot", line_color=PURPLE_WALL, annotation_text="Max Pain", annotation_position="top")
@@ -1524,7 +1626,6 @@ def render_gex_module(symbol: str, yf_ticker: str, asset_class: str, label: str)
         "increasing realized volatility, especially below the gamma flip level."
     )
     st.info(interpretation)
-
 # ==================================================================================
 # MODULE 6 — INSTITUTIONAL EXECUTION ALGORITHMS (VWAP / TWAP / ICEBERG)
 # ==================================================================================
@@ -1548,15 +1649,6 @@ def compute_vwap_bands(df: pd.DataFrame):
     out["vwap_l2"] = out["vwap"] - 2 * std
 
     out["twap"] = typical_price.expanding().mean()
-
-    # Final safety net: if Volume was entirely zero/NaN despite upstream handling,
-    # vwap/twap could still be all-NaN after ffill/bfill (nothing to fill from).
-    # Fall back to the typical price itself so the chart and downstream metrics
-    # never render NaN.
-    out["vwap"] = out["vwap"].fillna(typical_price)
-    out["twap"] = out["twap"].fillna(typical_price)
-    for col in ["vwap_u1", "vwap_u2", "vwap_l1", "vwap_l2"]:
-        out[col] = out[col].fillna(out["vwap"])
     return out
 
 def detect_icebergs(df: pd.DataFrame, z_thresh: float = 2.5):
@@ -1569,20 +1661,16 @@ def detect_icebergs(df: pd.DataFrame, z_thresh: float = 2.5):
     icebergs = out[(out["vr_z"] >= z_thresh)]
     return out, icebergs
 
-def render_execution_module(df: pd.DataFrame, label: str, volume_is_synthetic: bool = False):
+def render_execution_module(df: pd.DataFrame, order_book_df: pd.DataFrame, label: str):
     st.markdown(
         '<div class="module-note">Institutional execution benchmarks — VWAP with statistical '
-        'deviation bands, TWAP baseline, and detection of probable iceberg / hidden-order clusters.</div>',
+        'deviation bands, TWAP baseline, and detection of probable iceberg / hidden-order clusters '
+        'from the live Tradovate bar stream, cross-checked against resting DOM size when available.</div>',
         unsafe_allow_html=True,
     )
 
     if df["Volume"].sum() == 0:
-        render_status_badge("ℹ️ No volume data available for this instrument — VWAP falls back to typical price.")
-    elif volume_is_synthetic:
-        render_status_badge(
-            "🧮 Using a Synthetic Volume Proxy (bar-range × volatility estimate) — real exchange "
-            "volume was unavailable or zero for most bars. Not genuine traded volume."
-        )
+        st.warning("No volume streamed yet for this contract — VWAP and iceberg detection require non-zero volume.")
 
     vwap_df = compute_vwap_bands(df)
     z_thresh = st.slider("Iceberg Detection Sensitivity (Z-score)", 1.5, 4.0, 2.5, step=0.25, key="ice_z")
@@ -1622,7 +1710,7 @@ def render_execution_module(df: pd.DataFrame, label: str, volume_is_synthetic: b
 
     fig.update_layout(
         template=PLOTLY_TEMPLATE, height=650, xaxis_rangeslider_visible=False, dragmode="pan",
-        title=f"{label} — VWAP / TWAP Execution Benchmarks & Iceberg Detection",
+        title=f"{label} — VWAP / TWAP Execution Benchmarks & Iceberg Detection (Live Tradovate Feed)",
         margin=dict(l=10, r=10, t=50, b=10),
         yaxis=dict(range=price_range, autorange=False if price_range else True),
     )
@@ -1634,19 +1722,28 @@ def render_execution_module(df: pd.DataFrame, label: str, volume_is_synthetic: b
     fig_vol.update_layout(template=PLOTLY_TEMPLATE, height=280, title="Volume Profile & Anomaly Bars", margin=dict(l=10, r=10, t=40, b=10), dragmode="pan")
     st.plotly_chart(fig_vol, use_container_width=True, config=PLOTLY_CONFIG)
 
+    if not order_book_df.empty:
+        st.subheader("📒 Live DOM Size at Nearest Levels (Iceberg Cross-Check)")
+        near = order_book_df.copy()
+        near["dollar_value"] = near["price"] * near["qty"]
+        near = near.sort_values("dollar_value", ascending=False).head(10)
+        st.dataframe(
+            near.rename(columns={"price": "Price", "qty": "Size", "side": "Side", "dollar_value": "$ Value"}),
+            use_container_width=True, hide_index=True,
+        )
+
     with st.expander("🧊 Detected Iceberg / Hidden Order Clusters"):
         if not icebergs.empty:
             show_cols = ["Close", "Volume", "vol_range_ratio", "vr_z"]
             st.dataframe(icebergs[show_cols].tail(15).round(3), use_container_width=True)
         else:
             st.info("No statistically significant iceberg clusters detected at the current sensitivity level.")
-
 # ==================================================================================
-# SIDEBAR — THEME TOGGLE, ASSET SELECTION & DATA ENGINE CONTROLS
+# SIDEBAR — THEME, TRADOVATE CREDENTIALS, CONTRACT & INTERVAL SELECTION
 # ==================================================================================
 
 st.sidebar.markdown("## 📊 Institutional Quant Terminal")
-st.sidebar.caption("Hybrid Multi-Source Data Engine")
+st.sidebar.caption("Live Tradovate REST + WebSocket Data Engine")
 
 theme_choice = st.sidebar.radio(
     "🎨 Theme", ["Dark Theme", "Light Theme"], index=0, horizontal=True, key="theme_choice",
@@ -1659,206 +1756,252 @@ else:
     PLOTLY_TEMPLATE = "plotly_white"
 
 st.sidebar.divider()
+st.sidebar.subheader("🔐 Tradovate Account")
 
-st.sidebar.subheader("Asset Selection")
-asset_category = st.sidebar.selectbox(
-    "Asset Category",
-    ["Crypto (Binance)", "Forex (yfinance + optional SWFX overlay)", "Metals / Macro Index (yfinance)", "Custom Symbol"],
+environment = st.sidebar.selectbox(
+    "Environment", ["Demo", "Live"], index=0, key="tv_environment",
+    help="Demo tokens are valid up to 14 days; this app re-authenticates automatically once you "
+         "update credentials below after an expiration.",
 )
 
-if asset_category == "Crypto (Binance)":
-    asset_label = st.sidebar.selectbox("Select Crypto Pair", list(CRYPTO_ASSETS.keys()))
-    symbol = CRYPTO_ASSETS[asset_label]
-    asset_class = "crypto"
-    yf_ticker = binance_to_yf_ticker(symbol)
-    primary_source_note = "Primary: Binance REST (klines + L2 depth, 3-endpoint fallback)"
-
-elif asset_category == "Forex (yfinance + optional SWFX overlay)":
-    asset_label = st.sidebar.selectbox("Select Forex Pair", list(FOREX_ASSETS.keys()))
-    symbol = FOREX_ASSETS[asset_label]
-    asset_class = "forex"
-    yf_ticker = forex_to_yf_ticker(symbol)
-    primary_source_note = "Primary: yfinance structural baseline (always fast) + optional Dukascopy SWFX tick overlay"
-
-elif asset_category == "Metals / Macro Index (yfinance)":
-    asset_label = st.sidebar.selectbox("Select Macro Asset", list(MACRO_ASSETS.keys()))
-    symbol = MACRO_ASSETS[asset_label]
-    asset_class = "macro"
-    yf_ticker = symbol
-    primary_source_note = "Primary: yfinance (OHLCV + option chains)"
-
-else:
-    custom_class = st.sidebar.selectbox("Custom Asset Class", ["crypto", "forex", "macro"])
-    default_symbol = {"crypto": "BTCUSDT", "forex": "EURUSD", "macro": "GC=F"}[custom_class]
-    custom_symbol = st.sidebar.text_input("Custom Symbol", value=default_symbol)
-    symbol = custom_symbol.strip().upper() if custom_class != "macro" else custom_symbol.strip()
-    asset_class = custom_class
-    asset_label = f"Custom: {symbol}"
-    if asset_class == "crypto":
-        yf_ticker = binance_to_yf_ticker(symbol)
-        primary_source_note = "Primary: Binance REST (klines + L2 depth, 3-endpoint fallback)"
-    elif asset_class == "forex":
-        yf_ticker = forex_to_yf_ticker(symbol)
-        primary_source_note = "Primary: yfinance structural baseline (always fast) + optional Dukascopy SWFX tick overlay"
+with st.sidebar.expander("Credentials (or set via .env)", expanded=True):
+    tv_name = st.text_input("Username", value=os.getenv("TRADOVATE_USERNAME", ""), key="tv_name")
+    tv_password = st.text_input("Password", value=os.getenv("TRADOVATE_PASSWORD", ""), type="password", key="tv_password")
+    # Demo defaults to the "0" placeholder cid/sec so you can try the app
+    # without an API Access subscription. Live always needs your real,
+    # issued Client ID/Secret — "0"/"0" is a Demo-only convenience default.
+    cid_default = os.getenv("TRADOVATE_CID", "0" if environment == "Demo" else "")
+    sec_default = os.getenv("TRADOVATE_SECRET", "0" if environment == "Demo" else "")
+    tv_cid = st.text_input("API Key (cid)", value=cid_default, key="tv_cid")
+    tv_sec = st.text_input("API Secret (sec)", value=sec_default, type="password", key="tv_sec")
+    tv_app_id = st.text_input("App ID", value=os.getenv("TRADOVATE_APP_ID", DEFAULT_APP_ID), key="tv_app_id")
+    tv_app_version = st.text_input("App Version", value=os.getenv("TRADOVATE_APP_VERSION", DEFAULT_APP_VERSION), key="tv_app_version")
+    if environment == "Demo":
+        st.caption(
+            "Demo pre-fills cid/sec with the placeholder value \"0\", which some Tradovate Demo "
+            "accounts accept without a paid API Access subscription. This is not guaranteed for every "
+            "account — if authentication fails with \"Access is denied\" or an invalid-credentials "
+            "error, your account requires a real cid/sec pair from Settings → API Access."
+        )
     else:
-        yf_ticker = symbol
-        primary_source_note = "Primary: yfinance (OHLCV + option chains)"
-
-st.sidebar.caption(primary_source_note)
-st.sidebar.divider()
-
-interval = st.sidebar.selectbox("Interval / Timeframe", INTERVAL_CHOICES, index=INTERVAL_CHOICES.index("1d"))
-base_key_selected = INTERVAL_CONFIG.get(interval, INTERVAL_CONFIG["1d"])["base"]
-
-st.sidebar.divider()
-st.sidebar.subheader("DOM / Order-Book Depth")
-
-binance_depth_limit = DEFAULT_BINANCE_DEPTH_LIMIT
-tick_lookback_hours = DEFAULT_TICK_LOOKBACK_HOURS
-dom_bucket_pips = DEFAULT_DOM_BUCKET_PIPS
-enable_tick_overlay = False
-
-if asset_class == "crypto":
-    binance_depth_limit = st.sidebar.select_slider(
-        "Binance Depth Levels", options=[50, 100, 250, 500, 1000], value=DEFAULT_BINANCE_DEPTH_LIMIT,
-    )
-elif asset_class == "forex":
-    overlay_possible = base_key_selected in TICK_OVERLAY_ELIGIBLE_BASES
-    enable_tick_overlay = st.sidebar.checkbox(
-        "Enable Live SWFX Tick Overlay (Volume + DOM)", value=True,
-        help="Fetches real Dukascopy SWFX ticks as a separate, lazy step AFTER candles "
-             "load — turn off for maximum speed. Only applies to intraday timeframes; "
-             "candles always render from yfinance regardless of this setting.",
-        disabled=not overlay_possible,
-    )
-    if not overlay_possible:
-        st.sidebar.caption("Tick overlay isn't used on daily+ timeframes — candles + synthetic volume proxy cover it.")
-    if enable_tick_overlay and overlay_possible:
-        tick_lookback_hours = st.sidebar.slider(
-            "SWFX Tick Lookback (hours)", min_value=2, max_value=168, value=DEFAULT_TICK_LOOKBACK_HOURS, step=2,
-            help="Wider lookback survives weekend market closures and covers more bars with real "
-                 "volume; narrower is faster and more 'live'. Shared by both the volume overlay and "
-                 "the DOM ladder — only fetched once per rerun.",
+        st.caption(
+            "Live requires your real, issued API Key/Secret (cid/sec) from Tradovate → Settings → "
+            "API Access. The \"0\" Demo placeholder does not apply here."
         )
-        dom_bucket_pips = st.sidebar.slider(
-            "DOM Bucket Size (pips)", min_value=0.5, max_value=10.0, value=DEFAULT_DOM_BUCKET_PIPS, step=0.5,
-        )
+
+# Demo: username + password are enough to attempt auth (cid/sec fall back to
+# the "0" placeholder above). Live: cid/sec must be real, non-empty values.
+if environment == "Demo":
+    credentials_complete = all([tv_name, tv_password])
 else:
-    st.sidebar.caption("No order-book depth controls for macro/index assets (no public order book).")
+    credentials_complete = all([tv_name, tv_password, tv_cid, tv_sec])
 
 st.sidebar.divider()
-if st.sidebar.button("🔄 Refresh All Data (Clear Cache)", use_container_width=True):
-    st.cache_data.clear()
-    st.rerun()
+st.sidebar.subheader("Contract Selection")
+
+root_choice = st.sidebar.selectbox("Futures Root", list(FUTURES_ROOTS.keys()), key="root_choice")
+root_symbol = FUTURES_ROOTS[root_choice]
+use_custom_root = st.sidebar.checkbox("Use custom root symbol instead", value=False, key="use_custom_root")
+if use_custom_root:
+    root_symbol = st.sidebar.text_input("Custom Root Symbol", value=root_symbol, key="custom_root").strip().upper()
+    root_choice = f"Custom: {root_symbol}"
+
+interval = st.sidebar.selectbox("Primary Chart Interval", INTERVAL_CHOICES, index=INTERVAL_CHOICES.index("5m"), key="interval_choice")
+
+st.sidebar.divider()
+auto_refresh = st.sidebar.checkbox("🔴 Live Auto-Refresh", value=True, key="auto_refresh")
+refresh_secs = st.sidebar.slider("Refresh Interval (seconds)", 2, 15, 3, key="refresh_secs")
+
+col_reconnect, col_reset = st.sidebar.columns(2)
+force_reconnect = col_reconnect.button("🔄 Reconnect", use_container_width=True)
+force_reset = col_reset.button("🧹 Full Reset", use_container_width=True)
 
 st.sidebar.divider()
 st.sidebar.markdown(
     "<div style='font-size:0.75rem; opacity:0.75;'>"
     "<b>Data Engine Routing</b><br>"
-    "Crypto/Metals proxy → Binance Public API (3-endpoint fallback)<br>"
-    "Major Forex → yfinance structural baseline ALWAYS (fast, 200+ bars) + optional, "
-    "toggleable Dukascopy SWFX tick overlay for real volume / DOM (intraday only)<br>"
-    "Macro/Index/Futures → yfinance<br>"
-    "Any source failure → automatic yfinance fallback (crypto only — forex's primary IS "
-    "yfinance already, so it is never retried a second time with identical arguments)<br>"
-    "When real volume is missing/zero, a disclosed Synthetic Volume Proxy "
-    "(bar-range × volatility) fills the gap so VWAP/CVD/Iceberg never break — real "
-    "tick volume overwrites it wherever the SWFX overlay has coverage.<br>"
-    "Forex depth ladder is built from real SWFX tick prints (bid/ask price + volume), "
-    "not a native multi-level order book — Dukascopy does not publish one publicly.<br>"
-    "All Dukascopy tick downloads are cached 5 minutes and shared between the volume "
-    "overlay and DOM ladder, so repeated views are instant and never double-fetch.<br><br>"
-    "For informational / research purposes only — not investment advice."
+    "Authentication → Tradovate REST /auth/accesstoken<br>"
+    "Real-time Quotes & Trades → WS md/subscribeQuote<br>"
+    "Real-time Level 2 DOM → WS md/subscribeDOM<br>"
+    "Candles (all timeframes) → WS md/getChart, live-updating<br>"
+    "Options GEX (Module 5) → yfinance equity-ETF proxy or Black-Scholes simulation "
+    "(Tradovate API surface used here has no futures-options chain endpoint)<br>"
+    "Macro anchors (Module 3: DXY, 10Y yield) → yfinance<br><br>"
+    "For informational / research purposes only — not investment advice. "
+    "Demo-environment trading only reflects simulated fills."
     "</div>",
     unsafe_allow_html=True,
 )
 
+if force_reset:
+    for key in ["tv_session", "tv_state", "tv_worker", "tv_contract_cache"]:
+        st.session_state.pop(key, None)
+    st.cache_data.clear()
+    st.rerun()
+
 # ==================================================================================
-# MAIN HEADER & DATA FETCH
+# AUTHENTICATION LIFECYCLE
 # ==================================================================================
 
-st.title("📊 Institutional Quantitative Trading Terminal")
-st.caption(f"Active Instrument: **{asset_label}** ({symbol}) · Class: {asset_class} · Interval: {interval}")
+st.title("📊 Institutional Quantitative Trading Terminal — Tradovate")
 
-# Step 1 — FAST structural candle fetch. Never touches Dukascopy for any asset class.
-with st.spinner(f"Fetching market data for {symbol}..."):
-    main_df, source_used = fetch_ohlcv(asset_class, symbol, yf_ticker, interval)
-
-if main_df.empty:
-    st.error(
-        f"⚠️ Unable to retrieve OHLCV data for **{symbol}** at interval '{interval}' from any configured "
-        "source. Try a different interval, verify the symbol, or click **Refresh All Data** in the sidebar."
-    )
+if not credentials_complete:
+    if environment == "Demo":
+        st.warning(
+            "Enter your Tradovate **Username and Password** in the sidebar (or provide them via a "
+            "`.env` file) to authenticate and start streaming. cid/sec default to the Demo "
+            "placeholder \"0\" automatically."
+        )
+    else:
+        st.warning(
+            "Enter your Tradovate **Username, Password, API Key (cid), and API Secret (sec)** in the "
+            "sidebar (or provide them via a `.env` file) — Live requires real API keys, unlike Demo."
+        )
     st.stop()
 
-# Step 2 — Synthetic volume proxy applied immediately (local compute, no network) so
-# every downstream module always has a usable, non-degenerate Volume column regardless
-# of whether the optional tick overlay below succeeds, is enabled, or is even applicable.
-volume_is_synthetic = False
-if asset_class == "forex":
-    main_df, volume_is_synthetic = apply_synthetic_volume_proxy(main_df)
+fingerprint = (environment, tv_name, tv_password, tv_app_id, tv_app_version, tv_cid, tv_sec)
+existing_session = st.session_state.get("tv_session")
+need_new_session = (
+    existing_session is None
+    or existing_session.credential_fingerprint() != fingerprint
+    or force_reconnect
+)
 
-# Step 3 — OPTIONAL, separate, lazy Dukascopy tick overlay. Only runs for forex, only
-# when the sidebar toggle is on, and only on intraday timeframes. This is intentionally
-# AFTER candles are already valid and renderable, under its own clearly-labeled spinner,
-# and wrapped in try/except so a Dukascopy hiccup never takes candles off the screen.
-order_book_df = pd.DataFrame()
-if asset_class == "crypto":
-    with st.spinner("Fetching live Binance order book..."):
-        order_book_df = fetch_order_book(asset_class, symbol, depth_limit=binance_depth_limit)
-elif asset_class == "forex" and enable_tick_overlay and base_key_selected in TICK_OVERLAY_ELIGIBLE_BASES:
-    with st.spinner("Fetching live SWFX tick-flow overlay (volume + DOM)..."):
-        try:
-            ticks = fetch_dukascopy_ticks(symbol, tick_lookback_hours)
-        except Exception:
-            ticks = pd.DataFrame()
-        if not ticks.empty:
-            main_df = overlay_dukascopy_tick_volume(main_df, ticks, base_key_selected)
-            source_used += " + Dukascopy SWFX tick overlay"
-        try:
-            order_book_df = fetch_order_book(
-                asset_class, symbol,
-                dom_lookback_hours=tick_lookback_hours,
-                dom_bucket_pips=dom_bucket_pips,
-            )
-        except Exception:
-            order_book_df = pd.DataFrame()
+if need_new_session:
+    new_session = TradovateSession(
+        environment=environment, name=tv_name, password=tv_password,
+        app_id=tv_app_id, app_version=tv_app_version, cid=tv_cid, sec=tv_sec,
+        device_id=st.session_state.get("tv_device_id", str(uuid.uuid4())),
+    )
+    st.session_state["tv_device_id"] = new_session.device_id
+    try:
+        with st.spinner("Authenticating with Tradovate..."):
+            new_session.authenticate()
+    except TradovateAuthError as e:
+        st.error(f"❌ {e}")
+        st.stop()
+    st.session_state["tv_session"] = new_session
+    # credentials or environment changed -> any live worker is stale, tear it down
+    old_worker = st.session_state.pop("tv_worker", None)
+    if old_worker is not None:
+        old_worker.stop()
+    st.session_state.pop("tv_state", None)
+    st.session_state.pop("tv_contract_cache", None)
+
+tv_session = st.session_state["tv_session"]
+
+if not tv_session.is_token_valid():
+    try:
+        with st.spinner("Refreshing expired Tradovate session token..."):
+            tv_session.authenticate()
+    except TradovateAuthError as e:
+        st.error(f"❌ Token refresh failed: {e}")
+        st.stop()
+
+if tv_session.has_market_data is False:
+    st.warning(
+        "⚠️ This Tradovate account reports `hasMarketData: false`. Real-time quotes/DOM will not "
+        "stream until a market data subscription is enabled on the account, even though candles and "
+        "authentication will otherwise work normally."
+    )
+
+# ==================================================================================
+# CONTRACT RESOLUTION (front-month lookup, cached per root+environment)
+# ==================================================================================
+
+contract_cache = st.session_state.setdefault("tv_contract_cache", {})
+cache_key = f"{environment}:{root_symbol}"
+
+if cache_key not in contract_cache or force_reconnect:
+    try:
+        with st.spinner(f"Resolving front-month contract for {root_symbol}..."):
+            contract_cache[cache_key] = tv_session.find_front_month_contract(root_symbol)
+    except TradovateAuthError as e:
+        st.error(f"❌ {e}")
+        st.stop()
+
+contract_info = contract_cache[cache_key]
+contract_name = contract_info["name"]
+contract_id = contract_info["id"]
+asset_label = f"{root_choice} — {contract_name}"
+
+# ==================================================================================
+# WORKER LIFECYCLE — persistent background WebSocket thread across reruns
+# ==================================================================================
+
+timeframes_needed = sorted(set([interval, "1d"]))
+worker: MarketDataWorker = st.session_state.get("tv_worker")
+
+need_new_worker = (
+    worker is None
+    or not worker.is_alive()
+    or worker.contract_name != contract_name
+    or sorted(worker.timeframes) != timeframes_needed
+    or force_reconnect
+)
+
+if need_new_worker:
+    if worker is not None:
+        worker.stop()
+    live_state = LiveMarketState()
+    new_worker = MarketDataWorker(
+        session=tv_session, state=live_state, contract_name=contract_name,
+        contract_id=contract_id, timeframes=timeframes_needed,
+    )
+    new_worker.start()
+    st.session_state["tv_worker"] = new_worker
+    st.session_state["tv_state"] = live_state
+
+worker = st.session_state["tv_worker"]
+live_state: LiveMarketState = st.session_state["tv_state"]
+
+status = live_state.status()
+main_df = live_state.snapshot_bars(interval)
+daily_df = live_state.snapshot_bars("1d")
+order_book_df = live_state.snapshot_dom()
+quote_snapshot = live_state.snapshot_quote()
+live_ticks = live_state.snapshot_ticks()
+
+conn_badge = "🟢 WS CONNECTED" if status["connected"] else "🔴 WS DISCONNECTED"
+auth_badge = "🟢 AUTHORIZED" if status["authorized"] else "🟡 AUTHORIZING…"
+st.caption(f"Active Contract: **{asset_label}** · Environment: {environment} · Interval: {interval}")
+st.markdown(
+    f'<span class="source-badge">{conn_badge}</span>'
+    f'<span class="source-badge">{auth_badge}</span>'
+    f'<span class="source-badge">📡 CANDLES: TRADOVATE md/getChart (LIVE)</span>'
+    f'<span class="source-badge">{"🟢 LIVE L2 DOM" if not order_book_df.empty else "🔴 DOM AWAITING FIRST SNAPSHOT"}</span>',
+    unsafe_allow_html=True,
+)
+if status["last_error"]:
+    st.error(f"⚠️ {status['last_error']}")
+
+if main_df.empty:
+    st.info(
+        f"Waiting on the first `md/getChart` bar snapshot for **{contract_name}** ({interval})... "
+        "this normally arrives within a few seconds of authorization. The page will keep refreshing."
+    )
+    if auto_refresh:
+        time.sleep(refresh_secs)
+        st.rerun()
+    st.stop()
 
 if len(main_df) < 20:
-    st.warning("Very limited data returned for this selection — consider a lower-granularity interval.")
-
-if asset_class == "crypto":
-    dom_badge = "🟢 LIVE L2 DOM" if not order_book_df.empty else "🔴 L2 DOM UNAVAILABLE"
-elif asset_class == "forex":
-    if not enable_tick_overlay:
-        dom_badge = "⚪ TICK OVERLAY DISABLED (candles still live via yfinance)"
-    elif base_key_selected not in TICK_OVERLAY_ELIGIBLE_BASES:
-        dom_badge = "⚪ NOT APPLICABLE ON THIS TIMEFRAME"
-    elif not order_book_df.empty:
-        dom_badge = "🟢 LIVE SWFX TICK-FLOW DEPTH"
-    else:
-        dom_badge = "🔴 DEPTH UNAVAILABLE"
-else:
-    dom_badge = "⚪ NO L2 DOM (macro asset)"
-
-badges_html = (
-    f'<span class="source-badge">📡 CANDLES: {source_used.upper()}</span>'
-    f'<span class="source-badge">{dom_badge}</span>'
-)
-if volume_is_synthetic:
-    badges_html += '<span class="source-badge">🧮 SYNTHETIC VOLUME PROXY ACTIVE</span>'
-st.markdown(badges_html, unsafe_allow_html=True)
+    st.warning("Limited bar history streamed so far for this interval — some modules need more bars to compute.")
 
 # Snapshot metrics
 last_row = main_df.iloc[-1]
 prev_row = main_df.iloc[-2] if len(main_df) > 1 else last_row
 chg = safe_pct(last_row["Close"], prev_row["Close"])
+live_last = quote_snapshot.get("last")
+display_price = live_last if live_last is not None else last_row["Close"]
 
 m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Last Price", f"{last_row['Close']:,.4f}" if last_row['Close'] < 10 else f"{last_row['Close']:,.2f}", f"{chg:.2f}%")
-m2.metric("Session High", f"{last_row['High']:,.2f}")
-m3.metric("Session Low", f"{last_row['Low']:,.2f}")
-m4.metric("Volume", f"{last_row['Volume']:,.0f}")
+m1.metric("Last Price", f"{display_price:,.2f}", f"{chg:.2f}%")
+m2.metric("Bid / Ask", (
+    f"{quote_snapshot.get('bidPrice', '—')} / {quote_snapshot.get('askPrice', '—')}"
+))
+m3.metric("Session High", f"{main_df['High'].max():,.2f}")
+m4.metric("Session Low", f"{main_df['Low'].min():,.2f}")
 m5.metric("Bars Loaded", f"{len(main_df):,}")
 
 st.divider()
@@ -1878,7 +2021,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 
 with tab1:
     try:
-        render_liquidity_module(main_df, order_book_df, asset_class, asset_label)
+        render_liquidity_module(main_df, order_book_df, asset_label, dom_is_live=status["authorized"])
     except Exception as e:
         st.error(f"Liquidity module encountered an error: {e}")
 
@@ -1890,30 +2033,42 @@ with tab2:
 
 with tab3:
     try:
-        render_correlation_module(symbol, yf_ticker, asset_class, asset_label)
+        render_correlation_module(daily_df, asset_label)
     except Exception as e:
         st.error(f"Correlation module encountered an error: {e}")
 
 with tab4:
     try:
-        render_volume_delta_module(main_df, asset_label, source_used, volume_is_synthetic)
+        render_volume_delta_module(main_df, asset_label, live_ticks, ticks_available=len(live_ticks) > 20)
     except Exception as e:
         st.error(f"Volume Delta module encountered an error: {e}")
 
 with tab5:
     try:
-        render_gex_module(symbol, yf_ticker, asset_class, asset_label)
+        render_gex_module(root_symbol, float(display_price) if display_price else None, asset_label)
     except Exception as e:
         st.error(f"GEX module encountered an error: {e}")
 
 with tab6:
     try:
-        render_execution_module(main_df, asset_label, volume_is_synthetic)
+        render_execution_module(main_df, order_book_df, asset_label)
     except Exception as e:
         st.error(f"Execution Algorithms module encountered an error: {e}")
 
 st.divider()
 st.caption(
     "⚠️ Disclaimer: This dashboard is provided for research and educational purposes only. "
-    "It does not constitute financial advice."
+    "It does not constitute financial advice. Trading futures involves substantial risk of loss."
 )
+
+# ==================================================================================
+# LIVE AUTO-REFRESH LOOP
+# ==================================================================================
+# Streamlit has no native server-push; this simple sleep+rerun loop polls the
+# background worker's shared state at `refresh_secs` intervals so the UI feels
+# live without requiring an extra streamlit-autorefresh dependency. The
+# WebSocket connection itself is NOT affected by this — it keeps streaming on
+# its own background thread regardless of how often the page reruns.
+if auto_refresh:
+    time.sleep(refresh_secs)
+    st.rerun()
