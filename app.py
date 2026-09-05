@@ -69,11 +69,7 @@ from sklearn.preprocessing import StandardScaler
 
 RITHMIC_IMPORT_ERROR = None
 RITHMIC_IMPORT_DIAGNOSTICS = None
-# NOTE: `Gateway` was removed from async_rithmic in v1.5.0 (2025-06-17) and replaced
-# by a plain `url=` connection parameter on RithmicClient — see the library's own
-# CHANGELOG.md. It does not exist in 1.6.x under any name, top-level or nested, so
-# it is intentionally NOT resolved/required here anymore (see _try_import_rithmic).
-RithmicClient = DataType = TimeBarType = LastTradePresenceBits = None
+RithmicClient = Gateway = DataType = TimeBarType = LastTradePresenceBits = None
 
 def _find_attr_in_submodules(base_mod, name, submodule_names):
     """Look for `name` on base_mod itself, then on a handful of common
@@ -100,30 +96,17 @@ def _find_attr_in_submodules(base_mod, name, submodule_names):
     return None
 
 def _try_import_rithmic():
-    """Resolve RithmicClient/DataType/TimeBarType defensively.
-
-    IMPORTANT — why `Gateway` is gone: async_rithmic's own CHANGELOG.md records
-    that the `gateway` parameter (and the `Gateway` enum that fed it) was
-    deprecated in v1.4.5 and then fully REMOVED in v1.5.0, in favor of passing
-    a plain `url=` connection string straight to `RithmicClient(...)`. That is
-    exactly what the diagnostic block you sent shows for 1.6.6: `Gateway` isn't
-    at the top level, in enums/types, or nested on RithmicClient, because it
-    genuinely no longer exists in the package — it's not a naming difference to
-    search harder for. So this resolver only requires the names that are still
-    real, current parts of async_rithmic's public API (RithmicClient, DataType,
-    TimeBarType), and the app now connects via `url=` (see the sidebar and
-    RithmicMarketDataWorker below) instead of a Gateway enum.
-
-    The documented, top-level import is tried first for each name individually.
-    Any name not found there is searched for on real, common submodule locations
-    (`async_rithmic.enums`, `async_rithmic.types`) and as a nested class
-    attribute on RithmicClient — but we never invent a value. Faking a DataType
-    member would make market-data subscriptions fail silently (requesting the
-    wrong data type) instead of failing loudly, which is worse than an
-    ImportError.
+    """Resolve RithmicClient/DataType/TimeBarType (required) and Gateway
+    (optional — removed from async_rithmic's top level as of at least 1.6.6,
+    confirmed by inspecting a real installed copy's dir() output; current
+    connections are made with a literal `url=` string instead, see
+    resolve_connection_url() below). We do NOT treat a missing Gateway as a
+    fatal import error anymore, and we do NOT invent replacement values for
+    it — the worker switches to the newer `url=` connection style whenever
+    Gateway isn't found.
     """
     global RITHMIC_IMPORT_ERROR, RITHMIC_IMPORT_DIAGNOSTICS
-    global RithmicClient, DataType, TimeBarType, LastTradePresenceBits
+    global RithmicClient, Gateway, DataType, TimeBarType, LastTradePresenceBits
 
     try:
         import importlib
@@ -136,12 +119,15 @@ def _try_import_rithmic():
     submodule_guesses = ["enums", "types", "constants", "client"]
     resolved = {}
     missing = []
-    for name in ("RithmicClient", "DataType", "TimeBarType"):
+    for name in ("RithmicClient", "DataType", "TimeBarType"):  # hard requirements
         found = _find_attr_in_submodules(mod, name, submodule_guesses)
         if found is None:
             missing.append(name)
         else:
             resolved[name] = found
+    # Gateway is best-effort only — recent async_rithmic versions (>=~1.4?)
+    # dropped it in favor of a literal `url=` argument on RithmicClient.
+    resolved["Gateway"] = _find_attr_in_submodules(mod, "Gateway", submodule_guesses)
     resolved["LastTradePresenceBits"] = _find_attr_in_submodules(mod, "LastTradePresenceBits", submodule_guesses)
 
     module_file = getattr(mod, "__file__", "unknown location")
@@ -150,6 +136,8 @@ def _try_import_rithmic():
         f"async_rithmic version: {version}",
         f"Loaded from: {module_file}",
         f"Top-level names: {[n for n in dir(mod) if not n.startswith('_')]}",
+        f"Gateway available: {resolved['Gateway'] is not None} "
+        f"({'using gateway= connections' if resolved['Gateway'] else 'using url= connections (this async_rithmic version has no Gateway enum)'})",
     ]
     if "site-packages" not in str(module_file) and "dist-packages" not in str(module_file):
         diag_lines.append(
@@ -164,6 +152,7 @@ def _try_import_rithmic():
         return
 
     RithmicClient = resolved["RithmicClient"]
+    Gateway = resolved["Gateway"]  # may legitimately be None on 1.6.6+
     DataType = resolved["DataType"]
     TimeBarType = resolved["TimeBarType"]
     LastTradePresenceBits = resolved["LastTradePresenceBits"]
@@ -222,39 +211,37 @@ PLOTLY_CONFIG = {"scrollZoom": False, "displayModeBar": True, "responsive": True
 # RITHMIC CONSTANTS
 # ==================================================================================
 
-# async_rithmic dropped the `gateway=Gateway.X` enum in v1.5.0 — RithmicClient
-# now takes a plain `url="host:port"` connection string instead (see
-# _try_import_rithmic's docstring above and async_rithmic's CHANGELOG.md).
-#
-# Each entry below bundles the SYSTEM_NAME that Rithmic expects alongside the
-# matching connection URL, so picking a profile in the sidebar can populate
-# both fields together instead of leaving them to drift out of sync (which is
-# what previously produced the 'NoneType' object has no attribute
-# 'heartbeat_interval'' crash — that error is what async_rithmic surfaces when
-# the login handshake never completes because SYSTEM_NAME and url didn't match
-# the same environment).
-#
-# "Rithmic Test" is the one endpoint that's openly documented. The Paper
-# Trading (14-day demo) URL below (rituz00100.rithmic.com:443) is Rithmic's
-# standard test-complex host, which is what the demo/trial accounts connect
-# through — but if Rithmic's welcome email for your account gives you a
-# different host, paste that into the Connection URL field below; it is never
-# locked.
-SYSTEM_PROFILES = {
-    "Rithmic Paper Trading (Demo)": {
-        "system_name": "Rithmic Paper Trading",
-        "url": "rituz00100.rithmic.com:443",
-    },
-    "Rithmic Test": {
-        "system_name": "Rithmic Test",
-        "url": "rituz00100.rithmic.com:443",
-    },
-    "Live / Other (paste URL from Rithmic)": {
-        "system_name": "",
-        "url": "",
-    },
+# As of async_rithmic 1.6.6 (confirmed by inspecting a real installation),
+# there is no Gateway enum — RithmicClient connects via a literal `url=`
+# string pointing at Rithmic's server for your system, e.g.
+# "rituz00100.rithmic.com:443" for the generic "Rithmic Test" system. Only
+# that one URL is publicly documented (async-rithmic.readthedocs.io); the
+# Paper Trading and Live gateway URLs are assigned per broker/prop-firm by
+# Rithmic itself (confirmed by multiple broker connection guides — different
+# firms are handed different servers), so this app does NOT guess them. You
+# get your exact URL from your Rithmic dev-kit / broker welcome email and
+# paste it into the sidebar field below.
+KNOWN_GATEWAY_URLS = {
+    "Rithmic Test (rituz00100.rithmic.com:443)": "rituz00100.rithmic.com:443",
+    "Custom (paste your broker's gateway URL)": "",
 }
-SYSTEM_PROFILE_LABELS = list(SYSTEM_PROFILES.keys())
+GATEWAY_LABELS = list(KNOWN_GATEWAY_URLS.keys())
+
+def resolve_gateway(label: str):
+    """Back-compat path for older async_rithmic versions that DO still have a
+    Gateway enum. Only used if Gateway was actually found at import time —
+    never fabricated."""
+    if Gateway is None:
+        return None
+    candidates = {
+        "Rithmic Test (rituz00100.rithmic.com:443)": ["TEST"],
+        "Custom (paste your broker's gateway URL)": ["PAPER", "PAPER_TRADING", "LIVE", "TEST"],
+    }
+    for name in candidates.get(label, []):
+        if hasattr(Gateway, name):
+            return getattr(Gateway, name)
+    members = [m for m in dir(Gateway) if not m.startswith("_")]
+    return getattr(Gateway, members[0]) if members else None
 
 # Default symbol universe: CME-listed crypto-linked futures roots. Users can add
 # any symbol:exchange pair their Rithmic account is entitled to.
@@ -384,12 +371,13 @@ class RithmicMarketDataWorker(threading.Thread):
     to a clear "not available" state in the UI rather than crashing the app.
     """
 
-    def __init__(self, user, password, system_name, url, symbols, state: LiveMarketState):
+    def __init__(self, user, password, system_name, gateway_label, gateway_url, symbols, state: LiveMarketState):
         super().__init__(daemon=True)
         self.user = user
         self.password = password
         self.system_name = system_name
-        self.url = url  # host:port string, e.g. "rituz00100.rithmic.com:443" — replaces the old gateway= enum
+        self.gateway_label = gateway_label
+        self.gateway_url = gateway_url
         self.symbols = symbols  # list of (symbol, exchange, root)
         self.state = state
         self.loop = None
@@ -442,11 +430,27 @@ class RithmicMarketDataWorker(threading.Thread):
             backoff = min(backoff * 2, 30)
 
     async def _connect_and_stream(self):
-        self.client = RithmicClient(
+        client_kwargs = dict(
             user=self.user, password=self.password,
             system_name=self.system_name, app_name="InstitutionalQuantTerminal",
-            app_version="2.0", url=self.url,
+            app_version="2.0",
         )
+        if Gateway is not None:
+            # Older async_rithmic (<~1.4) — genuine Gateway enum was found at
+            # import time, so use it exactly as that version expects.
+            client_kwargs["gateway"] = resolve_gateway(self.gateway_label)
+        else:
+            # async_rithmic 1.6.6+ (confirmed): no Gateway enum, connect via
+            # a literal server URL instead.
+            if not self.gateway_url:
+                raise RuntimeError(
+                    "No Gateway URL configured. Your installed async_rithmic has no Gateway "
+                    "enum, so it needs the exact gateway URL from your Rithmic dev-kit/broker "
+                    "welcome email (e.g. 'rituz00100.rithmic.com:443' for the Test system) — "
+                    "enter it in the sidebar's Gateway URL field."
+                )
+            client_kwargs["url"] = self.gateway_url
+        self.client = RithmicClient(**client_kwargs)
         await self.client.connect()
         with self.state.lock:
             self.state.connected = True
@@ -1358,36 +1362,21 @@ if RITHMIC_IMPORT_ERROR:
             "installed version uses instead of guessing."
         )
 
-system_profile = st.sidebar.selectbox("Rithmic System", SYSTEM_PROFILE_LABELS, index=0, key="rt_system_profile")
-_preset = SYSTEM_PROFILES.get(system_profile, {"system_name": "", "url": ""})
-
+gateway_label = st.sidebar.selectbox("Rithmic System", GATEWAY_LABELS, index=0, key="rt_gateway")
+_default_url = KNOWN_GATEWAY_URLS.get(gateway_label, "")
+gateway_url = st.sidebar.text_input(
+    "Gateway URL (required on async_rithmic 1.6.6+, no Gateway enum exists)",
+    value=_default_url, key="rt_gateway_url",
+    help="Get this from your Rithmic dev-kit / broker welcome email. Only the generic "
+         "Test system's URL (rituz00100.rithmic.com:443) is publicly documented — Paper "
+         "Trading and Live gateway URLs are assigned per broker/prop-firm by Rithmic.",
+)
 rt_user = st.sidebar.text_input("Rithmic User ID (e.g. your 14-day trial email)", key="rt_user")
 rt_password = st.sidebar.text_input("Rithmic Password", type="password", key="rt_password")
-
-# The System Name and URL fields are keyed off `system_profile` so that switching
-# the dropdown re-populates both with the matched preset on the very next render
-# (Streamlit widgets otherwise keep whatever the user last typed under a fixed
-# key). Both remain plain, editable text inputs — never disabled — so a custom
-# Rithmic-issued host/system name can always override the preset.
 rt_system_name = st.sidebar.text_input(
-    "Rithmic System Name",
-    value=_preset["system_name"],
-    key=f"rt_system_name__{system_profile}",
-    disabled=False,
+    "Rithmic System Name", value="Rithmic Paper Trading", key="rt_system_name",
     help="The exact system name shown in your Rithmic dev-kit / trial welcome email — "
-         "auto-filled from the 'Rithmic System' dropdown above, but always editable "
-         "in case your account uses a different exact name.",
-)
-rt_url = st.sidebar.text_input(
-    "Rithmic Connection URL (host:port)",
-    value=_preset["url"],
-    key=f"rt_url__{system_profile}",
-    disabled=False,
-    help="async_rithmic 1.5+ connects via a direct url= string instead of a Gateway enum. "
-         "Auto-filled from the 'Rithmic System' dropdown above ('Rithmic Paper Trading (Demo)' "
-         "and 'Rithmic Test' both default to rituz00100.rithmic.com:443, Rithmic's shared "
-         "test-complex host). This field is never locked — paste a different host:port from "
-         "your Rithmic dev-kit / trial welcome email if your account was issued one.",
+         "e.g. 'Rithmic Paper Trading' for the 14-day demo.",
 )
 rt_symbols_raw = st.sidebar.text_area(
     "Symbols (SYMBOL:EXCHANGE, comma-separated)", value=DEFAULT_SYMBOLS, key="rt_symbols",
@@ -1427,7 +1416,7 @@ conn_error = st.session_state.get("rt_conn_error")
 is_live = bool(worker and worker.is_alive() and state and state.status()["connected"] and state.status()["authorized"])
 
 if is_live:
-    st.markdown(f'<div class="conn-banner-up">🟢 CONNECTED TO {system_profile.upper()}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="conn-banner-up">🟢 CONNECTED TO {gateway_label.upper()}</div>', unsafe_allow_html=True)
 else:
     st.markdown('<div class="conn-banner-down">🔴 DISCONNECTED</div>', unsafe_allow_html=True)
 
@@ -1449,18 +1438,11 @@ if connect_clicked:
         )
     elif not rt_user or not rt_password:
         st.session_state["rt_conn_error"] = "Rithmic User ID and Password are required."
-    elif not rt_system_name:
+    elif Gateway is None and not gateway_url:
         st.session_state["rt_conn_error"] = (
-            "A Rithmic System Name is required — pick 'Rithmic Paper Trading (Demo)' or "
-            "'Rithmic Test' in the dropdown above to auto-fill it, or type your account's "
-            "exact system name (from your Rithmic welcome email) if you picked 'Live / Other'."
-        )
-    elif not rt_url:
-        st.session_state["rt_conn_error"] = (
-            "A Rithmic Connection URL (host:port) is required — async_rithmic 1.5+ connects via "
-            "url= instead of a Gateway enum. Paste the URL from your Rithmic welcome email, or "
-            "pick 'Rithmic Paper Trading (Demo)' / 'Rithmic Test' in the System dropdown for the "
-            "shared test-complex default."
+            "Your installed async_rithmic (1.6.6) has no Gateway enum, so it needs the exact "
+            "Gateway URL from your Rithmic dev-kit/broker welcome email — fill in the "
+            "'Gateway URL' field in the sidebar (e.g. rituz00100.rithmic.com:443 for Test)."
         )
     else:
         symbols = parse_symbols(rt_symbols_raw)
@@ -1475,7 +1457,8 @@ if connect_clicked:
                 new_state = LiveMarketState(symbols=symbols)
                 new_worker = RithmicMarketDataWorker(
                     user=rt_user, password=rt_password, system_name=rt_system_name,
-                    url=rt_url, symbols=symbols, state=new_state,
+                    gateway_label=gateway_label, gateway_url=gateway_url,
+                    symbols=symbols, state=new_state,
                 )
                 new_worker.start()
 
@@ -1515,7 +1498,7 @@ quote_snapshot = state.snapshot_quote(focus_root)
 live_ticks = state.snapshot_ticks(focus_root)
 daily_bars_by_root = {root: resample_bars(state.snapshot_base_bars(root), "1D") for root in roots}
 
-st.caption(f"Focused Symbol: **{focus_root}** · System: {system_profile} · Interval: {interval}")
+st.caption(f"Focused Symbol: **{focus_root}** · System: {gateway_label} · Interval: {interval}")
 st.markdown(
     f'<span class="source-badge">📡 CANDLES: RITHMIC TIME BAR STREAM (LIVE, resampled)</span>'
     f'<span class="source-badge">{"🟢 LIVE L2 DOM" if not order_book_df.empty else "🟡 DOM AWAITING FIRST SNAPSHOT / NOT ENTITLED"}</span>',
