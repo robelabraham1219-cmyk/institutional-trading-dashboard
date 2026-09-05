@@ -225,18 +225,36 @@ PLOTLY_CONFIG = {"scrollZoom": False, "displayModeBar": True, "responsive": True
 # async_rithmic dropped the `gateway=Gateway.X` enum in v1.5.0 — RithmicClient
 # now takes a plain `url="host:port"` connection string instead (see
 # _try_import_rithmic's docstring above and async_rithmic's CHANGELOG.md).
-# Rithmic's public Test system is the one endpoint that's openly documented;
-# every other system's URL (Paper Trading, Live, region-specific colos) is
-# assigned per-developer by Rithmic after signup and is NOT something this
-# app can guess or hardcode — it comes from your dev-kit/trial welcome email,
-# same as your System Name. So we offer the public Test URL as a convenience
-# default and otherwise require the user to paste their own.
-SYSTEM_URL_PRESETS = {
-    "Rithmic Test": "rituz00100.rithmic.com:443",
-    "Rithmic Paper Trading (Demo)": "",  # paste from your Rithmic welcome email
-    "Live / Other (paste URL from Rithmic)": "",
+#
+# Each entry below bundles the SYSTEM_NAME that Rithmic expects alongside the
+# matching connection URL, so picking a profile in the sidebar can populate
+# both fields together instead of leaving them to drift out of sync (which is
+# what previously produced the 'NoneType' object has no attribute
+# 'heartbeat_interval'' crash — that error is what async_rithmic surfaces when
+# the login handshake never completes because SYSTEM_NAME and url didn't match
+# the same environment).
+#
+# "Rithmic Test" is the one endpoint that's openly documented. The Paper
+# Trading (14-day demo) URL below (rituz00100.rithmic.com:443) is Rithmic's
+# standard test-complex host, which is what the demo/trial accounts connect
+# through — but if Rithmic's welcome email for your account gives you a
+# different host, paste that into the Connection URL field below; it is never
+# locked.
+SYSTEM_PROFILES = {
+    "Rithmic Paper Trading (Demo)": {
+        "system_name": "Rithmic Paper Trading",
+        "url": "rituz00100.rithmic.com:443",
+    },
+    "Rithmic Test": {
+        "system_name": "Rithmic Test",
+        "url": "rituz00100.rithmic.com:443",
+    },
+    "Live / Other (paste URL from Rithmic)": {
+        "system_name": "",
+        "url": "",
+    },
 }
-SYSTEM_PROFILE_LABELS = list(SYSTEM_URL_PRESETS.keys())
+SYSTEM_PROFILE_LABELS = list(SYSTEM_PROFILES.keys())
 
 # Default symbol universe: CME-listed crypto-linked futures roots. Users can add
 # any symbol:exchange pair their Rithmic account is entitled to.
@@ -1341,21 +1359,35 @@ if RITHMIC_IMPORT_ERROR:
         )
 
 system_profile = st.sidebar.selectbox("Rithmic System", SYSTEM_PROFILE_LABELS, index=0, key="rt_system_profile")
+_preset = SYSTEM_PROFILES.get(system_profile, {"system_name": "", "url": ""})
+
 rt_user = st.sidebar.text_input("Rithmic User ID (e.g. your 14-day trial email)", key="rt_user")
 rt_password = st.sidebar.text_input("Rithmic Password", type="password", key="rt_password")
+
+# The System Name and URL fields are keyed off `system_profile` so that switching
+# the dropdown re-populates both with the matched preset on the very next render
+# (Streamlit widgets otherwise keep whatever the user last typed under a fixed
+# key). Both remain plain, editable text inputs — never disabled — so a custom
+# Rithmic-issued host/system name can always override the preset.
 rt_system_name = st.sidebar.text_input(
-    "Rithmic System Name", value="Rithmic Paper Trading", key="rt_system_name",
+    "Rithmic System Name",
+    value=_preset["system_name"],
+    key=f"rt_system_name__{system_profile}",
+    disabled=False,
     help="The exact system name shown in your Rithmic dev-kit / trial welcome email — "
-         "e.g. 'Rithmic Paper Trading' for the 14-day demo.",
+         "auto-filled from the 'Rithmic System' dropdown above, but always editable "
+         "in case your account uses a different exact name.",
 )
 rt_url = st.sidebar.text_input(
     "Rithmic Connection URL (host:port)",
-    value=SYSTEM_URL_PRESETS.get(system_profile, ""),
-    key="rt_url",
+    value=_preset["url"],
+    key=f"rt_url__{system_profile}",
+    disabled=False,
     help="async_rithmic 1.5+ connects via a direct url= string instead of a Gateway enum. "
-         "'Rithmic Test' has a public default filled in above. For Paper Trading or Live, "
-         "paste the exact host:port from your Rithmic dev-kit / trial welcome email — "
-         "Rithmic assigns this per developer/account and it can't be guessed or hardcoded.",
+         "Auto-filled from the 'Rithmic System' dropdown above ('Rithmic Paper Trading (Demo)' "
+         "and 'Rithmic Test' both default to rituz00100.rithmic.com:443, Rithmic's shared "
+         "test-complex host). This field is never locked — paste a different host:port from "
+         "your Rithmic dev-kit / trial welcome email if your account was issued one.",
 )
 rt_symbols_raw = st.sidebar.text_area(
     "Symbols (SYMBOL:EXCHANGE, comma-separated)", value=DEFAULT_SYMBOLS, key="rt_symbols",
@@ -1417,11 +1449,18 @@ if connect_clicked:
         )
     elif not rt_user or not rt_password:
         st.session_state["rt_conn_error"] = "Rithmic User ID and Password are required."
+    elif not rt_system_name:
+        st.session_state["rt_conn_error"] = (
+            "A Rithmic System Name is required — pick 'Rithmic Paper Trading (Demo)' or "
+            "'Rithmic Test' in the dropdown above to auto-fill it, or type your account's "
+            "exact system name (from your Rithmic welcome email) if you picked 'Live / Other'."
+        )
     elif not rt_url:
         st.session_state["rt_conn_error"] = (
             "A Rithmic Connection URL (host:port) is required — async_rithmic 1.5+ connects via "
             "url= instead of a Gateway enum. Paste the URL from your Rithmic welcome email, or "
-            "pick 'Rithmic Test' in the System dropdown for the public default."
+            "pick 'Rithmic Paper Trading (Demo)' / 'Rithmic Test' in the System dropdown for the "
+            "shared test-complex default."
         )
     else:
         symbols = parse_symbols(rt_symbols_raw)
