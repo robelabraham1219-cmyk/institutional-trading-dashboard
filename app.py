@@ -46,6 +46,7 @@ sidebar UI only, so this runs cleanly on share.streamlit.io.
 """
 
 import asyncio
+import logging
 import math
 import queue
 import threading
@@ -221,27 +222,53 @@ PLOTLY_CONFIG = {"scrollZoom": False, "displayModeBar": True, "responsive": True
 # firms are handed different servers), so this app does NOT guess them. You
 # get your exact URL from your Rithmic dev-kit / broker welcome email and
 # paste it into the sidebar field below.
-KNOWN_GATEWAY_URLS = {
-    "Rithmic Test (rituz00100.rithmic.com:443)": "rituz00100.rithmic.com:443",
-    "Custom (paste your broker's gateway URL)": "",
-}
-GATEWAY_LABELS = list(KNOWN_GATEWAY_URLS.keys())
+# As of async_rithmic 1.6.6 (confirmed by inspecting a real installation),
+# there is no Gateway enum — RithmicClient connects via a literal `url=`
+# string paired with an exact `system_name=` string, and the two MUST match
+# each other (the server validates that the URL you connected to actually
+# hosts the system name you claimed). Each preset below is a single (label,
+# system_name, url) triple — never two independently-editable fields — so
+# the UI can no longer send a mismatched pair. Only the "Rithmic Test" URL
+# is publicly documented (async-rithmic.readthedocs.io); Paper Trading and
+# Live gateway URLs are assigned per broker/prop-firm by Rithmic itself, so
+# this app does NOT guess them — pick "Custom" and supply both values from
+# your dev-kit / broker welcome email as a matching pair.
+GATEWAY_PRESETS = [
+    # (dropdown label, exact system_name, exact url)
+    ("Rithmic Test  →  rituz00100.rithmic.com:443", "Rithmic Test", "rituz00100.rithmic.com:443"),
+    ("Rithmic Paper Trading  →  (enter your broker's matching URL)", "Rithmic Paper Trading", ""),
+    ("Custom / Other Broker System", "", ""),
+]
+GATEWAY_LABELS = [p[0] for p in GATEWAY_PRESETS]
+GATEWAY_PRESET_MAP = {label: (sys_name, url) for label, sys_name, url in GATEWAY_PRESETS}
 
-def resolve_gateway(label: str):
+def _sync_gateway_fields():
+    """on_change callback for the preset dropdown. Writes BOTH system_name and
+    url into session_state together, from the same tuple, so they can never
+    represent two different systems — this is the actual fix for the
+    state-desync bug (previously these were two independently-defaulted
+    widgets that could drift apart)."""
+    label = st.session_state.get("rt_gateway_preset")
+    sys_name, url = GATEWAY_PRESET_MAP.get(label, ("", ""))
+    st.session_state["rt_system_name"] = sys_name
+    st.session_state["rt_gateway_url"] = url
+
+def resolve_gateway(system_name: str):
     """Back-compat path for older async_rithmic versions that DO still have a
     Gateway enum. Only used if Gateway was actually found at import time —
     never fabricated."""
     if Gateway is None:
         return None
     candidates = {
-        "Rithmic Test (rituz00100.rithmic.com:443)": ["TEST"],
-        "Custom (paste your broker's gateway URL)": ["PAPER", "PAPER_TRADING", "LIVE", "TEST"],
+        "Rithmic Test": ["TEST"],
+        "Rithmic Paper Trading": ["PAPER", "PAPER_TRADING"],
     }
-    for name in candidates.get(label, []):
+    for name in candidates.get(system_name, []):
         if hasattr(Gateway, name):
             return getattr(Gateway, name)
     members = [m for m in dir(Gateway) if not m.startswith("_")]
     return getattr(Gateway, members[0]) if members else None
+
 
 # Default symbol universe: CME-listed crypto-linked futures roots. Users can add
 # any symbol:exchange pair their Rithmic account is entitled to.
@@ -438,7 +465,7 @@ class RithmicMarketDataWorker(threading.Thread):
         if Gateway is not None:
             # Older async_rithmic (<~1.4) — genuine Gateway enum was found at
             # import time, so use it exactly as that version expects.
-            client_kwargs["gateway"] = resolve_gateway(self.gateway_label)
+            client_kwargs["gateway"] = resolve_gateway(self.system_name)
         else:
             # async_rithmic 1.6.6+ (confirmed): no Gateway enum, connect via
             # a literal server URL instead.
@@ -450,6 +477,15 @@ class RithmicMarketDataWorker(threading.Thread):
                     "enter it in the sidebar's Gateway URL field."
                 )
             client_kwargs["url"] = self.gateway_url
+
+        # Log the EXACT dict about to be sent, right at the call site — this is
+        # the one place a system_name/url mismatch would actually fail, so this
+        # is where the audit trail matters most (not just at button-click time).
+        redacted = {**client_kwargs, "password": "***redacted***"}
+        logging.getLogger("rithmic_terminal").info("RithmicClient(%s)", redacted)
+        with self.state.lock:
+            self.state.last_error = f"Connecting with: {redacted}"
+
         self.client = RithmicClient(**client_kwargs)
         await self.client.connect()
         with self.state.lock:
@@ -1362,22 +1398,39 @@ if RITHMIC_IMPORT_ERROR:
             "installed version uses instead of guessing."
         )
 
-gateway_label = st.sidebar.selectbox("Rithmic System", GATEWAY_LABELS, index=0, key="rt_gateway")
-_default_url = KNOWN_GATEWAY_URLS.get(gateway_label, "")
-gateway_url = st.sidebar.text_input(
-    "Gateway URL (required on async_rithmic 1.6.6+, no Gateway enum exists)",
-    value=_default_url, key="rt_gateway_url",
-    help="Get this from your Rithmic dev-kit / broker welcome email. Only the generic "
-         "Test system's URL (rituz00100.rithmic.com:443) is publicly documented — Paper "
-         "Trading and Live gateway URLs are assigned per broker/prop-firm by Rithmic.",
+# Initialize the linked pair BEFORE creating any widgets, so first render is
+# already in sync (on_change callbacks only fire on user interaction, not on
+# initial load).
+if "rt_gateway_preset" not in st.session_state:
+    st.session_state["rt_gateway_preset"] = GATEWAY_LABELS[0]
+    _init_sys, _init_url = GATEWAY_PRESET_MAP[GATEWAY_LABELS[0]]
+    st.session_state.setdefault("rt_system_name", _init_sys)
+    st.session_state.setdefault("rt_gateway_url", _init_url)
+
+st.sidebar.selectbox(
+    "Rithmic System", GATEWAY_LABELS, key="rt_gateway_preset", on_change=_sync_gateway_fields,
+    help="Selecting a system sets BOTH the System Name and Gateway URL together, as a matching "
+         "pair, so they can never point at two different systems.",
 )
+
+is_custom_system = st.session_state["rt_gateway_preset"] == "Custom / Other Broker System"
+is_fully_known_pair = st.session_state["rt_gateway_preset"] == GATEWAY_LABELS[0]  # Rithmic Test — both values public and fixed
+rt_system_name = st.sidebar.text_input(
+    "Rithmic System Name (must match the URL below)", key="rt_system_name",
+    disabled=not is_custom_system,
+    help="Locked to the exact string required by your selected preset. Choose 'Custom / Other "
+         "Broker System' above to edit this and the URL yourself as a matching pair.",
+)
+gateway_url = st.sidebar.text_input(
+    "Gateway URL (must match the System Name above)", key="rt_gateway_url",
+    disabled=is_fully_known_pair,
+    help="Get this from your Rithmic dev-kit / broker welcome email if your system isn't listed "
+         "above. This MUST be the server that actually hosts the System Name above — mismatched "
+         "pairs are rejected by Rithmic with a 'You must specify valid SYSTEM_NAME' error.",
+)
+gateway_label = st.session_state["rt_gateway_preset"]
 rt_user = st.sidebar.text_input("Rithmic User ID (e.g. your 14-day trial email)", key="rt_user")
 rt_password = st.sidebar.text_input("Rithmic Password", type="password", key="rt_password")
-rt_system_name = st.sidebar.text_input(
-    "Rithmic System Name", value="Rithmic Paper Trading", key="rt_system_name",
-    help="The exact system name shown in your Rithmic dev-kit / trial welcome email — "
-         "e.g. 'Rithmic Paper Trading' for the 14-day demo.",
-)
 rt_symbols_raw = st.sidebar.text_area(
     "Symbols (SYMBOL:EXCHANGE, comma-separated)", value=DEFAULT_SYMBOLS, key="rt_symbols",
     help="Any symbol + exchange your Rithmic account is entitled to. Crypto-linked CME futures "
@@ -1388,6 +1441,10 @@ st.sidebar.caption(
     "Because 14-day demo credentials expire, just paste your newest Rithmic User ID/Password here "
     "and click Connect — nothing needs to change in the source code."
 )
+
+if st.session_state.get("rt_last_credentials_debug"):
+    with st.sidebar.expander("🧾 Last credentials sent (password redacted)"):
+        st.json(st.session_state["rt_last_credentials_debug"])
 
 def parse_symbols(raw: str):
     out = []
@@ -1444,6 +1501,8 @@ if connect_clicked:
             "Gateway URL from your Rithmic dev-kit/broker welcome email — fill in the "
             "'Gateway URL' field in the sidebar (e.g. rituz00100.rithmic.com:443 for Test)."
         )
+    elif not rt_system_name:
+        st.session_state["rt_conn_error"] = "System Name is required (pick a preset above, or fill it in under Custom)."
     else:
         symbols = parse_symbols(rt_symbols_raw)
         if not symbols:
@@ -1455,6 +1514,23 @@ if connect_clicked:
                     old_worker.stop()
 
                 new_state = LiveMarketState(symbols=symbols)
+
+                # Explicit credentials audit trail — printed to the console AND
+                # kept in session_state so the sidebar can show exactly what was
+                # about to be sent, before any connection is attempted. Password
+                # is deliberately redacted from both.
+                debug_creds = {
+                    "system_name": rt_system_name,
+                    "url": gateway_url or "(none — using legacy gateway= enum)",
+                    "user": rt_user,
+                    "domain": (gateway_url.split(":")[0] if gateway_url else None),
+                    "gateway_preset_selected": gateway_label,
+                }
+                logging.getLogger("rithmic_terminal").info(
+                    "Connecting with credentials: %s", {**debug_creds, "password": "***redacted***"}
+                )
+                st.session_state["rt_last_credentials_debug"] = debug_creds
+
                 new_worker = RithmicMarketDataWorker(
                     user=rt_user, password=rt_password, system_name=rt_system_name,
                     gateway_label=gateway_label, gateway_url=gateway_url,
