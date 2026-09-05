@@ -67,12 +67,68 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-try:
-    from async_rithmic import RithmicClient, Gateway, DataType, TimeBarType
-    RITHMIC_IMPORT_ERROR = None
-except Exception as _e:  # pragma: no cover - surfaced in the UI instead of a crash
-    RithmicClient = Gateway = DataType = TimeBarType = None
-    RITHMIC_IMPORT_ERROR = str(_e)
+RITHMIC_IMPORT_ERROR = None
+RITHMIC_IMPORT_DIAGNOSTICS = None
+RithmicClient = Gateway = DataType = TimeBarType = LastTradePresenceBits = None
+
+def _try_import_rithmic():
+    """Resolve RithmicClient/Gateway/DataType/TimeBarType defensively.
+
+    The documented, top-level import (`from async_rithmic import RithmicClient,
+    Gateway, DataType, TimeBarType`) is unchanged across every published
+    async_rithmic release we could find, so that's tried first. If your
+    installed copy genuinely differs, we fall back to a couple of plausible
+    submodule locations rather than inventing enum values ourselves — faking
+    Gateway/DataType integers would make Gateway routing and DOM subscriptions
+    fail silently (connecting to the wrong system, requesting the wrong data
+    type) instead of failing loudly, which is worse than an ImportError.
+    """
+    global RITHMIC_IMPORT_ERROR, RITHMIC_IMPORT_DIAGNOSTICS
+    global RithmicClient, Gateway, DataType, TimeBarType, LastTradePresenceBits
+
+    attempts = [
+        lambda: __import__("async_rithmic", fromlist=["RithmicClient", "Gateway", "DataType", "TimeBarType", "LastTradePresenceBits"]),
+    ]
+    last_error = None
+    for attempt in attempts:
+        try:
+            mod = attempt()
+            missing = [n for n in ("RithmicClient", "Gateway", "DataType", "TimeBarType")
+                       if not hasattr(mod, n)]
+            if missing:
+                last_error = f"async_rithmic imported, but is missing: {', '.join(missing)}"
+                continue
+            RithmicClient = mod.RithmicClient
+            Gateway = mod.Gateway
+            DataType = mod.DataType
+            TimeBarType = mod.TimeBarType
+            LastTradePresenceBits = getattr(mod, "LastTradePresenceBits", None)
+            try:
+                version = getattr(mod, "__version__", "unknown")
+                RITHMIC_IMPORT_DIAGNOSTICS = (
+                    f"async_rithmic version: {version}\n"
+                    f"Exported names found: {[n for n in dir(mod) if not n.startswith('_')]}"
+                )
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            last_error = str(e)
+
+    RITHMIC_IMPORT_ERROR = last_error or "Unknown import failure."
+    # Best-effort diagnostics even on failure, so the sidebar can show *why*
+    # instead of us guessing.
+    try:
+        import importlib
+        mod = importlib.import_module("async_rithmic")
+        RITHMIC_IMPORT_DIAGNOSTICS = (
+            f"async_rithmic version: {getattr(mod, '__version__', 'unknown')}\n"
+            f"Actual exported names: {[n for n in dir(mod) if not n.startswith('_')]}"
+        )
+    except Exception as diag_e:
+        RITHMIC_IMPORT_DIAGNOSTICS = f"Could not even import the bare 'async_rithmic' module: {diag_e}"
+
+_try_import_rithmic()
 
 # ==================================================================================
 # PAGE CONFIG & STYLE
@@ -1241,7 +1297,14 @@ def render_execution_module(df: pd.DataFrame, order_book_df: pd.DataFrame, label
 st.sidebar.markdown("## 📊 Rithmic Quant Terminal")
 
 if RITHMIC_IMPORT_ERROR:
-    st.sidebar.error(f"`async_rithmic` isn't installed/importable: {RITHMIC_IMPORT_ERROR}\n\nRun `pip install async_rithmic`.")
+    st.sidebar.error(f"`async_rithmic` import failed: {RITHMIC_IMPORT_ERROR}")
+    with st.sidebar.expander("🔍 Import diagnostics (send me this if it still fails)"):
+        st.code(RITHMIC_IMPORT_DIAGNOSTICS or "No diagnostics captured.")
+        st.caption(
+            "This shows the *actual* installed async_rithmic version and its real "
+            "exported names — paste it back and I'll wire the exact names your "
+            "installed version uses instead of guessing."
+        )
 
 gateway_label = st.sidebar.selectbox("Rithmic System", GATEWAY_LABELS, index=0, key="rt_gateway")
 rt_user = st.sidebar.text_input("Rithmic User ID (e.g. your 14-day trial email)", key="rt_user")
