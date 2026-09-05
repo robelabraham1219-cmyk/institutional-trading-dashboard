@@ -71,62 +71,90 @@ RITHMIC_IMPORT_ERROR = None
 RITHMIC_IMPORT_DIAGNOSTICS = None
 RithmicClient = Gateway = DataType = TimeBarType = LastTradePresenceBits = None
 
+def _find_attr_in_submodules(base_mod, name, submodule_names):
+    """Look for `name` on base_mod itself, then on a handful of common
+    submodule locations Python packages use for enums. Only ever returns a
+    REAL object found on the actually-installed package — never a guessed
+    value — so a miss here means the object genuinely isn't there under any
+    of the paths checked, not that we synthesized something to paper over it.
+    """
+    if hasattr(base_mod, name):
+        return getattr(base_mod, name)
+    for sub in submodule_names:
+        try:
+            import importlib
+            submod = importlib.import_module(f"async_rithmic.{sub}")
+            if hasattr(submod, name):
+                return getattr(submod, name)
+        except Exception:
+            continue
+    # Some libraries nest enums as class attributes on the client itself
+    # (e.g. RithmicClient.Gateway) rather than at module scope.
+    client_cls = getattr(base_mod, "RithmicClient", None)
+    if client_cls is not None and hasattr(client_cls, name):
+        return getattr(client_cls, name)
+    return None
+
 def _try_import_rithmic():
     """Resolve RithmicClient/Gateway/DataType/TimeBarType defensively.
 
     The documented, top-level import (`from async_rithmic import RithmicClient,
     Gateway, DataType, TimeBarType`) is unchanged across every published
-    async_rithmic release we could find, so that's tried first. If your
-    installed copy genuinely differs, we fall back to a couple of plausible
-    submodule locations rather than inventing enum values ourselves — faking
-    Gateway/DataType integers would make Gateway routing and DOM subscriptions
-    fail silently (connecting to the wrong system, requesting the wrong data
-    type) instead of failing loudly, which is worse than an ImportError.
+    async_rithmic release we could find, so that's tried first for each name
+    individually. Any name not found there is searched for on real, common
+    submodule locations (`async_rithmic.enums`, `async_rithmic.types`) and as
+    a nested class attribute on RithmicClient — but we never invent a value.
+    Faking Gateway/DataType members would make Gateway routing and DOM
+    subscriptions fail silently (connecting to the wrong system, requesting
+    the wrong data type) instead of failing loudly, which is worse than an
+    ImportError.
     """
     global RITHMIC_IMPORT_ERROR, RITHMIC_IMPORT_DIAGNOSTICS
     global RithmicClient, Gateway, DataType, TimeBarType, LastTradePresenceBits
 
-    attempts = [
-        lambda: __import__("async_rithmic", fromlist=["RithmicClient", "Gateway", "DataType", "TimeBarType", "LastTradePresenceBits"]),
-    ]
-    last_error = None
-    for attempt in attempts:
-        try:
-            mod = attempt()
-            missing = [n for n in ("RithmicClient", "Gateway", "DataType", "TimeBarType")
-                       if not hasattr(mod, n)]
-            if missing:
-                last_error = f"async_rithmic imported, but is missing: {', '.join(missing)}"
-                continue
-            RithmicClient = mod.RithmicClient
-            Gateway = mod.Gateway
-            DataType = mod.DataType
-            TimeBarType = mod.TimeBarType
-            LastTradePresenceBits = getattr(mod, "LastTradePresenceBits", None)
-            try:
-                version = getattr(mod, "__version__", "unknown")
-                RITHMIC_IMPORT_DIAGNOSTICS = (
-                    f"async_rithmic version: {version}\n"
-                    f"Exported names found: {[n for n in dir(mod) if not n.startswith('_')]}"
-                )
-            except Exception:
-                pass
-            return
-        except Exception as e:
-            last_error = str(e)
-
-    RITHMIC_IMPORT_ERROR = last_error or "Unknown import failure."
-    # Best-effort diagnostics even on failure, so the sidebar can show *why*
-    # instead of us guessing.
     try:
         import importlib
         mod = importlib.import_module("async_rithmic")
-        RITHMIC_IMPORT_DIAGNOSTICS = (
-            f"async_rithmic version: {getattr(mod, '__version__', 'unknown')}\n"
-            f"Actual exported names: {[n for n in dir(mod) if not n.startswith('_')]}"
+    except Exception as e:
+        RITHMIC_IMPORT_ERROR = f"Could not import 'async_rithmic' at all: {e}"
+        RITHMIC_IMPORT_DIAGNOSTICS = "The package itself failed to import — check `pip show async_rithmic`."
+        return
+
+    submodule_guesses = ["enums", "types", "constants", "client"]
+    resolved = {}
+    missing = []
+    for name in ("RithmicClient", "Gateway", "DataType", "TimeBarType"):
+        found = _find_attr_in_submodules(mod, name, submodule_guesses)
+        if found is None:
+            missing.append(name)
+        else:
+            resolved[name] = found
+    resolved["LastTradePresenceBits"] = _find_attr_in_submodules(mod, "LastTradePresenceBits", submodule_guesses)
+
+    module_file = getattr(mod, "__file__", "unknown location")
+    version = getattr(mod, "__version__", "unknown")
+    diag_lines = [
+        f"async_rithmic version: {version}",
+        f"Loaded from: {module_file}",
+        f"Top-level names: {[n for n in dir(mod) if not n.startswith('_')]}",
+    ]
+    if "site-packages" not in str(module_file) and "dist-packages" not in str(module_file):
+        diag_lines.append(
+            "⚠️ This does NOT look like it's loading from your installed site-packages — "
+            "check for a local file/folder named 'async_rithmic.py' or 'async_rithmic/' in "
+            "your project directory that is shadowing the real package."
         )
-    except Exception as diag_e:
-        RITHMIC_IMPORT_DIAGNOSTICS = f"Could not even import the bare 'async_rithmic' module: {diag_e}"
+    RITHMIC_IMPORT_DIAGNOSTICS = "\n".join(diag_lines)
+
+    if missing:
+        RITHMIC_IMPORT_ERROR = f"async_rithmic imported, but could not locate (top level, enums/, types/, or as a RithmicClient attribute): {', '.join(missing)}"
+        return
+
+    RithmicClient = resolved["RithmicClient"]
+    Gateway = resolved["Gateway"]
+    DataType = resolved["DataType"]
+    TimeBarType = resolved["TimeBarType"]
+    LastTradePresenceBits = resolved["LastTradePresenceBits"]
 
 _try_import_rithmic()
 
@@ -1368,7 +1396,10 @@ elif state and state.status()["last_error"]:
 if connect_clicked:
     st.session_state["rt_conn_error"] = None
     if RithmicClient is None:
-        st.session_state["rt_conn_error"] = "async_rithmic is not installed — run `pip install async_rithmic`."
+        st.session_state["rt_conn_error"] = (
+            f"async_rithmic isn't fully resolved yet ({RITHMIC_IMPORT_ERROR or 'unknown reason'}) — "
+            "open the '🔍 Import diagnostics' expander in the sidebar for the exact cause."
+        )
     elif not rt_user or not rt_password:
         st.session_state["rt_conn_error"] = "Rithmic User ID and Password are required."
     else:
