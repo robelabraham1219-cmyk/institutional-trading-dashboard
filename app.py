@@ -487,7 +487,62 @@ class RithmicMarketDataWorker(threading.Thread):
             self.state.last_error = f"Connecting with: {redacted}"
 
         self.client = RithmicClient(**client_kwargs)
-        await self.client.connect()
+
+        # ------------------------------------------------------------------
+        # Isolated connect/login call. async_rithmic's own internals can raise
+        # a raw AttributeError like "'NoneType' object has no attribute
+        # 'heartbeat_interval'" when a plant's login handshake is rejected or
+        # returns an empty response — the library then tries to schedule a
+        # heartbeat against a session object that never got created. That
+        # AttributeError is NOT coming from our code (grep confirms we never
+        # touch `.heartbeat_interval` anywhere), so we can't null-check our
+        # way out of it — but we CAN catch it here specifically, translate it
+        # into an actionable message, and make sure we tear down cleanly
+        # instead of leaving a half-initialized client around for the next
+        # loop iteration to trip over again.
+        # ------------------------------------------------------------------
+        try:
+            await self.client.connect()
+        except Exception as e:
+            is_heartbeat_none_bug = (
+                isinstance(e, AttributeError) and "heartbeat_interval" in str(e)
+            )
+            if is_heartbeat_none_bug:
+                translated = (
+                    "Rithmic rejected the login before async_rithmic finished setting up "
+                    "the connection (it then crashed internally trying to schedule a "
+                    "heartbeat against a session that was never created). This is not a bug "
+                    "in this app's code — grep confirms we never access `.heartbeat_interval` "
+                    "ourselves. It almost always means one of: (1) wrong password/User ID, "
+                    "(2) the System Name and Gateway URL don't actually match each other or "
+                    "your account isn't provisioned for that system, or (3) your account "
+                    "hasn't accepted Rithmic's required license/market-data agreements yet "
+                    f"(see rithmic.com/rag_paper.html for demo accounts). Raw error: {e}"
+                )
+            else:
+                translated = f"Login/connect failed: {type(e).__name__}: {e}"
+
+            logging.getLogger("rithmic_terminal").error(
+                "Connect failed for system_name=%r url=%r: %s",
+                self.system_name, self.gateway_url, e, exc_info=True,
+            )
+
+            # Clean teardown: never leave a half-connected client referenced —
+            # abort immediately rather than falling through to subscriptions.
+            with self.state.lock:
+                self.state.connected = False
+                self.state.authorized = False
+                self.state.last_error = translated
+            try:
+                if self.client is not None and hasattr(self.client, "disconnect"):
+                    await self.client.disconnect()
+            except Exception:
+                pass  # already broken — teardown is best-effort, must not mask the original error
+            finally:
+                self.client = None
+
+            raise RuntimeError(translated) from e
+
         with self.state.lock:
             self.state.connected = True
             self.state.authorized = True
