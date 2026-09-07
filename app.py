@@ -226,32 +226,49 @@ PLOTLY_CONFIG = {"scrollZoom": False, "displayModeBar": True, "responsive": True
 # there is no Gateway enum — RithmicClient connects via a literal `url=`
 # string paired with an exact `system_name=` string, and the two MUST match
 # each other (the server validates that the URL you connected to actually
-# hosts the system name you claimed). Each preset below is a single (label,
-# system_name, url) triple — never two independently-editable fields — so
-# the UI can no longer send a mismatched pair. Only the "Rithmic Test" URL
-# is publicly documented (async-rithmic.readthedocs.io); Paper Trading and
-# Live gateway URLs are assigned per broker/prop-firm by Rithmic itself, so
-# this app does NOT guess them — pick "Custom" and supply both values from
-# your dev-kit / broker welcome email as a matching pair.
-GATEWAY_PRESETS = [
-    # (dropdown label, exact system_name, exact url)
-    ("Rithmic Test  →  rituz00100.rithmic.com:443", "Rithmic Test", "rituz00100.rithmic.com:443"),
-    ("Rithmic Paper Trading  →  (enter your broker's matching URL)", "Rithmic Paper Trading", ""),
-    ("Custom / Other Broker System", "", ""),
+# hosts the system name you claimed).
+#
+# R|Trader Pro (Rithmic's own proprietary desktop app) hides the raw URL
+# because it ships with a private hostname table baked into the binary.
+# Third-party API clients don't get that table: async_rithmic's own docs
+# state only ONE URL publicly ("rituz00100.rithmic.com:443" for system_name
+# "Rithmic Test"), and confirmed via a real Rithmic integrator's setup guide,
+# every other System/Gateway URL is issued privately, per developer, only
+# AFTER passing Rithmic's "conformance" process — there is no public table
+# mapping region names (Chicago Area, Europe, Tokyo, ...) to hostnames.
+#
+# So: the dropdowns below use REAL Rithmic values (System names and Gateway
+# region labels — the region list is taken directly from the R|Trader Pro
+# screenshot you shared, so those strings are verified, not guessed). But we
+# only auto-fill a URL for the one pair that's actually publicly documented.
+# Every other combination shows a URL field — not because of a UI limitation,
+# but because Rithmic itself doesn't publish that mapping.
+SYSTEM_NAMES = [
+    "Rithmic Test",
+    "Rithmic Paper Trading",
+    "Rithmic 01",
+    "Custom / Broker-Specific System",
 ]
-GATEWAY_LABELS = [p[0] for p in GATEWAY_PRESETS]
-GATEWAY_PRESET_MAP = {label: (sys_name, url) for label, sys_name, url in GATEWAY_PRESETS}
+# Region labels as shown in R|Trader Pro's own Gateway dropdown (per your screenshot).
+GATEWAY_REGIONS = [
+    "Chicago Area", "Chicago Area Summary", "NYC Area", "Europe", "Frankfurt",
+    "Mumbai", "Seoul", "Satellite Link", "Cote 75 Summary", "Singapore",
+    "Tokyo", "Sydney", "Sao Paulo", "Cote 75",
+    "Not sure / Custom",
+]
+# The ONLY verified (system_name, gateway_region) -> url mapping. Everything
+# else genuinely requires a URL from your welcome email or R|Trader Pro's own
+# connection log (see the sidebar tip) — not fabricated here.
+VERIFIED_URL_TABLE = {
+    ("Rithmic Test", "Not sure / Custom"): "rituz00100.rithmic.com:443",
+}
 
-def _sync_gateway_fields():
-    """on_change callback for the preset dropdown. Writes BOTH system_name and
-    url into session_state together, from the same tuple, so they can never
-    represent two different systems — this is the actual fix for the
-    state-desync bug (previously these were two independently-defaulted
-    widgets that could drift apart)."""
-    label = st.session_state.get("rt_gateway_preset")
-    sys_name, url = GATEWAY_PRESET_MAP.get(label, ("", ""))
-    st.session_state["rt_system_name"] = sys_name
-    st.session_state["rt_gateway_url"] = url
+def resolve_connection_url(system_name: str, gateway_region: str, manual_url: str) -> str:
+    """Only ever returns a URL that's either (a) the one publicly-verified
+    pair, or (b) whatever the user explicitly typed in themselves. Never
+    invents a hostname for a System/Gateway combo we can't vouch for."""
+    verified = VERIFIED_URL_TABLE.get((system_name, gateway_region))
+    return verified if verified else (manual_url or "")
 
 def resolve_gateway(system_name: str):
     """Back-compat path for older async_rithmic versions that DO still have a
@@ -268,6 +285,7 @@ def resolve_gateway(system_name: str):
             return getattr(Gateway, name)
     members = [m for m in dir(Gateway) if not m.startswith("_")]
     return getattr(Gateway, members[0]) if members else None
+
 
 
 # Default symbol universe: CME-listed crypto-linked futures roots. Users can add
@@ -1453,39 +1471,49 @@ if RITHMIC_IMPORT_ERROR:
             "installed version uses instead of guessing."
         )
 
-# Initialize the linked pair BEFORE creating any widgets, so first render is
-# already in sync (on_change callbacks only fire on user interaction, not on
-# initial load).
-if "rt_gateway_preset" not in st.session_state:
-    st.session_state["rt_gateway_preset"] = GATEWAY_LABELS[0]
-    _init_sys, _init_url = GATEWAY_PRESET_MAP[GATEWAY_LABELS[0]]
-    st.session_state.setdefault("rt_system_name", _init_sys)
-    st.session_state.setdefault("rt_gateway_url", _init_url)
-
-st.sidebar.selectbox(
-    "Rithmic System", GATEWAY_LABELS, key="rt_gateway_preset", on_change=_sync_gateway_fields,
-    help="Selecting a system sets BOTH the System Name and Gateway URL together, as a matching "
-         "pair, so they can never point at two different systems.",
+rt_user = st.sidebar.text_input("User ID (e.g. your 14-day trial email)", key="rt_user")
+rt_password = st.sidebar.text_input("Password", type="password", key="rt_password")
+rt_system_name = st.sidebar.selectbox(
+    "System", SYSTEM_NAMES, key="rt_system_name",
+    help="Matches R|Trader Pro's 'System' dropdown. Pick 'Custom / Broker-Specific System' if "
+         "your prop firm/broker has its own named system (e.g. shown as their own brand in "
+         "R|Trader Pro's System list).",
+)
+rt_gateway_region = st.sidebar.selectbox(
+    "Gateway", GATEWAY_REGIONS, key="rt_gateway_region",
+    help="Matches R|Trader Pro's 'Gateway' dropdown — pick whichever region you selected there.",
 )
 
-is_custom_system = st.session_state["rt_gateway_preset"] == "Custom / Other Broker System"
-is_fully_known_pair = st.session_state["rt_gateway_preset"] == GATEWAY_LABELS[0]  # Rithmic Test — both values public and fixed
-rt_system_name = st.sidebar.text_input(
-    "Rithmic System Name (must match the URL below)", key="rt_system_name",
-    disabled=not is_custom_system,
-    help="Locked to the exact string required by your selected preset. Choose 'Custom / Other "
-         "Broker System' above to edit this and the URL yourself as a matching pair.",
-)
-gateway_url = st.sidebar.text_input(
-    "Gateway URL (must match the System Name above)", key="rt_gateway_url",
-    disabled=is_fully_known_pair,
-    help="Get this from your Rithmic dev-kit / broker welcome email if your system isn't listed "
-         "above. This MUST be the server that actually hosts the System Name above — mismatched "
-         "pairs are rejected by Rithmic with a 'You must specify valid SYSTEM_NAME' error.",
-)
-gateway_label = st.session_state["rt_gateway_preset"]
-rt_user = st.sidebar.text_input("Rithmic User ID (e.g. your 14-day trial email)", key="rt_user")
-rt_password = st.sidebar.text_input("Rithmic Password", type="password", key="rt_password")
+if rt_system_name == "Custom / Broker-Specific System":
+    rt_system_name = st.sidebar.text_input(
+        "Exact System name (from your broker's R|Trader Pro System list)", key="rt_system_name_custom",
+    )
+if rt_gateway_region == "Not sure / Custom":
+    rt_gateway_region = st.sidebar.text_input(
+        "Exact Gateway region (optional label, for your reference)", key="rt_gateway_region_custom", value="",
+    )
+
+_auto_url = VERIFIED_URL_TABLE.get((rt_system_name, rt_gateway_region), "")
+if _auto_url:
+    st.sidebar.caption(f"✅ Server address resolved automatically: `{_auto_url}`")
+    gateway_url = _auto_url
+else:
+    gateway_url = st.sidebar.text_input(
+        "Server Address (Rithmic doesn't publish this combo publicly)", key="rt_gateway_url",
+        help=(
+            "Rithmic only publishes ONE System+Gateway → server address pair "
+            "(Rithmic Test). Every other combination — including standard Paper "
+            "Trading regions — is issued privately per developer/broker, so I "
+            "can't pre-fill it without guessing (which risks silently connecting "
+            "you to the wrong server). Two ways to get it: (1) it's usually in "
+            "your broker's Rithmic welcome email, or (2) since R|Trader Pro is "
+            "already connecting successfully with these same System/Gateway "
+            "values, check its Message Log / connection diagnostics — the "
+            "resolved server address is typically printed there."
+        ),
+    )
+
+gateway_label = f"{rt_system_name} / {rt_gateway_region}"
 rt_symbols_raw = st.sidebar.text_area(
     "Symbols (SYMBOL:EXCHANGE, comma-separated)", value=DEFAULT_SYMBOLS, key="rt_symbols",
     help="Any symbol + exchange your Rithmic account is entitled to. Crypto-linked CME futures "
