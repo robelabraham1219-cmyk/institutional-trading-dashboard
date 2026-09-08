@@ -1471,6 +1471,52 @@ if RITHMIC_IMPORT_ERROR:
             "installed version uses instead of guessing."
         )
 
+# ------------------------------------------------------------------------
+# ZERO-TYPING AUTO-CONNECT via st.secrets — this is the mechanism Streamlit
+# itself provides for exactly this need (one-click connect with no runtime
+# typing), WITHOUT the credential living inside app.py's source. app.py never
+# contains your actual password anywhere — only the KEY NAME it expects.
+#
+# Local dev: create .streamlit/secrets.toml (add it to .gitignore!) with:
+#   [rithmic]
+#   user = "your_email@example.com"
+#   password = "your_real_password"
+#   system_name = "Rithmic Paper Trading"
+#   gateway_region = "Chicago Area"
+#   gateway_url = ""   # only if you have a verified server address
+#
+# Streamlit Community Cloud: paste the same TOML into your app's
+# Settings -> Secrets panel (encrypted at rest, never touches git).
+# ------------------------------------------------------------------------
+_secrets = st.secrets.get("rithmic", {}) if hasattr(st, "secrets") else {}
+has_saved_secrets = bool(_secrets.get("user")) and bool(_secrets.get("password"))
+
+if has_saved_secrets:
+    if st.sidebar.button("⚡ Auto-Connect (using saved secrets)", use_container_width=True, type="primary"):
+        st.session_state["rt_user"] = _secrets.get("user", "")
+        st.session_state["rt_password"] = _secrets.get("password", "")
+        if _secrets.get("system_name") in SYSTEM_NAMES:
+            st.session_state["rt_system_name"] = _secrets["system_name"]
+        if _secrets.get("gateway_region") in GATEWAY_REGIONS:
+            st.session_state["rt_gateway_region"] = _secrets["gateway_region"]
+        if _secrets.get("gateway_url"):
+            st.session_state["rt_gateway_url"] = _secrets["gateway_url"]
+        st.session_state["rt_auto_connect_requested"] = True
+        st.rerun()
+    st.sidebar.caption("Credentials loaded from st.secrets — nothing typed, nothing in this file.")
+else:
+    st.sidebar.info(
+        "No saved secrets found yet. Add a `[rithmic]` section with `user`/`password` to "
+        "`.streamlit/secrets.toml` (local) or your Streamlit Cloud app's Secrets panel to "
+        "enable one-click Auto-Connect. Manual fields below still work in the meantime.",
+        icon="🔒",
+    )
+
+st.sidebar.divider()
+
+st.session_state.setdefault("rt_system_name", "Rithmic Paper Trading")
+st.session_state.setdefault("rt_gateway_region", "Chicago Area")
+
 rt_user = st.sidebar.text_input("User ID (e.g. your 14-day trial email)", key="rt_user")
 rt_password = st.sidebar.text_input("Password", type="password", key="rt_password")
 rt_system_name = st.sidebar.selectbox(
@@ -1520,6 +1566,8 @@ rt_symbols_raw = st.sidebar.text_area(
          "example: BTC:CME, ETH:CME, MBT:CME, MET:CME.",
 )
 connect_clicked = st.sidebar.button("🔌 Connect to Rithmic", use_container_width=True)
+if st.session_state.pop("rt_auto_connect_requested", False):
+    connect_clicked = True
 st.sidebar.caption(
     "Because 14-day demo credentials expire, just paste your newest Rithmic User ID/Password here "
     "and click Connect — nothing needs to change in the source code."
