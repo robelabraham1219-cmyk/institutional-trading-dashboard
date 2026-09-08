@@ -49,6 +49,8 @@ import asyncio
 import logging
 import math
 import queue
+import re
+import socket
 import threading
 import time
 import warnings
@@ -263,12 +265,32 @@ VERIFIED_URL_TABLE = {
     ("Rithmic Test", "Not sure / Custom"): "rituz00100.rithmic.com:443",
 }
 
+def clean_gateway_url(raw: str) -> str:
+    """Strip scheme prefixes (wss://, ws://, ssl://, tcp://, https://, http://),
+    surrounding whitespace, and trailing slashes from a user-typed server
+    address, leaving a plain 'host:port' string — the exact format
+    async_rithmic's `url=` parameter expects (confirmed against its docs,
+    which show no scheme prefix). This does NOT invent or substitute a
+    hostname; it only cleans up formatting around whatever the user gave us.
+    """
+    if not raw:
+        return raw
+    cleaned = raw.strip()
+    cleaned = re.sub(r'^(wss|ws|ssl|tcp|https|http)://', '', cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.rstrip('/')
+    return cleaned
+
 def resolve_connection_url(system_name: str, gateway_region: str, manual_url: str) -> str:
     """Only ever returns a URL that's either (a) the one publicly-verified
-    pair, or (b) whatever the user explicitly typed in themselves. Never
-    invents a hostname for a System/Gateway combo we can't vouch for."""
+    pair, or (b) whatever the user explicitly typed in themselves (cleaned of
+    scheme prefixes). Never invents a hostname for a System/Gateway combo we
+    can't vouch for, and never silently substitutes a different real gateway
+    (e.g. falling back to Rithmic Test) when the user's input is missing or
+    invalid — that would connect to a different system without saying so."""
     verified = VERIFIED_URL_TABLE.get((system_name, gateway_region))
-    return verified if verified else (manual_url or "")
+    if verified:
+        return verified
+    return clean_gateway_url(manual_url) if manual_url else ""
 
 def resolve_gateway(system_name: str):
     """Back-compat path for older async_rithmic versions that DO still have a
@@ -525,7 +547,29 @@ class RithmicMarketDataWorker(threading.Thread):
             is_heartbeat_none_bug = (
                 isinstance(e, AttributeError) and "heartbeat_interval" in str(e)
             )
-            if is_heartbeat_none_bug:
+            # socket.gaierror can arrive either directly or wrapped inside
+            # another exception's __cause__/args by asyncio/ssl layers — check
+            # both the exception itself and its string form.
+            is_dns_failure = (
+                isinstance(e, socket.gaierror)
+                or isinstance(getattr(e, "__cause__", None), socket.gaierror)
+                or "gaierror" in str(type(e))
+                or "Name or service not known" in str(e)
+                or "nodename nor servname" in str(e)  # macOS equivalent
+                or "getaddrinfo failed" in str(e)  # Windows equivalent
+            )
+            if is_dns_failure:
+                translated = (
+                    f"DNS lookup failed for '{self.gateway_url}' — this hostname doesn't "
+                    "resolve at all, meaning it's not a real Rithmic server address (a typo, "
+                    "or a guessed hostname that doesn't exist). Rithmic does not publish "
+                    "Paper Trading / regional gateway hostnames anywhere — even other "
+                    "open-source Rithmic API clients (in other languages) ship this as a "
+                    "literal 'ask Rithmic for this' placeholder for every region. Get your "
+                    "real one from your broker's Rithmic welcome email, or by asking your "
+                    f"broker/Rithmic support directly. Raw error: {e}"
+                )
+            elif is_heartbeat_none_bug:
                 translated = (
                     "Rithmic rejected the login before async_rithmic finished setting up "
                     "the connection (it then crashed internally trying to schedule a "
@@ -1544,20 +1588,30 @@ if _auto_url:
     st.sidebar.caption(f"✅ Server address resolved automatically: `{_auto_url}`")
     gateway_url = _auto_url
 else:
-    gateway_url = st.sidebar.text_input(
+    _raw_gateway_url = st.sidebar.text_input(
         "Server Address (Rithmic doesn't publish this combo publicly)", key="rt_gateway_url",
         help=(
             "Rithmic only publishes ONE System+Gateway → server address pair "
             "(Rithmic Test). Every other combination — including standard Paper "
-            "Trading regions — is issued privately per developer/broker, so I "
-            "can't pre-fill it without guessing (which risks silently connecting "
-            "you to the wrong server). Two ways to get it: (1) it's usually in "
-            "your broker's Rithmic welcome email, or (2) since R|Trader Pro is "
-            "already connecting successfully with these same System/Gateway "
-            "values, check its Message Log / connection diagnostics — the "
-            "resolved server address is typically printed there."
+            "Trading regions — is issued privately per developer/broker (confirmed: "
+            "even other open-source Rithmic clients in other languages ship this as "
+            "a literal '{ASK_RITHMIC_FOR_DEV_KIT}' placeholder for every region), so "
+            "I can't pre-fill it without guessing. Get it from your broker's Rithmic "
+            "welcome email, or by asking Rithmic/your broker directly. Paste it in "
+            "as host:port — 'wss://', 'ssl://' etc. prefixes are stripped "
+            "automatically if you include them."
         ),
     )
+    gateway_url = clean_gateway_url(_raw_gateway_url)
+    if _raw_gateway_url and gateway_url != _raw_gateway_url.strip():
+        st.sidebar.caption(f"Cleaned to: `{gateway_url}`")
+    if gateway_url and not re.match(r'^[A-Za-z0-9.\-]+:\d{2,5}$', gateway_url):
+        st.sidebar.warning(
+            f"`{gateway_url}` doesn't look like a valid host:port (e.g. "
+            f"`rituz00100.rithmic.com:443`) — double-check it before connecting.",
+            icon="⚠️",
+        )
+
 
 gateway_label = f"{rt_system_name} / {rt_gateway_region}"
 rt_symbols_raw = st.sidebar.text_area(
