@@ -51,6 +51,7 @@ import math
 import queue
 import re
 import socket
+import ssl
 import threading
 import time
 import warnings
@@ -265,6 +266,26 @@ VERIFIED_URL_TABLE = {
     ("Rithmic Test", "Not sure / Custom"): "rituz00100.rithmic.com:443",
 }
 
+def sanitize_input(text: str) -> str:
+    """Strip zero-width and other invisible/non-printable Unicode that sneaks
+    in from copy-paste (mobile keyboards, PDFs, chat apps, welcome emails
+    rendered as HTML) — U+200B zero-width space, U+FEFF byte-order-mark,
+    U+200C/200D zero-width non/joiners, U+2060 word joiner, U+00A0
+    non-breaking space, and anything else outside printable ASCII. Credentials,
+    hostnames, and system/gateway names are all expected to be plain ASCII, so
+    this is safe to apply universally rather than guessing which field might
+    be affected."""
+    if not text:
+        return text
+    # Named invisible characters first (clearer than relying solely on the
+    # ASCII-range backstop, and catches anything that regex range might miss
+    # due to encoding quirks).
+    for ch in ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u00a0"):
+        text = text.replace(ch, "" if ch != "\u00a0" else " ")
+    # Backstop: strip anything outside printable ASCII (space through tilde).
+    text = re.sub(r'[^\x20-\x7E]', '', text)
+    return text.strip()
+
 def clean_gateway_url(raw: str) -> str:
     """Strip scheme prefixes (wss://, ws://, ssl://, tcp://, https://, http://),
     surrounding whitespace, and trailing slashes from a user-typed server
@@ -275,7 +296,7 @@ def clean_gateway_url(raw: str) -> str:
     """
     if not raw:
         return raw
-    cleaned = raw.strip()
+    cleaned = sanitize_input(raw)
     cleaned = re.sub(r'^(wss|ws|ssl|tcp|https|http)://', '', cleaned, flags=re.IGNORECASE)
     cleaned = cleaned.rstrip('/')
     return cleaned
@@ -558,7 +579,26 @@ class RithmicMarketDataWorker(threading.Thread):
                 or "nodename nor servname" in str(e)  # macOS equivalent
                 or "getaddrinfo failed" in str(e)  # Windows equivalent
             )
-            if is_dns_failure:
+            is_ssl_cert_failure = isinstance(e, ssl.SSLCertVerificationError) or (
+                isinstance(e, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(e)
+            )
+            if is_ssl_cert_failure:
+                translated = (
+                    f"TLS handshake succeeded but the certificate presented by "
+                    f"'{self.gateway_url}' doesn't match that hostname (hostname mismatch). "
+                    "This is NOT something to bypass by disabling certificate verification — "
+                    "doing that would remove protection against a man-in-the-middle on a live "
+                    "trading connection, AND it wouldn't fix the actual problem here. A "
+                    "hostname-mismatch on a *successful* TLS handshake almost always means "
+                    "this address isn't a genuine R|Protocol gateway endpoint — e.g. an "
+                    "OmneVerse discovery/license server hostname (as seen in R|Trader Pro's "
+                    "log files) rather than the actual market-data/order gateway address. "
+                    "Double-check this URL against your broker's Rithmic welcome email or "
+                    f"Rithmic support. Raw error: {e}"
+                )
+            elif isinstance(e, ssl.SSLError):
+                translated = f"TLS/SSL connection error (not a certificate mismatch): {e}"
+            elif is_dns_failure:
                 translated = (
                     f"DNS lookup failed for '{self.gateway_url}' — this hostname doesn't "
                     "resolve at all, meaning it's not a real Rithmic server address (a typo, "
@@ -1537,14 +1577,16 @@ has_saved_secrets = bool(_secrets.get("user")) and bool(_secrets.get("password")
 
 if has_saved_secrets:
     if st.sidebar.button("⚡ Auto-Connect (using saved secrets)", use_container_width=True, type="primary"):
-        st.session_state["rt_user"] = _secrets.get("user", "")
-        st.session_state["rt_password"] = _secrets.get("password", "")
-        if _secrets.get("system_name") in SYSTEM_NAMES:
-            st.session_state["rt_system_name"] = _secrets["system_name"]
-        if _secrets.get("gateway_region") in GATEWAY_REGIONS:
-            st.session_state["rt_gateway_region"] = _secrets["gateway_region"]
+        st.session_state["rt_user"] = sanitize_input(_secrets.get("user", ""))
+        st.session_state["rt_password"] = sanitize_input(_secrets.get("password", ""))
+        _secret_system = sanitize_input(_secrets.get("system_name", ""))
+        if _secret_system in SYSTEM_NAMES:
+            st.session_state["rt_system_name"] = _secret_system
+        _secret_gateway = sanitize_input(_secrets.get("gateway_region", ""))
+        if _secret_gateway in GATEWAY_REGIONS:
+            st.session_state["rt_gateway_region"] = _secret_gateway
         if _secrets.get("gateway_url"):
-            st.session_state["rt_gateway_url"] = _secrets["gateway_url"]
+            st.session_state["rt_gateway_url"] = clean_gateway_url(_secrets["gateway_url"])
         st.session_state["rt_auto_connect_requested"] = True
         st.rerun()
     st.sidebar.caption("Credentials loaded from st.secrets — nothing typed, nothing in this file.")
@@ -1561,8 +1603,8 @@ st.sidebar.divider()
 st.session_state.setdefault("rt_system_name", "Rithmic Paper Trading")
 st.session_state.setdefault("rt_gateway_region", "Chicago Area")
 
-rt_user = st.sidebar.text_input("User ID (e.g. your 14-day trial email)", key="rt_user")
-rt_password = st.sidebar.text_input("Password", type="password", key="rt_password")
+rt_user = sanitize_input(st.sidebar.text_input("User ID (e.g. your 14-day trial email)", key="rt_user"))
+rt_password = sanitize_input(st.sidebar.text_input("Password", type="password", key="rt_password"))
 rt_system_name = st.sidebar.selectbox(
     "System", SYSTEM_NAMES, key="rt_system_name",
     help="Matches R|Trader Pro's 'System' dropdown. Pick 'Custom / Broker-Specific System' if "
@@ -1575,13 +1617,13 @@ rt_gateway_region = st.sidebar.selectbox(
 )
 
 if rt_system_name == "Custom / Broker-Specific System":
-    rt_system_name = st.sidebar.text_input(
+    rt_system_name = sanitize_input(st.sidebar.text_input(
         "Exact System name (from your broker's R|Trader Pro System list)", key="rt_system_name_custom",
-    )
+    ))
 if rt_gateway_region == "Not sure / Custom":
-    rt_gateway_region = st.sidebar.text_input(
+    rt_gateway_region = sanitize_input(st.sidebar.text_input(
         "Exact Gateway region (optional label, for your reference)", key="rt_gateway_region_custom", value="",
-    )
+    ))
 
 _auto_url = VERIFIED_URL_TABLE.get((rt_system_name, rt_gateway_region), "")
 if _auto_url:
@@ -1633,7 +1675,7 @@ if st.session_state.get("rt_last_credentials_debug"):
 
 def parse_symbols(raw: str):
     out = []
-    for chunk in raw.split(","):
+    for chunk in sanitize_input(raw).split(","):
         chunk = chunk.strip()
         if not chunk:
             continue
