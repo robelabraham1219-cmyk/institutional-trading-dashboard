@@ -1,1886 +1,726 @@
 """
-==================================================================================
-RITHMIC INSTITUTIONAL QUANTITATIVE TRADING TERMINAL
-Live Rithmic R|Protocol Engine (Binary WebSocket + Protobuf) — Multi-Symbol Streaming
-==================================================================================
-Streams real-time quotes, Level 2 DOM, tick trades, and multi-timeframe candles for
-any symbol/exchange combination available on the connected Rithmic system (paper
-trading / 14-day demo included), feeding six institutional quant analytics modules.
+Institutional Quantitative FX Terminal
+========================================
+A single-file Streamlit application combining:
+  Phase 1 - Official DXY geometric-mean formula + multi-asset engine
+  Phase 2 - Volatility & Range engine (ATR, Bollinger Bands)
+  Phase 3 - Momentum & Trend engine (RSI, EMA 20/50/200)
+  Phase 4 - SMC / ICT engine (Fair Value Gaps, Order Blocks, BOS/MSS, liquidity sweeps)
+  Phase 5 - Macro Yield & Correlation engine (US 10Y vs asset)
+  Phase 6 - Multi-source fundamental news sentiment (RSS, no paid API)
+  Phase 7 - Hurst Exponent rolling volatility-regime engine
 
-IMPORTANT ARCHITECTURAL NOTE — READ BEFORE DEPLOYING
---------------------------------------------------------------------------------
-Rithmic's raw R|Protocol .proto schemas (the actual "rithmic_pb2" message
-definitions) are distributed only to registered developers under Rithmic's own
-dev-kit/NDA process — they are not public. Hand-rolling those message classes
-from scratch would produce code that *looks* correct but cannot actually
-authenticate against Rithmic's servers.
-
-Instead, this engine is built on top of `async_rithmic` (pip install
-async_rithmic), an actively maintained, open-source (MIT) Python client that
-already implements the correct binary-framed protobuf handshake across
-Rithmic's four "plants" (TICKER_PLANT for market data, ORDER_PLANT, HISTORY_PLANT,
-PNL_PLANT). This is the standard, working way to talk to Rithmic from Python
-today. If your dev-kit / system name gives you access to the lower-level proto
-objects directly and you specifically need to bypass this wrapper, the
-`RithmicMarketDataWorker` class below is the single place to swap that in — the
-rest of the app (LiveMarketState + all 6 analytics modules) is transport-agnostic.
-
-Also note: Rithmic connects to regulated futures exchanges (CME, ICE, etc.), not
-spot crypto pairs. "Crypto futures" here means exchange-listed crypto-linked
-futures (e.g. BTC, ETH, MBT, MET on CME) — the sidebar lets you type ANY
-symbol + exchange combination your Rithmic account is entitled to, rather than
-assuming a "list all crypto pairs" endpoint that doesn't exist in the API.
-
-TIMEFRAME STRATEGY: Rithmic streams live time bars at fixed native granularities.
-Rather than open 18 separate live subscriptions per symbol (fragile, and prone to
-"missing bars" when you switch), this engine subscribes to ONE canonical 1-minute
-bar stream (plus a 1-day historical backfill) per symbol and derives every other
-timeframe (2m,3m,4m,5m,15m,30m,1h,2h,3h,4h,1D,3D,1W,1M,3M,6M,1Y) via pandas
-resampling from that single source of truth. This guarantees consistent bars
-across every timeframe switch with no gaps.
-
-DEPENDENCY NOTE: streamlit, pandas, numpy, plotly, scikit-learn, async_rithmic.
-No yfinance / python-dotenv — credentials are entered each session via the
-sidebar UI only, so this runs cleanly on share.streamlit.io.
-==================================================================================
+Zero paid API keys. Data: yfinance + feedparser only.
 """
 
-import asyncio
-import logging
-import math
-import queue
-import re
-import socket
-import ssl
-import threading
 import time
-import warnings
-from collections import deque
-from datetime import datetime, timedelta, timezone
-
-warnings.filterwarnings("ignore")
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import requests
+import feedparser
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import streamlit as st
+import yfinance as yf
 
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-
-RITHMIC_IMPORT_ERROR = None
-RITHMIC_IMPORT_DIAGNOSTICS = None
-RithmicClient = Gateway = DataType = TimeBarType = LastTradePresenceBits = None
-
-def _find_attr_in_submodules(base_mod, name, submodule_names):
-    """Look for `name` on base_mod itself, then on a handful of common
-    submodule locations Python packages use for enums. Only ever returns a
-    REAL object found on the actually-installed package — never a guessed
-    value — so a miss here means the object genuinely isn't there under any
-    of the paths checked, not that we synthesized something to paper over it.
-    """
-    if hasattr(base_mod, name):
-        return getattr(base_mod, name)
-    for sub in submodule_names:
-        try:
-            import importlib
-            submod = importlib.import_module(f"async_rithmic.{sub}")
-            if hasattr(submod, name):
-                return getattr(submod, name)
-        except Exception:
-            continue
-    # Some libraries nest enums as class attributes on the client itself
-    # (e.g. RithmicClient.Gateway) rather than at module scope.
-    client_cls = getattr(base_mod, "RithmicClient", None)
-    if client_cls is not None and hasattr(client_cls, name):
-        return getattr(client_cls, name)
-    return None
-
-def _try_import_rithmic():
-    """Resolve RithmicClient/DataType/TimeBarType (required) and Gateway
-    (optional — removed from async_rithmic's top level as of at least 1.6.6,
-    confirmed by inspecting a real installed copy's dir() output; current
-    connections are made with a literal `url=` string instead, see
-    resolve_connection_url() below). We do NOT treat a missing Gateway as a
-    fatal import error anymore, and we do NOT invent replacement values for
-    it — the worker switches to the newer `url=` connection style whenever
-    Gateway isn't found.
-    """
-    global RITHMIC_IMPORT_ERROR, RITHMIC_IMPORT_DIAGNOSTICS
-    global RithmicClient, Gateway, DataType, TimeBarType, LastTradePresenceBits
-
-    try:
-        import importlib
-        mod = importlib.import_module("async_rithmic")
-    except Exception as e:
-        RITHMIC_IMPORT_ERROR = f"Could not import 'async_rithmic' at all: {e}"
-        RITHMIC_IMPORT_DIAGNOSTICS = "The package itself failed to import — check `pip show async_rithmic`."
-        return
-
-    submodule_guesses = ["enums", "types", "constants", "client"]
-    resolved = {}
-    missing = []
-    for name in ("RithmicClient", "DataType", "TimeBarType"):  # hard requirements
-        found = _find_attr_in_submodules(mod, name, submodule_guesses)
-        if found is None:
-            missing.append(name)
-        else:
-            resolved[name] = found
-    # Gateway is best-effort only — recent async_rithmic versions (>=~1.4?)
-    # dropped it in favor of a literal `url=` argument on RithmicClient.
-    resolved["Gateway"] = _find_attr_in_submodules(mod, "Gateway", submodule_guesses)
-    resolved["LastTradePresenceBits"] = _find_attr_in_submodules(mod, "LastTradePresenceBits", submodule_guesses)
-
-    module_file = getattr(mod, "__file__", "unknown location")
-    version = getattr(mod, "__version__", "unknown")
-    diag_lines = [
-        f"async_rithmic version: {version}",
-        f"Loaded from: {module_file}",
-        f"Top-level names: {[n for n in dir(mod) if not n.startswith('_')]}",
-        f"Gateway available: {resolved['Gateway'] is not None} "
-        f"({'using gateway= connections' if resolved['Gateway'] else 'using url= connections (this async_rithmic version has no Gateway enum)'})",
-    ]
-    if "site-packages" not in str(module_file) and "dist-packages" not in str(module_file):
-        diag_lines.append(
-            "⚠️ This does NOT look like it's loading from your installed site-packages — "
-            "check for a local file/folder named 'async_rithmic.py' or 'async_rithmic/' in "
-            "your project directory that is shadowing the real package."
-        )
-    RITHMIC_IMPORT_DIAGNOSTICS = "\n".join(diag_lines)
-
-    if missing:
-        RITHMIC_IMPORT_ERROR = f"async_rithmic imported, but could not locate (top level, enums/, types/, or as a RithmicClient attribute): {', '.join(missing)}"
-        return
-
-    RithmicClient = resolved["RithmicClient"]
-    Gateway = resolved["Gateway"]  # may legitimately be None on 1.6.6+
-    DataType = resolved["DataType"]
-    TimeBarType = resolved["TimeBarType"]
-    LastTradePresenceBits = resolved["LastTradePresenceBits"]
-
-_try_import_rithmic()
-
-# ==================================================================================
-# PAGE CONFIG & STYLE
-# ==================================================================================
+# ============================================================================
+# CONFIG / CONSTANTS
+# ============================================================================
 
 st.set_page_config(
-    page_title="Rithmic Institutional Quant Terminal",
+    page_title="Institutional FX Quant Terminal",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-APP_CSS = """
-<style>
-    .stApp { background-color: #0b0e14; color: #e6e6e6; }
-    section[data-testid="stSidebar"] { background-color: #0f1420; border-right: 1px solid #1f2937; }
-    div[data-testid="stMetric"] {
-        background-color: #131722; border: 1px solid #1f2937; border-radius: 10px; padding: 12px 16px;
-    }
-    div[data-testid="stMetricValue"] { color: #f0b90b; }
-    h1, h2, h3 { color: #f0f0f0; }
-    .stTabs [data-baseweb="tab-list"] { gap: 6px; }
-    .stTabs [data-baseweb="tab"] { background-color: #131722; border-radius: 8px 8px 0 0; padding: 8px 16px; color: #cfd3dc; }
-    .stTabs [aria-selected="true"] { background-color: #1f2937; color: #f0b90b; font-weight: 600; }
-    .module-note {
-        background-color: #131722; border-left: 3px solid #f0b90b; padding: 10px 14px;
-        border-radius: 4px; font-size: 0.85rem; color: #b8bdc9; margin-bottom: 10px;
-    }
-    .source-badge {
-        display: inline-block; background-color: #1f2937; color: #f0b90b; border-radius: 6px;
-        padding: 3px 10px; font-size: 0.75rem; font-weight: 600; margin-right: 6px;
-    }
-    .conn-banner-up {
-        background-color: #0d2b1e; border: 1px solid #1e7d4b; color: #4ade80;
-        border-radius: 8px; padding: 10px 16px; font-weight: 700; margin-bottom: 12px;
-    }
-    .conn-banner-down {
-        background-color: #2b0d0d; border: 1px solid #7d1e1e; color: #f87171;
-        border-radius: 8px; padding: 10px 16px; font-weight: 700; margin-bottom: 12px;
-    }
-    .stButton>button { background-color: #f0b90b; color: #0b0e14; border: none; font-weight: 600; border-radius: 6px; }
-    thead tr th { background-color: #1f2937 !important; color: #f0b90b !important; }
-</style>
-"""
-st.markdown(APP_CSS, unsafe_allow_html=True)
-PLOTLY_TEMPLATE = "plotly_dark"
-PURPLE_WALL = "#ba68c8"
-PLOTLY_CONFIG = {"scrollZoom": False, "displayModeBar": True, "responsive": True}
-
-# ==================================================================================
-# RITHMIC CONSTANTS
-# ==================================================================================
-
-# As of async_rithmic 1.6.6 (confirmed by inspecting a real installation),
-# there is no Gateway enum — RithmicClient connects via a literal `url=`
-# string pointing at Rithmic's server for your system, e.g.
-# "rituz00100.rithmic.com:443" for the generic "Rithmic Test" system. Only
-# that one URL is publicly documented (async-rithmic.readthedocs.io); the
-# Paper Trading and Live gateway URLs are assigned per broker/prop-firm by
-# Rithmic itself (confirmed by multiple broker connection guides — different
-# firms are handed different servers), so this app does NOT guess them. You
-# get your exact URL from your Rithmic dev-kit / broker welcome email and
-# paste it into the sidebar field below.
-# As of async_rithmic 1.6.6 (confirmed by inspecting a real installation),
-# there is no Gateway enum — RithmicClient connects via a literal `url=`
-# string paired with an exact `system_name=` string, and the two MUST match
-# each other (the server validates that the URL you connected to actually
-# hosts the system name you claimed).
-#
-# R|Trader Pro (Rithmic's own proprietary desktop app) hides the raw URL
-# because it ships with a private hostname table baked into the binary.
-# Third-party API clients don't get that table: async_rithmic's own docs
-# state only ONE URL publicly ("rituz00100.rithmic.com:443" for system_name
-# "Rithmic Test"), and confirmed via a real Rithmic integrator's setup guide,
-# every other System/Gateway URL is issued privately, per developer, only
-# AFTER passing Rithmic's "conformance" process — there is no public table
-# mapping region names (Chicago Area, Europe, Tokyo, ...) to hostnames.
-#
-# So: the dropdowns below use REAL Rithmic values (System names and Gateway
-# region labels — the region list is taken directly from the R|Trader Pro
-# screenshot you shared, so those strings are verified, not guessed). But we
-# only auto-fill a URL for the one pair that's actually publicly documented.
-# Every other combination shows a URL field — not because of a UI limitation,
-# but because Rithmic itself doesn't publish that mapping.
-SYSTEM_NAMES = [
-    "Rithmic Test",
-    "Rithmic Paper Trading",
-    "Rithmic 01",
-    "Custom / Broker-Specific System",
-]
-# Region labels as shown in R|Trader Pro's own Gateway dropdown (per your screenshot).
-GATEWAY_REGIONS = [
-    "Chicago Area", "Chicago Area Summary", "NYC Area", "Europe", "Frankfurt",
-    "Mumbai", "Seoul", "Satellite Link", "Cote 75 Summary", "Singapore",
-    "Tokyo", "Sydney", "Sao Paulo", "Cote 75",
-    "Not sure / Custom",
-]
-# The ONLY verified (system_name, gateway_region) -> url mapping. Everything
-# else genuinely requires a URL from your welcome email or R|Trader Pro's own
-# connection log (see the sidebar tip) — not fabricated here.
-VERIFIED_URL_TABLE = {
-    ("Rithmic Test", "Not sure / Custom"): "rituz00100.rithmic.com:443",
+ASSET_TICKERS = {
+    "DXY Index": None,          # computed via Phase 1 geometric formula
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "USDJPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "USDCAD=X",
+    "XAU/USD (Gold)": "GC=F",   # COMEX Gold futures, most reliable free XAU/USD proxy
 }
 
-def sanitize_input(text: str) -> str:
-    """Strip zero-width and other invisible/non-printable Unicode that sneaks
-    in from copy-paste (mobile keyboards, PDFs, chat apps, welcome emails
-    rendered as HTML) — U+200B zero-width space, U+FEFF byte-order-mark,
-    U+200C/200D zero-width non/joiners, U+2060 word joiner, U+00A0
-    non-breaking space, and anything else outside printable ASCII. Credentials,
-    hostnames, and system/gateway names are all expected to be plain ASCII, so
-    this is safe to apply universally rather than guessing which field might
-    be affected."""
-    if not text:
-        return text
-    # Named invisible characters first (clearer than relying solely on the
-    # ASCII-range backstop, and catches anything that regex range might miss
-    # due to encoding quirks).
-    for ch in ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u00a0"):
-        text = text.replace(ch, "" if ch != "\u00a0" else " ")
-    # Backstop: strip anything outside printable ASCII (space through tilde).
-    text = re.sub(r'[^\x20-\x7E]', '', text)
-    return text.strip()
-
-def clean_gateway_url(raw: str) -> str:
-    """Strip scheme prefixes (wss://, ws://, ssl://, tcp://, https://, http://),
-    surrounding whitespace, and trailing slashes from a user-typed server
-    address, leaving a plain 'host:port' string — the exact format
-    async_rithmic's `url=` parameter expects (confirmed against its docs,
-    which show no scheme prefix). This does NOT invent or substitute a
-    hostname; it only cleans up formatting around whatever the user gave us.
-    """
-    if not raw:
-        return raw
-    cleaned = sanitize_input(raw)
-    cleaned = re.sub(r'^(wss|ws|ssl|tcp|https|http)://', '', cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.rstrip('/')
-    return cleaned
-
-def resolve_connection_url(system_name: str, gateway_region: str, manual_url: str) -> str:
-    """Only ever returns a URL that's either (a) the one publicly-verified
-    pair, or (b) whatever the user explicitly typed in themselves (cleaned of
-    scheme prefixes). Never invents a hostname for a System/Gateway combo we
-    can't vouch for, and never silently substitutes a different real gateway
-    (e.g. falling back to Rithmic Test) when the user's input is missing or
-    invalid — that would connect to a different system without saying so."""
-    verified = VERIFIED_URL_TABLE.get((system_name, gateway_region))
-    if verified:
-        return verified
-    return clean_gateway_url(manual_url) if manual_url else ""
-
-def resolve_gateway(system_name: str):
-    """Back-compat path for older async_rithmic versions that DO still have a
-    Gateway enum. Only used if Gateway was actually found at import time —
-    never fabricated."""
-    if Gateway is None:
-        return None
-    candidates = {
-        "Rithmic Test": ["TEST"],
-        "Rithmic Paper Trading": ["PAPER", "PAPER_TRADING"],
-    }
-    for name in candidates.get(system_name, []):
-        if hasattr(Gateway, name):
-            return getattr(Gateway, name)
-    members = [m for m in dir(Gateway) if not m.startswith("_")]
-    return getattr(Gateway, members[0]) if members else None
-
-
-
-# Default symbol universe: CME-listed crypto-linked futures roots. Users can add
-# any symbol:exchange pair their Rithmic account is entitled to.
-DEFAULT_SYMBOLS = "BTC:CME, ETH:CME, MBT:CME, MET:CME"
-
-BASE_BAR_MINUTES = 1  # canonical live granularity every other timeframe derives from
-HISTORY_BACKFILL_DAYS = 5
-
-# timeframe -> pandas resample rule (minutes-based timeframes resample the 1m
-# base feed; date-based ones resample the same 1m feed on calendar boundaries)
-TIMEFRAME_RULES = {
-    "1m": "1min", "2m": "2min", "3m": "3min", "4m": "4min", "5m": "5min",
-    "15m": "15min", "30m": "30min",
-    "1h": "1h", "2h": "2h", "3h": "3h", "4h": "4h",
-    "1D": "1D", "3D": "3D", "1W": "1W", "1M": "1MS", "3M": "3MS", "6M": "6MS", "1Y": "1YS",
+DXY_COMPONENT_TICKERS = {
+    "EURUSD": "EURUSD=X",
+    "USDJPY": "USDJPY=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDCAD": "USDCAD=X",
+    "USDSEK": "USDSEK=X",
+    "USDCHF": "USDCHF=X",
 }
-INTERVAL_CHOICES = list(TIMEFRAME_RULES.keys())
-AUTO_REFRESH_SECONDS = 3
 
-# ==================================================================================
-# LIVE MARKET DATA STATE — multi-symbol, thread-safe
-# ==================================================================================
+# interval -> lookback period, tuned to keep candle counts sane on yfinance's
+# own intraday retention limits (1m ~7d, intraday <60m ~60d, 60m ~730d)
+INTERVAL_PERIOD_MAP = {
+    "1m": "5d",
+    "2m": "5d",
+    "5m": "5d",
+    "15m": "1mo",
+    "30m": "1mo",
+    "60m": "3mo",
+    "1d": "1y",
+    "1wk": "5y",
+}
 
-class LiveMarketState:
-    """One shared object per connected session. Mutated by the background asyncio
-    worker thread (Rithmic callbacks), read (copy-on-read) by the Streamlit main
-    thread on every rerun. Bars are stored ONLY at the 1-minute base granularity;
-    every other timeframe is derived on read via resample_bars()."""
+RSS_FEEDS = {
+    "ForexFactory": "https://www.forexfactory.com/rss.php",
+    "FXStreet": "https://www.fxstreet.com/rss/news",
+    "DailyFX": "https://www.dailyfx.com/feeds/all",
+}
 
-    def __init__(self, symbols: list, max_base_bars: int = 200_000):
-        self.lock = threading.Lock()
-        self.connected = False
-        self.authorized = False
-        self.last_error = None
-        self.symbols = symbols  # list of (symbol, exchange, display_root)
-        self.max_base_bars = max_base_bars
+BULLISH_KEYWORDS = [
+    "rate hike", "hawkish", "beats expectations", "stronger than expected",
+    "inflation rises", "gdp beats", "jobs beat", "raises rates", "tightening",
+]
+BEARISH_KEYWORDS = [
+    "rate cut", "dovish", "misses expectations", "weaker than expected",
+    "recession", "gdp falls", "jobs miss", "cuts rates", "easing", "slowdown",
+]
+RELEVANCE_KEYWORDS = [
+    "cpi", "nfp", "fomc", "inflation", "rate hike", "rate cut", "federal reserve",
+    "ecb", "boe", "boj", "payrolls", "gdp", "ppi", "unemployment", "fed",
+]
 
-        self._quote = {root: {} for _, _, root in symbols}
-        self._dom_bids = {root: [] for _, _, root in symbols}
-        self._dom_asks = {root: [] for _, _, root in symbols}
-        self._ticks = {root: deque(maxlen=6000) for _, _, root in symbols}
-        self._base_bars = {root: pd.DataFrame() for _, _, root in symbols}
+SQUAWK_CHANNELS = [
+    {
+        "name": "Newsquawk",
+        "url": "https://www.newsquawk.com",
+        "desc_en": "Institutional-grade live audio news squawk covering macro, rates and FX.",
+        "desc_am": "ለማክሮ፣ ለወለድ ምጣኔ እና ለውጭ ምንዛሪ ገበያ ተቋማዊ ደረጃ ያለው ቀጥታ የድምጽ ዜና ሽፋን።",
+    },
+    {
+        "name": "Livesquawk",
+        "url": "https://www.livesquawk.com",
+        "desc_en": "Real-time audio and text news squawk service for FX and rates traders.",
+        "desc_am": "ለውጭ ምንዛሪ እና ለወለድ ነጋዴዎች የቀጥታ ጊዜ የድምጽ እና የጽሑፍ ዜና አገልግሎት።",
+    },
+    {
+        "name": "Bloomberg Audio",
+        "url": "https://www.bloomberg.com/audio",
+        "desc_en": "Bloomberg Radio / Surveillance live audio market coverage.",
+        "desc_am": "የብሉምበርግ ራዲዮ/ሰርቬይላንስ ቀጥታ የገበያ የድምጽ ሽፋን።",
+    },
+]
 
-    def set_quote(self, root, updates):
-        with self.lock:
-            self._quote.setdefault(root, {}).update(updates)
+# ============================================================================
+# TRANSLATIONS
+# ============================================================================
 
-    def push_tick(self, root, tick):
-        with self.lock:
-            self._ticks.setdefault(root, deque(maxlen=6000)).append(tick)
+T = {
+    "en": {
+        "app_title": "Institutional Quantitative FX Terminal",
+        "app_subtitle": "7-Phase Quant Engine · SMC/ICT Structure · News Sentiment · Multi-Asset Correlation",
+        "language": "Language",
+        "asset": "Asset",
+        "timeframe": "Timeframe",
+        "refresh": "🔄 Refresh Data",
+        "price": "Price",
+        "atr": "ATR (14)",
+        "rsi": "RSI (14)",
+        "hurst": "Hurst Exponent",
+        "trend": "Trend",
+        "sentiment": "News Sentiment",
+        "overbought": "Overbought",
+        "oversold": "Oversold",
+        "neutral_rsi": "Neutral",
+        "strong_bullish": "Strong Bullish",
+        "strong_bearish": "Strong Bearish",
+        "bullish": "Bullish",
+        "bearish": "Bearish",
+        "neutral": "Neutral",
+        "mean_reverting": "Mean-Reverting (Volatility Spike Risk)",
+        "trending": "Trending / Persistent",
+        "random_walk": "Random Walk / Noise",
+        "chart_title": "Price Action — SMC/ICT Confluence Chart",
+        "smc_panel": "SMC / ICT Structure",
+        "fvg": "Fair Value Gaps",
+        "order_blocks": "Order Blocks",
+        "structure_events": "Structure Events (BOS / Liquidity Sweeps)",
+        "no_fvg": "No recent Fair Value Gaps detected.",
+        "no_ob": "No recent Order Blocks detected.",
+        "no_events": "No recent structure events.",
+        "correlation_panel": "Macro Yield & Correlation",
+        "us10y": "US 10Y Yield (^TNX)",
+        "correlation_label": "Correlation",
+        "correlation_unavailable": "Correlation data unavailable for this timeframe.",
+        "news_panel": "Fundamental News Sentiment",
+        "squawk_panel": "Live Audio Squawk",
+        "no_news": "No headlines available right now.",
+        "gold_note": "Sourced from COMEX Gold futures (GC=F) as a free XAU/USD proxy.",
+        "dxy_error": "Could not build a full DXY basket for this timeframe (thin intraday coverage on one or more component pairs). Try Daily or Weekly.",
+        "data_error": "Unable to retrieve sufficient market data for this asset/timeframe. Try a different selection.",
+        "disclaimer": "For educational and informational purposes only. Not financial advice. Trade at your own risk.",
+        "signals_legend": "▲ Buy confluence   ▼ Sell confluence",
+    },
+    "am": {
+        "app_title": "የተቋማት መጠናዊ የውጭ ምንዛሪ ተርሚናል",
+        "app_subtitle": "7-ደረጃ መጠናዊ ሞተር · SMC/ICT አወቃቀር · የዜና ስሜት · የብዙ ንብረት ትስስር",
+        "language": "ቋንቋ",
+        "asset": "ንብረት",
+        "timeframe": "የጊዜ ገደብ",
+        "refresh": "🔄 መረጃ አድስ",
+        "price": "ዋጋ",
+        "atr": "ATR (14)",
+        "rsi": "RSI (14)",
+        "hurst": "የሁርስት ኤክስፖነንት",
+        "trend": "አዝማሚያ",
+        "sentiment": "የዜና ስሜት",
+        "overbought": "ከመጠን በላይ የተገዛ",
+        "oversold": "ከመጠን በላይ የተሸጠ",
+        "neutral_rsi": "ገለልተኛ",
+        "strong_bullish": "በጣም ወደ ላይ",
+        "strong_bearish": "በጣም ወደ ታች",
+        "bullish": "ወደ ላይ",
+        "bearish": "ወደ ታች",
+        "neutral": "ገለልተኛ",
+        "mean_reverting": "ወደ አማካይ የመመለስ አዝማሚያ (የመዋዠቅ ስጋት)",
+        "trending": "ቀጣይነት ያለው አዝማሚያ",
+        "random_walk": "ዘፈቀደ እንቅስቃሴ / ጫጫታ",
+        "chart_title": "የዋጋ እንቅስቃሴ — SMC/ICT ቻርት",
+        "smc_panel": "SMC / ICT አወቃቀር",
+        "fvg": "የፍትሃዊ ዋጋ ክፍተቶች (FVG)",
+        "order_blocks": "የትዕዛዝ ብሎኮች",
+        "structure_events": "የአወቃቀር ክስተቶች (BOS / የፈሳሽ ማጥመጃ)",
+        "no_fvg": "በቅርብ ጊዜ የፍትሃዊ ዋጋ ክፍተት አልተገኘም።",
+        "no_ob": "በቅርብ ጊዜ የትዕዛዝ ብሎክ አልተገኘም።",
+        "no_events": "በቅርብ ጊዜ የአወቃቀር ክስተት የለም።",
+        "correlation_panel": "የማክሮ ምርት እና ትስስር",
+        "us10y": "የአሜሪካ 10-ዓመት ምርት (^TNX)",
+        "correlation_label": "ትስስር",
+        "correlation_unavailable": "ለዚህ የጊዜ ገደብ የትስስር መረጃ የለም።",
+        "news_panel": "የመሠረታዊ ዜና ስሜት",
+        "squawk_panel": "ቀጥታ የድምጽ ዜና",
+        "no_news": "በአሁኑ ጊዜ ዜናዎች የሉም።",
+        "gold_note": "ከኮሜክስ ወርቅ ፊውቸርስ (GC=F) የተገኘ፣ ለ XAU/USD ነፃ አማራጭ።",
+        "dxy_error": "ለዚህ የጊዜ ገደብ ሙሉ የ DXY ቅርጫት መገንባት አልተቻለም። እባክዎ ዕለታዊ ወይም ሳምንታዊ ይሞክሩ።",
+        "data_error": "ለዚህ ንብረት/የጊዜ ገደብ በቂ የገበያ መረጃ ማግኘት አልተቻለም። እባክዎ ሌላ ይምረጡ።",
+        "disclaimer": "ለትምህርት እና መረጃ አገልግሎት ብቻ። የፋይናንስ ምክር አይደለም። በራስዎ ኃላፊነት ይነግዱ።",
+        "signals_legend": "▲ የግዢ ውህደት   ▼ የሽያጭ ውህደት",
+    },
+}
 
-    def set_dom(self, root, bids=None, asks=None):
-        with self.lock:
-            if bids is not None:
-                self._dom_bids[root] = bids
-            if asks is not None:
-                self._dom_asks[root] = asks
+# ============================================================================
+# PHASE 1 — DATA FETCHING + DXY GEOMETRIC FORMULA
+# ============================================================================
 
-    def merge_base_bars(self, root, new_df: pd.DataFrame):
-        with self.lock:
-            existing = self._base_bars.get(root, pd.DataFrame())
-            merged = new_df if existing.empty else pd.concat([existing, new_df])
-            merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-            if len(merged) > self.max_base_bars:
-                merged = merged.iloc[-self.max_base_bars:]
-            self._base_bars[root] = merged
-
-    def snapshot_quote(self, root):
-        with self.lock:
-            return dict(self._quote.get(root, {}))
-
-    def snapshot_dom(self, root):
-        with self.lock:
-            bids = list(self._dom_bids.get(root, []))
-            asks = list(self._dom_asks.get(root, []))
-        frames = []
-        if bids:
-            b = pd.DataFrame(bids); b["side"] = "bid"; frames.append(b)
-        if asks:
-            a = pd.DataFrame(asks); a["side"] = "ask"; frames.append(a)
-        if not frames:
-            return pd.DataFrame(columns=["price", "qty", "side"])
-        return pd.concat(frames, ignore_index=True)
-
-    def snapshot_base_bars(self, root):
-        with self.lock:
-            df = self._base_bars.get(root, pd.DataFrame())
-            return df.copy() if not df.empty else df
-
-    def snapshot_ticks(self, root):
-        with self.lock:
-            return list(self._ticks.get(root, []))
-
-    def status(self):
-        with self.lock:
-            return {"connected": self.connected, "authorized": self.authorized, "last_error": self.last_error}
-
-
-def resample_bars(base_df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-    """Derive any supported timeframe from the canonical 1-minute base feed."""
-    if base_df.empty:
-        return base_df
-    rule = TIMEFRAME_RULES.get(timeframe, "1min")
-    if rule == "1min":
-        return base_df
-    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    out = base_df.resample(rule).agg(agg).dropna(subset=["Open", "High", "Low", "Close"])
-    return out
-
-# ==================================================================================
-# BACKGROUND RITHMIC WORKER — one asyncio loop on its own thread
-# ==================================================================================
-
-class RithmicMarketDataWorker(threading.Thread):
-    """Owns a dedicated asyncio event loop on a background thread (Streamlit's main
-    thread is sync, async_rithmic is asyncio-native). Connects one RithmicClient,
-    resolves each requested symbol/exchange, and subscribes to:
-      - last-trade ticks         (DataType.LAST_TRADE)
-      - best bid/offer           (DataType.BBO, when supported by the installed lib)
-      - full L2 order book depth (DataType.ORDER_BOOK, when entitled)
-      - live 1-minute time bars  (TimeBarType.MINUTE_BAR, bar_type_period=1)
-    plus a one-time historical 1-minute backfill so charts aren't empty on connect.
-
-    Every callback name/enum is resolved defensively via getattr/hasattr because
-    async_rithmic's exact surface can shift slightly between versions — a missing
-    optional feature (e.g. DOM on an account without that entitlement) degrades
-    to a clear "not available" state in the UI rather than crashing the app.
-    """
-
-    def __init__(self, user, password, system_name, gateway_label, gateway_url, symbols, state: LiveMarketState):
-        super().__init__(daemon=True)
-        self.user = user
-        self.password = password
-        self.system_name = system_name
-        self.gateway_label = gateway_label
-        self.gateway_url = gateway_url
-        self.symbols = symbols  # list of (symbol, exchange, root)
-        self.state = state
-        self.loop = None
-        self.client = None
-        self._resolved_codes = {}  # root -> (security_code, exchange)
-        self._stop_event = threading.Event()
-        self._pending_focus = queue.Queue()  # (root, timeframe) requests from UI thread — reserved for future on-demand subscriptions
-
-    def stop(self):
-        self._stop_event.set()
-        if self.loop is not None:
-            try:
-                asyncio.run_coroutine_threadsafe(self._shutdown(), self.loop)
-            except Exception:
-                pass
-
-    async def _shutdown(self):
-        try:
-            if self.client is not None:
-                await self.client.disconnect()
-        except Exception:
-            pass
-
-    def run(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        try:
-            self.loop.run_until_complete(self._main())
-        except Exception as e:
-            with self.state.lock:
-                self.state.last_error = f"Worker terminated: {e}"
-        finally:
-            with self.state.lock:
-                self.state.connected = False
-                self.state.authorized = False
-
-    async def _main(self):
-        backoff = 2
-        while not self._stop_event.is_set():
-            try:
-                await self._connect_and_stream()
-            except Exception as e:
-                with self.state.lock:
-                    self.state.connected = False
-                    self.state.authorized = False
-                    self.state.last_error = f"Connection dropped: {e}"
-            if self._stop_event.is_set():
-                break
-            await asyncio.sleep(min(backoff, 30))
-            backoff = min(backoff * 2, 30)
-
-    async def _connect_and_stream(self):
-        client_kwargs = dict(
-            user=self.user, password=self.password,
-            system_name=self.system_name, app_name="InstitutionalQuantTerminal",
-            app_version="2.0",
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_ohlc(ticker, period, interval):
+    """Fetch OHLC data for a single ticker via yfinance. Cached 60s."""
+    try:
+        df = yf.download(
+            ticker, period=period, interval=interval,
+            progress=False, auto_adjust=False, threads=False,
         )
-        if Gateway is not None:
-            # Older async_rithmic (<~1.4) — genuine Gateway enum was found at
-            # import time, so use it exactly as that version expects.
-            client_kwargs["gateway"] = resolve_gateway(self.system_name)
-        else:
-            # async_rithmic 1.6.6+ (confirmed): no Gateway enum, connect via
-            # a literal server URL instead.
-            if not self.gateway_url:
-                raise RuntimeError(
-                    "No Gateway URL configured. Your installed async_rithmic has no Gateway "
-                    "enum, so it needs the exact gateway URL from your Rithmic dev-kit/broker "
-                    "welcome email (e.g. 'rituz00100.rithmic.com:443' for the Test system) — "
-                    "enter it in the sidebar's Gateway URL field."
-                )
-            client_kwargs["url"] = self.gateway_url
-
-        # Log the EXACT dict about to be sent, right at the call site — this is
-        # the one place a system_name/url mismatch would actually fail, so this
-        # is where the audit trail matters most (not just at button-click time).
-        redacted = {**client_kwargs, "password": "***redacted***"}
-        logging.getLogger("rithmic_terminal").info("RithmicClient(%s)", redacted)
-        with self.state.lock:
-            self.state.last_error = f"Connecting with: {redacted}"
-
-        self.client = RithmicClient(**client_kwargs)
-
-        # ------------------------------------------------------------------
-        # Isolated connect/login call. async_rithmic's own internals can raise
-        # a raw AttributeError like "'NoneType' object has no attribute
-        # 'heartbeat_interval'" when a plant's login handshake is rejected or
-        # returns an empty response — the library then tries to schedule a
-        # heartbeat against a session object that never got created. That
-        # AttributeError is NOT coming from our code (grep confirms we never
-        # touch `.heartbeat_interval` anywhere), so we can't null-check our
-        # way out of it — but we CAN catch it here specifically, translate it
-        # into an actionable message, and make sure we tear down cleanly
-        # instead of leaving a half-initialized client around for the next
-        # loop iteration to trip over again.
-        # ------------------------------------------------------------------
-        try:
-            await self.client.connect()
-        except Exception as e:
-            is_heartbeat_none_bug = (
-                isinstance(e, AttributeError) and "heartbeat_interval" in str(e)
-            )
-            # socket.gaierror can arrive either directly or wrapped inside
-            # another exception's __cause__/args by asyncio/ssl layers — check
-            # both the exception itself and its string form.
-            is_dns_failure = (
-                isinstance(e, socket.gaierror)
-                or isinstance(getattr(e, "__cause__", None), socket.gaierror)
-                or "gaierror" in str(type(e))
-                or "Name or service not known" in str(e)
-                or "nodename nor servname" in str(e)  # macOS equivalent
-                or "getaddrinfo failed" in str(e)  # Windows equivalent
-            )
-            is_ssl_cert_failure = isinstance(e, ssl.SSLCertVerificationError) or (
-                isinstance(e, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(e)
-            )
-            if is_ssl_cert_failure:
-                translated = (
-                    f"TLS handshake succeeded but the certificate presented by "
-                    f"'{self.gateway_url}' doesn't match that hostname (hostname mismatch). "
-                    "This is NOT something to bypass by disabling certificate verification — "
-                    "doing that would remove protection against a man-in-the-middle on a live "
-                    "trading connection, AND it wouldn't fix the actual problem here. A "
-                    "hostname-mismatch on a *successful* TLS handshake almost always means "
-                    "this address isn't a genuine R|Protocol gateway endpoint — e.g. an "
-                    "OmneVerse discovery/license server hostname (as seen in R|Trader Pro's "
-                    "log files) rather than the actual market-data/order gateway address. "
-                    "Double-check this URL against your broker's Rithmic welcome email or "
-                    f"Rithmic support. Raw error: {e}"
-                )
-            elif isinstance(e, ssl.SSLError):
-                translated = f"TLS/SSL connection error (not a certificate mismatch): {e}"
-            elif is_dns_failure:
-                translated = (
-                    f"DNS lookup failed for '{self.gateway_url}' — this hostname doesn't "
-                    "resolve at all, meaning it's not a real Rithmic server address (a typo, "
-                    "or a guessed hostname that doesn't exist). Rithmic does not publish "
-                    "Paper Trading / regional gateway hostnames anywhere — even other "
-                    "open-source Rithmic API clients (in other languages) ship this as a "
-                    "literal 'ask Rithmic for this' placeholder for every region. Get your "
-                    "real one from your broker's Rithmic welcome email, or by asking your "
-                    f"broker/Rithmic support directly. Raw error: {e}"
-                )
-            elif is_heartbeat_none_bug:
-                translated = (
-                    "Rithmic rejected the login before async_rithmic finished setting up "
-                    "the connection (it then crashed internally trying to schedule a "
-                    "heartbeat against a session that was never created). This is not a bug "
-                    "in this app's code — grep confirms we never access `.heartbeat_interval` "
-                    "ourselves. It almost always means one of: (1) wrong password/User ID, "
-                    "(2) the System Name and Gateway URL don't actually match each other or "
-                    "your account isn't provisioned for that system, or (3) your account "
-                    "hasn't accepted Rithmic's required license/market-data agreements yet "
-                    f"(see rithmic.com/rag_paper.html for demo accounts). Raw error: {e}"
-                )
-            else:
-                translated = f"Login/connect failed: {type(e).__name__}: {e}"
-
-            logging.getLogger("rithmic_terminal").error(
-                "Connect failed for system_name=%r url=%r: %s",
-                self.system_name, self.gateway_url, e, exc_info=True,
-            )
-
-            # Clean teardown: never leave a half-connected client referenced —
-            # abort immediately rather than falling through to subscriptions.
-            with self.state.lock:
-                self.state.connected = False
-                self.state.authorized = False
-                self.state.last_error = translated
-            try:
-                if self.client is not None and hasattr(self.client, "disconnect"):
-                    await self.client.disconnect()
-            except Exception:
-                pass  # already broken — teardown is best-effort, must not mask the original error
-            finally:
-                self.client = None
-
-            raise RuntimeError(translated) from e
-
-        with self.state.lock:
-            self.state.connected = True
-            self.state.authorized = True
-            self.state.last_error = None
-
-        # Wire callbacks (event names verified against async_rithmic's documented
-        # +=/on_ hook pattern; guarded with hasattr so an unsupported hook on an
-        # older/newer library version doesn't take the whole app down).
-        if hasattr(self.client, "on_tick"):
-            self.client.on_tick += self._on_tick
-        if hasattr(self.client, "on_time_bar"):
-            self.client.on_time_bar += self._on_time_bar
-        if hasattr(self.client, "on_order_book"):
-            self.client.on_order_book += self._on_order_book
-        elif hasattr(self.client, "on_market_depth"):
-            self.client.on_market_depth += self._on_order_book
-
-        for symbol, exchange, root in self.symbols:
-            try:
-                security_code = symbol
-                if hasattr(self.client, "get_front_month_contract"):
-                    try:
-                        resolved = await self.client.get_front_month_contract(symbol, exchange)
-                        if resolved:
-                            security_code = resolved
-                    except Exception:
-                        pass  # not every root is a rolling future — fall back to the literal symbol
-                self._resolved_codes[root] = (security_code, exchange)
-
-                if DataType is not None and hasattr(self.client, "subscribe_to_market_data"):
-                    try:
-                        await self.client.subscribe_to_market_data(security_code, exchange, DataType.LAST_TRADE)
-                    except Exception as e:
-                        with self.state.lock:
-                            self.state.last_error = f"{root}: tick subscribe failed ({e})"
-                    if hasattr(DataType, "ORDER_BOOK"):
-                        try:
-                            await self.client.subscribe_to_market_data(security_code, exchange, DataType.ORDER_BOOK)
-                        except Exception:
-                            pass  # DOM entitlement not present on this account/system — module degrades gracefully
-
-                if TimeBarType is not None and hasattr(self.client, "subscribe_to_time_bar_data"):
-                    try:
-                        await self.client.subscribe_to_time_bar_data(
-                            security_code, exchange, TimeBarType.MINUTE_BAR, 1,
-                        )
-                    except Exception as e:
-                        with self.state.lock:
-                            self.state.last_error = f"{root}: time bar subscribe failed ({e})"
-
-                if hasattr(self.client, "get_historical_time_bars"):
-                    try:
-                        end = datetime.now(timezone.utc)
-                        start = end - timedelta(days=HISTORY_BACKFILL_DAYS)
-                        hist = await self.client.get_historical_time_bars(
-                            security_code, exchange, start, end, TimeBarType.MINUTE_BAR, 1,
-                        )
-                        self._ingest_history(root, hist)
-                    except Exception:
-                        pass  # backfill is best-effort; live bars will populate the chart regardless
-            except Exception as e:
-                with self.state.lock:
-                    self.state.last_error = f"Failed to subscribe {root}: {e}"
-
-        # Keep the connection (and this coroutine) alive; callbacks do the work.
-        while not self._stop_event.is_set():
-            await asyncio.sleep(1)
-
-    def _root_for_code(self, security_code, exchange):
-        for root, (code, exch) in self._resolved_codes.items():
-            if code == security_code and exch == exchange:
-                return root
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df[["Open", "High", "Low", "Close"]].dropna()
+        return df if not df.empty else None
+    except Exception:
         return None
 
-    def _ingest_history(self, root, bars):
-        if not bars:
-            return
-        rows = []
-        for b in bars:
-            ts = b.get("timestamp") or b.get("bar_end_datetime") or b.get("datetime")
-            try:
-                idx = pd.to_datetime(ts, utc=True)
-            except Exception:
-                continue
-            rows.append({
-                "timestamp": idx,
-                "Open": b.get("open_price", b.get("open")),
-                "High": b.get("high_price", b.get("high")),
-                "Low": b.get("low_price", b.get("low")),
-                "Close": b.get("close_price", b.get("close")),
-                "Volume": b.get("volume", 0) or 0,
-            })
-        if not rows:
-            return
-        df = pd.DataFrame(rows).dropna(subset=["Open", "High", "Low", "Close"])
-        df = df.drop_duplicates(subset="timestamp").set_index("timestamp").sort_index()
-        self.state.merge_base_bars(root, df)
 
-    async def _on_tick(self, data: dict):
-        root = self._root_for_code(data.get("symbol"), data.get("exchange"))
-        if root is None:
-            return
-        price = data.get("trade_price") or data.get("price")
-        qty = data.get("trade_size") or data.get("size") or 0
-        if price is not None:
-            self.state.set_quote(root, {"last": price, "lastSize": qty})
-            self.state.push_tick(root, {"price": price, "qty": qty, "timestamp": datetime.now(timezone.utc)})
-        bid, ask = data.get("bid_price"), data.get("ask_price")
-        if bid is not None or ask is not None:
-            snap = {}
-            if bid is not None:
-                snap["bidPrice"] = bid; snap["bidSize"] = data.get("bid_size")
-            if ask is not None:
-                snap["askPrice"] = ask; snap["askSize"] = data.get("ask_size")
-            self.state.set_quote(root, snap)
+def compute_dxy_ohlc(period, interval):
+    """Phase 1: build a synthetic DXY OHLC series from the official
+    ICE weighted-geometric-mean formula, applied independently to the
+    Open/High/Low/Close of each component pair."""
+    data = {}
+    for key, ticker in DXY_COMPONENT_TICKERS.items():
+        d = fetch_ohlc(ticker, period, interval)
+        if d is None:
+            return None
+        data[key] = d
 
-    async def _on_time_bar(self, data: dict):
-        root = self._root_for_code(data.get("symbol"), data.get("exchange"))
-        if root is None:
-            return
-        try:
-            idx = pd.to_datetime(data.get("bar_end_datetime") or data.get("timestamp"), utc=True)
-        except Exception:
-            return
-        row = pd.DataFrame([{
-            "Open": data.get("open_price", data.get("open")),
-            "High": data.get("high_price", data.get("high")),
-            "Low": data.get("low_price", data.get("low")),
-            "Close": data.get("close_price", data.get("close")),
-            "Volume": data.get("volume", 0) or 0,
-        }], index=[idx]).dropna(subset=["Open", "High", "Low", "Close"])
-        if not row.empty:
-            self.state.merge_base_bars(root, row)
+    idx = None
+    for d in data.values():
+        idx = d.index if idx is None else idx.intersection(d.index)
+    if idx is None or len(idx) < 5:
+        return None
 
-    async def _on_order_book(self, data: dict):
-        root = self._root_for_code(data.get("symbol"), data.get("exchange"))
-        if root is None:
-            return
-        bids_raw = data.get("bids") or data.get("bid_levels") or []
-        asks_raw = data.get("asks") or data.get("ask_levels") or []
-        bids = [{"price": l.get("price"), "qty": l.get("size", l.get("qty", 0))} for l in bids_raw if l.get("price") is not None]
-        asks = [{"price": l.get("price"), "qty": l.get("size", l.get("qty", 0))} for l in asks_raw if l.get("price") is not None]
-        self.state.set_dom(root, bids=bids or None, asks=asks or None)
+    aligned = {k: d.reindex(idx) for k, d in data.items()}
+    out = pd.DataFrame(index=idx)
+    for col in ["Open", "High", "Low", "Close"]:
+        eur = aligned["EURUSD"][col]
+        jpy = aligned["USDJPY"][col]
+        gbp = aligned["GBPUSD"][col]
+        cad = aligned["USDCAD"][col]
+        sek = aligned["USDSEK"][col]
+        chf = aligned["USDCHF"][col]
+        out[col] = (
+            50.14348112
+            * (eur ** -0.576)
+            * (jpy ** 0.136)
+            * (gbp ** -0.119)
+            * (cad ** 0.091)
+            * (sek ** 0.042)
+            * (chf ** 0.036)
+        )
+    out = out.dropna()
+    return out if not out.empty else None
 
-# ==================================================================================
-# SHARED TECHNICAL UTILITIES
-# ==================================================================================
 
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(period, min_periods=period).mean()
-    avg_loss = loss.rolling(period, min_periods=period).mean()
+def get_price_data(asset_label, period, interval):
+    if asset_label == "DXY Index":
+        return compute_dxy_ohlc(period, interval)
+    ticker = ASSET_TICKERS[asset_label]
+    return fetch_ohlc(ticker, period, interval)
+
+
+# ============================================================================
+# PHASE 2 — VOLATILITY & RANGE ENGINE
+# ============================================================================
+
+def calc_atr(df, period=14):
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def calc_bollinger(df, period=20, num_std=2):
+    mid = df["Close"].rolling(period).mean()
+    std = df["Close"].rolling(period).std()
+    return mid, mid + num_std * std, mid - num_std * std
+
+
+# ============================================================================
+# PHASE 3 — MOMENTUM & TREND ENGINE
+# ============================================================================
+
+def calc_rsi(df, period=14):
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
 
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high_low = df["High"] - df["Low"]
-    high_close = (df["High"] - df["Close"].shift()).abs()
-    low_close = (df["Low"] - df["Close"].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(period, min_periods=1).mean()
 
-def safe_pct(a, b):
-    try:
-        if b == 0 or pd.isna(b):
-            return 0.0
-        return (a - b) / abs(b) * 100
-    except Exception:
-        return 0.0
+def determine_trend(df, ema20, ema50, ema200):
+    last_close = df["Close"].iloc[-1]
+    e20, e50, e200 = ema20.iloc[-1], ema50.iloc[-1], ema200.iloc[-1]
+    if last_close > e20 > e50 > e200:
+        return "strong_bullish"
+    if last_close < e20 < e50 < e200:
+        return "strong_bearish"
+    if last_close > e50:
+        return "bullish"
+    if last_close < e50:
+        return "bearish"
+    return "neutral"
 
-def price_axis_range(*series_list, pad_pct: float = 0.08):
-    values = []
-    for s in series_list:
-        if s is None:
-            continue
-        s = pd.Series(s).dropna()
-        if not s.empty:
-            values.append(s)
-    if not values:
-        return None
-    combined = pd.concat(values)
-    lo = float(combined.min())
-    hi = float(combined.max())
-    if hi <= lo:
-        hi = lo * 1.01 if lo > 0 else lo + 1.0
-    pad = (hi - lo) * pad_pct
-    if pad <= 0:
-        pad = abs(hi) * 0.01 if hi != 0 else 1.0
-    return [lo - pad, hi + pad]
 
-def format_dollars(value: float) -> str:
-    try:
-        value = float(value)
-    except Exception:
-        return "$0"
-    sign = "-" if value < 0 else ""
-    value = abs(value)
-    if value >= 1e9:
-        return f"{sign}${value/1e9:.2f}B"
-    elif value >= 1e6:
-        return f"{sign}${value/1e6:.2f}M"
-    elif value >= 1e3:
-        return f"{sign}${value/1e3:.1f}K"
-    else:
-        return f"{sign}${value:,.0f}"
+# ============================================================================
+# PHASE 4 — SMC / ICT & PRICE ACTION ENGINE
+# ============================================================================
 
-def format_price_level(price: float) -> str:
-    try:
-        price = float(price)
-    except Exception:
-        return "0.00"
-    if abs(price) < 10:
-        return f"{price:,.5f}"
-    elif abs(price) < 1000:
-        return f"{price:,.3f}"
-    else:
-        return f"{price:,.2f}"
-
-def compute_level_dollar_volume(order_book_df: pd.DataFrame, level_price: float, tolerance_pct: float = 0.15) -> float:
-    if order_book_df.empty or level_price <= 0:
-        return 0.0
-    tol = level_price * (tolerance_pct / 100.0)
-    mask = (order_book_df["price"] >= level_price - tol) & (order_book_df["price"] <= level_price + tol)
-    subset = order_book_df[mask]
-    if subset.empty:
-        return 0.0
-    return float((subset["price"] * subset["qty"]).sum())
-
-def isolate_institutional_walls(
-    order_book_df: pd.DataFrame, current_price: float, percentile: float = 80.0,
-    top_n_per_side: int = 5, max_distance_pct: float = 25.0
-) -> pd.DataFrame:
-    if order_book_df.empty:
-        return pd.DataFrame()
-    df = order_book_df.copy()
-    if current_price and current_price > 0:
-        band = current_price * (max_distance_pct / 100.0)
-        df = df[(df["price"] >= current_price - band) & (df["price"] <= current_price + band)]
-    if df.empty:
-        return pd.DataFrame()
-    df["dollar_value"] = df["price"] * df["qty"]
-    threshold = np.percentile(df["dollar_value"], percentile)
-    walls = df[df["dollar_value"] >= threshold].copy()
-    if walls.empty:
-        return pd.DataFrame()
-    bid_walls = walls[walls["side"] == "bid"].sort_values("dollar_value", ascending=False).head(top_n_per_side)
-    ask_walls = walls[walls["side"] == "ask"].sort_values("dollar_value", ascending=False).head(top_n_per_side)
-    return pd.concat([bid_walls, ask_walls], ignore_index=True).sort_values("dollar_value", ascending=False)
-
-def compute_bank_anchor_pnl(walls_df: pd.DataFrame, current_price: float) -> pd.DataFrame:
-    if walls_df.empty or current_price <= 0:
-        return pd.DataFrame()
-    out = walls_df.copy()
-    pnl_vals, position_vals = [], []
-    for _, row in out.iterrows():
-        if row["side"] == "bid":
-            pnl = safe_pct(current_price, row["price"])
-            position_vals.append("Long Anchor (Support)")
-        else:
-            pnl = safe_pct(row["price"], current_price)
-            position_vals.append("Short Anchor (Resistance)")
-        pnl_vals.append(pnl)
-    out["pnl_pct"] = pnl_vals
-    out["position"] = position_vals
-
-    def status(p):
-        if p > 0.5:
-            return "🟢 Expanding Profit"
-        elif p < -0.5:
-            return "🔴 Unwinding / Cutting Loss"
-        else:
-            return "🟡 Building Position"
-
-    out["status"] = out["pnl_pct"].apply(status)
-    return out.sort_values("dollar_value", ascending=False)
-# ==================================================================================
-# MODULE 1 — INSTITUTIONAL ORDER FLOW & LIQUIDITY HEATMAP
-# ==================================================================================
-
-def detect_swings(df: pd.DataFrame, window: int = 5):
-    highs = df["High"].values
-    lows = df["Low"].values
-    n = len(df)
-    swing_highs, swing_lows = [], []
-    for i in range(window, n - window):
-        window_high = highs[i - window: i + window + 1]
-        window_low = lows[i - window: i + window + 1]
-        if highs[i] == window_high.max():
-            swing_highs.append((df.index[i], float(highs[i])))
-        if lows[i] == window_low.min():
-            swing_lows.append((df.index[i], float(lows[i])))
-    return swing_highs, swing_lows
-
-def detect_fvg(df: pd.DataFrame):
-    bullish, bearish = [], []
-    highs = df["High"].values
-    lows = df["Low"].values
-    idx = df.index
+def find_fvg(df):
+    """3-candle Fair Value Gap imbalance detection."""
+    fvgs = []
+    highs, lows, idx = df["High"].values, df["Low"].values, df.index
     for i in range(2, len(df)):
         if lows[i] > highs[i - 2]:
-            bullish.append({"start": idx[i - 2], "end": idx[i], "top": float(lows[i]), "bottom": float(highs[i - 2])})
+            fvgs.append({"type": "bullish", "start_idx": idx[i - 2], "end_idx": idx[i],
+                         "top": lows[i], "bottom": highs[i - 2]})
         if highs[i] < lows[i - 2]:
-            bearish.append({"start": idx[i - 2], "end": idx[i], "top": float(lows[i - 2]), "bottom": float(highs[i])})
-    return bullish, bearish
+            fvgs.append({"type": "bearish", "start_idx": idx[i - 2], "end_idx": idx[i],
+                         "top": lows[i - 2], "bottom": highs[i]})
+    return fvgs
 
-def render_liquidity_module(df: pd.DataFrame, order_book_df: pd.DataFrame, label: str, dom_is_live: bool):
-    st.markdown(
-        '<div class="module-note">Swing-point liquidity pools (BSL/SSL) and Fair Value Gap '
-        'imbalance zones from price-action structure, dynamically annotated with the live '
-        'Rithmic Level 2 DOM ($ resting-order depth), institutional bank-wall isolation, and a '
-        'Bank Anchor PnL Tracker.</div>', unsafe_allow_html=True,
-    )
-    if len(df) < 15:
-        st.warning("Not enough bars streamed yet for this timeframe to compute liquidity structure. "
-                    "Give the feed a few seconds, or pick a lower-granularity interval.")
-        return
 
-    c1, c2, c3 = st.columns(3)
-    window = c1.slider("Swing Sensitivity (lookback bars)", 2, 15, 5, key="liq_window")
-    tolerance = c2.slider("DOM Price Tolerance (%) for $ Volume Aggregation", 0.02, 1.0, 0.15, step=0.02, key="liq_tol")
-    wall_pctl = c3.slider("Institutional Wall Percentile", 50, 99, 80, key="liq_wall_pct")
-    max_zones = st.slider("Max FVG Zones Displayed", 3, 30, 12, key="liq_fvg_count")
+def find_order_blocks(df):
+    """Bullish OB = last down-candle before an up-expansion that clears its high.
+    Bearish OB = last up-candle before a down-expansion that clears its low."""
+    obs = []
+    o, c = df["Open"].values, df["Close"].values
+    h, l = df["High"].values, df["Low"].values
+    idx = df.index
+    for i in range(len(df) - 1):
+        if c[i] < o[i] and c[i + 1] > h[i]:
+            obs.append({"type": "bullish", "idx": idx[i], "top": h[i], "bottom": l[i]})
+        if c[i] > o[i] and c[i + 1] < l[i]:
+            obs.append({"type": "bearish", "idx": idx[i], "top": h[i], "bottom": l[i]})
+    return obs
 
-    swing_highs, swing_lows = detect_swings(df, window=window)
-    bullish_fvg, bearish_fvg = detect_fvg(df)
-    current_price = float(df["Close"].iloc[-1])
 
-    has_dom = dom_is_live and not order_book_df.empty
-    if not has_dom:
-        st.info(
-            "Live Rithmic L2 DOM not yet populated for this symbol — $ volume annotations and "
-            "institutional wall isolation are skipped until the order-book stream delivers its "
-            "first snapshot (or if this account isn't entitled to depth data). Swing/FVG structure "
-            "is still fully computed from streamed price action below."
-        )
-    else:
-        st.markdown(
-            f'<span class="source-badge">🟢 LIVE RITHMIC L2 DOM</span> '
-            f'<span style="color:#8b90a0; font-size:0.8rem;">{len(order_book_df):,} price levels loaded</span>',
-            unsafe_allow_html=True,
-        )
+def find_swings(df, n=3):
+    highs, lows, idx = df["High"].values, df["Low"].values, df.index
+    swing_highs, swing_lows = [], []
+    for i in range(n, len(df) - n):
+        wh = highs[i - n:i + n + 1]
+        wl = lows[i - n:i + n + 1]
+        if highs[i] == wh.max():
+            swing_highs.append((idx[i], highs[i]))
+        if lows[i] == wl.min():
+            swing_lows.append((idx[i], lows[i]))
+    return swing_highs, swing_lows
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("BSL Pools (Swing Highs)", len(swing_highs))
-    c2.metric("SSL Pools (Swing Lows)", len(swing_lows))
-    c3.metric("Bullish FVG Zones", len(bullish_fvg))
-    c4.metric("Bearish FVG Zones", len(bearish_fvg))
 
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-                                  name=label, increasing_line_color="#26a69a", decreasing_line_color="#ef5350"))
+def detect_bos_and_sweeps(df, n=3):
+    """Single-pass detector for Break of Structure (MSS) and liquidity
+    sweeps of the most recent unbroken swing high/low."""
+    swing_highs, swing_lows = find_swings(df, n)
+    sh_map = dict(swing_highs)
+    sl_map = dict(swing_lows)
+    idx = df.index
+    closes, highs, lows = df["Close"].values, df["High"].values, df["Low"].values
+    events = []
+    last_sh = last_sl = None
+    for i in range(len(df)):
+        t = idx[i]
+        if t in sh_map:
+            last_sh = sh_map[t]
+        if t in sl_map:
+            last_sl = sl_map[t]
+        if last_sh is not None:
+            if closes[i] > last_sh:
+                events.append({"type": "BOS_up", "idx": t, "level": last_sh})
+                last_sh = None
+            elif highs[i] > last_sh and closes[i] < last_sh:
+                events.append({"type": "liquidity_sweep_high", "idx": t, "level": last_sh})
+        if last_sl is not None:
+            if closes[i] < last_sl:
+                events.append({"type": "BOS_down", "idx": t, "level": last_sl})
+                last_sl = None
+            elif lows[i] < last_sl and closes[i] > last_sl:
+                events.append({"type": "liquidity_sweep_low", "idx": t, "level": last_sl})
+    return events
 
-    recent_highs = sorted(swing_highs, key=lambda x: x[0])[-8:]
-    recent_lows = sorted(swing_lows, key=lambda x: x[0])[-8:]
 
-    for t, price in recent_highs:
-        dv = compute_level_dollar_volume(order_book_df, price, tolerance) if has_dom else 0.0
-        annot_text = f"BSL @ {format_price_level(price)} ({format_dollars(dv)})" if has_dom else f"BSL @ {format_price_level(price)}"
-        fig.add_shape(type="line", x0=t, x1=df.index[-1], y0=price, y1=price, line=dict(color="#ff5252", width=1, dash="dot"))
-        fig.add_annotation(x=df.index[-1], y=price, text=annot_text, showarrow=False, font=dict(color="#ff5252", size=10), xanchor="left")
+# ============================================================================
+# PHASE 5 — MACRO YIELD & CORRELATION ENGINE
+# ============================================================================
 
-    for t, price in recent_lows:
-        dv = compute_level_dollar_volume(order_book_df, price, tolerance) if has_dom else 0.0
-        annot_text = f"SSL @ {format_price_level(price)} ({format_dollars(dv)})" if has_dom else f"SSL @ {format_price_level(price)}"
-        fig.add_shape(type="line", x0=t, x1=df.index[-1], y0=price, y1=price, line=dict(color="#00e5ff", width=1, dash="dot"))
-        fig.add_annotation(x=df.index[-1], y=price, text=annot_text, showarrow=False, font=dict(color="#00e5ff", size=10), xanchor="left")
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_yield(period, interval):
+    safe_interval = interval if interval in ("1d", "1wk") else "1d"
+    safe_period = period if interval in ("1d", "1wk") else "1y"
+    return fetch_ohlc("^TNX", safe_period, safe_interval)
 
-    for zone in bullish_fvg[-max_zones:]:
-        fig.add_shape(type="rect", x0=zone["start"], x1=df.index[-1], y0=zone["bottom"], y1=zone["top"], fillcolor="rgba(38,166,154,0.18)", line=dict(width=0))
-    for zone in bearish_fvg[-max_zones:]:
-        fig.add_shape(type="rect", x0=zone["start"], x1=df.index[-1], y0=zone["bottom"], y1=zone["top"], fillcolor="rgba(239,83,80,0.18)", line=dict(width=0))
 
-    walls_df = pd.DataFrame()
-    if has_dom:
-        walls_df = isolate_institutional_walls(order_book_df, current_price, percentile=wall_pctl, top_n_per_side=5)
-        for _, w in walls_df.iterrows():
-            fig.add_shape(type="line", x0=df.index[0], x1=df.index[-1], y0=w["price"], y1=w["price"], line=dict(color=PURPLE_WALL, width=2, dash="dash"))
-            side_tag = "BID WALL" if w["side"] == "bid" else "ASK WALL"
-            fig.add_annotation(x=df.index[len(df)//2], y=w["price"],
-                                text=f"🏦 {side_tag} @ {format_price_level(w['price'])}: {format_dollars(w['dollar_value'])}",
-                                showarrow=False, font=dict(color=PURPLE_WALL, size=10), bgcolor="rgba(11,14,20,0.7)")
+def calc_rolling_correlation(series_a, series_b, window=20):
+    a, b = series_a.pct_change(), series_b.pct_change()
+    combined = pd.concat([a, b], axis=1, join="inner").dropna()
+    combined.columns = ["a", "b"]
+    if len(combined) < window:
+        return pd.Series(dtype=float)
+    return combined["a"].rolling(window).corr(combined["b"])
 
-    y_range = price_axis_range(df["Low"], df["High"], pad_pct=0.10)
-    fig.update_layout(template=PLOTLY_TEMPLATE, height=680, xaxis_rangeslider_visible=False, dragmode="pan",
-                       title=f"{label} — Liquidity Pools, Fair Value Gaps & Institutional Bank Walls (Live Rithmic Feed)",
-                       margin=dict(l=10, r=10, t=50, b=10), yaxis=dict(range=y_range, autorange=False if y_range else True))
-    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
-    if has_dom:
-        st.subheader("🏦 Bank Anchor PnL Tracker")
-        if not walls_df.empty:
-            pnl_df = compute_bank_anchor_pnl(walls_df, current_price)
-            net_pnl = float(pnl_df["pnl_pct"].mean())
-            overall_status = ("🟢 Institutional Anchors Net Expanding Profit" if net_pnl > 0.5 else
-                               "🔴 Institutional Anchors Net Unwinding / Taking Profit" if net_pnl < -0.5 else
-                               "🟡 Institutional Anchors Net Neutral / Building Positions")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Net Institutional Anchor PnL", f"{net_pnl:+.2f}%")
-            m2.metric("Institutional Walls Detected", len(pnl_df))
-            m3.metric("Largest Wall $ Value", format_dollars(pnl_df["dollar_value"].max()))
-            st.markdown(f"### {overall_status}")
-            show_cols = ["price", "qty", "side", "dollar_value", "position", "pnl_pct", "status"]
-            display_df = pnl_df[show_cols].rename(columns={
-                "price": "Price", "qty": "Quantity", "side": "Side", "dollar_value": "$ Value",
-                "position": "Anchor Type", "pnl_pct": "Unrealized PnL %", "status": "Status"})
-            display_df["$ Value"] = display_df["$ Value"].apply(format_dollars)
-            display_df["Unrealized PnL %"] = display_df["Unrealized PnL %"].round(2)
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No institutional-sized walls detected above the selected percentile threshold within a realistic band of the current price.")
+# ============================================================================
+# PHASE 6 — MULTI-SOURCE FUNDAMENTAL NEWS ENGINE
+# ============================================================================
 
-    with st.expander("📋 Nearest Liquidity Levels to Current Price"):
-        all_levels = [("BSL", t, p) for t, p in swing_highs] + [("SSL", t, p) for t, p in swing_lows]
-        if all_levels:
-            lvl_df = pd.DataFrame(all_levels, columns=["Type", "Timestamp", "Price"])
-            lvl_df["Distance %"] = lvl_df["Price"].apply(lambda p: safe_pct(p, current_price))
-            if has_dom:
-                lvl_df["$ Volume Nearby"] = lvl_df["Price"].apply(lambda p: format_dollars(compute_level_dollar_volume(order_book_df, p, tolerance)))
-            lvl_df = lvl_df.reindex(lvl_df["Distance %"].abs().sort_values().index).head(10)
-            st.dataframe(lvl_df.set_index("Timestamp"), use_container_width=True)
-        else:
-            st.info("Not enough data to identify swing liquidity levels for the selected window.")
-# ==================================================================================
-# MODULE 2 — QUANTITATIVE ML CLASSIFIER
-# ==================================================================================
-
-def build_ml_features(df: pd.DataFrame) -> pd.DataFrame:
-    feat = pd.DataFrame(index=df.index)
-    feat["return_1"] = df["Close"].pct_change(1)
-    feat["return_3"] = df["Close"].pct_change(3)
-    feat["return_5"] = df["Close"].pct_change(5)
-    feat["rsi_14"] = compute_rsi(df["Close"], 14)
-    feat["atr_14"] = compute_atr(df, 14)
-    feat["volatility_10"] = df["Close"].pct_change().rolling(10).std()
-    feat["ma_10"] = df["Close"].rolling(10).mean()
-    feat["ma_30"] = df["Close"].rolling(30).mean()
-    feat["ma_ratio"] = feat["ma_10"] / feat["ma_30"] - 1
-    feat["momentum_10"] = df["Close"] - df["Close"].shift(10)
-    feat["volume_delta"] = df["Volume"].pct_change().replace([np.inf, -np.inf], 0)
-    feat["hl_range"] = (df["High"] - df["Low"]) / df["Close"]
-    return feat
-
-def render_ml_module(df: pd.DataFrame, label: str):
-    st.markdown(
-        '<div class="module-note">A RandomForest classifier trained live on engineered technical '
-        'features (RSI, ATR, volatility, MA ratios, volume delta, momentum) built from the streamed '
-        'Rithmic bars, estimating the probability of the next-N-bar directional move.</div>',
-        unsafe_allow_html=True,
-    )
-    if len(df) < 80:
-        st.warning("Insufficient bars streamed yet for reliable ML training. Let the feed accumulate "
-                    "more history, or select a lower-granularity interval.")
-        return
-
-    horizon = st.slider("Prediction Horizon (bars ahead)", 1, 10, 3, key="ml_horizon")
-    threshold = st.slider("Move Threshold for Buy/Sell Classification (%)", 0.05, 2.0, 0.15, step=0.05, key="ml_threshold") / 100
-
-    feat = build_ml_features(df)
-    future_return = df["Close"].shift(-horizon) / df["Close"] - 1
-    labels = pd.Series(1, index=df.index)
-    labels[future_return > threshold] = 2
-    labels[future_return < -threshold] = 0
-
-    data = feat.copy()
-    data["target"] = labels
-    data = data.dropna()
-
-    if len(data) < 50 or data["target"].nunique() < 2:
-        st.warning("Not enough class diversity in the streamed sample yet to train a robust classifier.")
-        return
-
-    feature_cols = list(feat.columns)
-    X = data[feature_cols]
-    y = data["target"]
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
+def _parse_feed(url, timeout=6):
     try:
-        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.25, shuffle=False)
-        model = RandomForestClassifier(n_estimators=300, max_depth=6, min_samples_leaf=5,
-                                        random_state=42, class_weight="balanced", n_jobs=-1)
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-        acc = accuracy_score(y_test, preds)
-    except Exception as e:
-        st.error(f"Model training failed: {e}")
-        return
-
-    latest_features = feat.iloc[[-1]].fillna(feat.median(numeric_only=True))
-    latest_scaled = scaler.transform(latest_features)
-    proba = model.predict_proba(latest_scaled)[0]
-    class_order = model.classes_
-    proba_map = {int(c): p for c, p in zip(class_order, proba)}
-    sell_p = proba_map.get(0, 0.0) * 100
-    hold_p = proba_map.get(1, 0.0) * 100
-    buy_p = proba_map.get(2, 0.0) * 100
-    signal = "BUY" if buy_p == max(buy_p, hold_p, sell_p) else ("SELL" if sell_p == max(buy_p, hold_p, sell_p) else "HOLD")
-    signal_color = {"BUY": "#26a69a", "SELL": "#ef5350", "HOLD": "#f0b90b"}[signal]
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Model Accuracy (Test Set)", f"{acc*100:.1f}%")
-    c2.metric("Buy Probability", f"{buy_p:.1f}%")
-    c3.metric("Sell Probability", f"{sell_p:.1f}%")
-    c4.metric("Hold Probability", f"{hold_p:.1f}%")
-    st.markdown(f"<h3 style='color:{signal_color};'>Model Signal: {signal}</h3>", unsafe_allow_html=True)
-
-    col_a, col_b = st.columns([1.3, 1])
-    with col_a:
-        fi = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=True)
-        fig_fi = go.Figure(go.Bar(x=fi.values, y=fi.index, orientation="h", marker_color="#f0b90b"))
-        fig_fi.update_layout(template=PLOTLY_TEMPLATE, height=420, title="Feature Importance", margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
-        st.plotly_chart(fig_fi, use_container_width=True, config=PLOTLY_CONFIG)
-    with col_b:
-        fig_proba = go.Figure(go.Pie(labels=["Sell", "Hold", "Buy"], values=[sell_p, hold_p, buy_p],
-                                      marker=dict(colors=["#ef5350", "#f0b90b", "#26a69a"]), hole=0.55))
-        fig_proba.update_layout(template=PLOTLY_TEMPLATE, height=420, title="Directional Probability", margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig_proba, use_container_width=True, config=PLOTLY_CONFIG)
-
-    st.caption(f"Model trained on {len(X_train)} bars, validated on {len(X_test)} out-of-sample bars for {label} (live Rithmic feed).")
-
-# ==================================================================================
-# MODULE 3 — CROSS-ASSET CORRELATION MATRIX
-# ==================================================================================
-
-def render_correlation_module(daily_bars_by_root: dict, focus_root: str):
-    st.markdown(
-        '<div class="module-note">Cross-asset correlation across every symbol currently streamed '
-        'from Rithmic, computed from their own live daily bars (derived from the 1-minute base '
-        'feed).</div>', unsafe_allow_html=True,
-    )
-    lookback = st.slider("Correlation Lookback (Days)", 10, 365, 90, step=5, key="corr_lookback")
-
-    series_dict, missing = {}, []
-    for root, df in daily_bars_by_root.items():
-        if df.empty:
-            missing.append(root); continue
-        cutoff = df.index.max() - pd.Timedelta(days=lookback)
-        s = df[df.index >= cutoff]["Close"]
-        s.index = s.index.tz_localize(None) if s.index.tz is not None else s.index
-        if not s.empty:
-            series_dict[root] = s
-
-    if missing:
-        st.info(f"Still waiting on daily bars for: {', '.join(missing)}.")
-    if len(series_dict) < 2:
-        st.warning("Need daily bars for at least two symbols to compute correlations — give the feed a few more seconds.")
-        return
-
-    combined = pd.DataFrame(series_dict).dropna(how="all").ffill().dropna()
-    if combined.empty or len(combined) < 5:
-        st.warning("Not enough overlapping daily history across symbols yet for this lookback window.")
-        return
-
-    corr_matrix = combined.corr()
-    fig_heat = go.Figure(go.Heatmap(z=corr_matrix.values, x=corr_matrix.columns, y=corr_matrix.columns,
-                                     colorscale="RdBu", zmin=-1, zmax=1, zmid=0,
-                                     text=np.round(corr_matrix.values, 2), texttemplate="%{text}"))
-    fig_heat.update_layout(template=PLOTLY_TEMPLATE, height=420, title="Cross-Symbol Correlation Matrix",
-                            margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
-    st.plotly_chart(fig_heat, use_container_width=True, config=PLOTLY_CONFIG)
-
-    if focus_root in combined.columns:
-        st.subheader(f"Rolling Correlation vs {focus_root}")
-        rolling_window = min(20, max(5, len(combined) // 3))
-        fig_roll = go.Figure()
-        for col in combined.columns:
-            if col == focus_root:
-                continue
-            rolling_corr = combined[focus_root].rolling(rolling_window).corr(combined[col])
-            fig_roll.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr, mode="lines", name=f"{focus_root} vs {col}"))
-        fig_roll.add_hline(y=0, line_dash="dot", line_color="#666")
-        fig_roll.update_layout(template=PLOTLY_TEMPLATE, height=400, title=f"Rolling {rolling_window}-Day Correlation",
-                                margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
-        st.plotly_chart(fig_roll, use_container_width=True, config=PLOTLY_CONFIG)
-
-    with st.expander("📈 Normalized Performance (Rebased to 100)"):
-        rebased = combined / combined.iloc[0] * 100
-        fig_reb = go.Figure()
-        for col in rebased.columns:
-            fig_reb.add_trace(go.Scatter(x=rebased.index, y=rebased[col], mode="lines", name=col))
-        fig_reb.update_layout(template=PLOTLY_TEMPLATE, height=380, margin=dict(l=10, r=10, t=30, b=10), dragmode="pan")
-        st.plotly_chart(fig_reb, use_container_width=True, config=PLOTLY_CONFIG)
-# ==================================================================================
-# MODULE 4 — VOLUME DELTA & FOOTPRINT IMBALANCE
-# ==================================================================================
-
-def compute_volume_delta_bar_heuristic(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    rng = (out["High"] - out["Low"]).replace(0, np.nan)
-    buy_ratio = ((out["Close"] - out["Low"]) / rng).clip(0, 1).fillna(0.5)
-    out["buy_volume"] = out["Volume"] * buy_ratio
-    out["sell_volume"] = out["Volume"] * (1 - buy_ratio)
-    out["delta"] = out["buy_volume"] - out["sell_volume"]
-    out["cvd"] = out["delta"].cumsum()
-    return out
-
-def compute_volume_delta_from_ticks(df: pd.DataFrame, ticks: list) -> pd.DataFrame:
-    out = df.copy()
-    out["buy_volume"] = 0.0
-    out["sell_volume"] = 0.0
-    if not ticks:
-        return compute_volume_delta_bar_heuristic(df)
-    tick_df = pd.DataFrame(ticks).dropna(subset=["price"])
-    if tick_df.empty:
-        return compute_volume_delta_bar_heuristic(df)
-
-    tick_df = tick_df.sort_values("timestamp")
-    tick_df["price_diff"] = tick_df["price"].diff()
-    side, last_side = [], "buy"
-    for d in tick_df["price_diff"]:
-        if pd.isna(d) or d == 0:
-            side.append(last_side)
-        elif d > 0:
-            side.append("buy"); last_side = "buy"
-        else:
-            side.append("sell"); last_side = "sell"
-    tick_df["side"] = side
-
-    tick_df["timestamp"] = pd.to_datetime(tick_df["timestamp"], utc=True)
-    bin_edges = df.index
-    if bin_edges.tz is None:
-        tick_df["timestamp"] = tick_df["timestamp"].dt.tz_localize(None)
-    tick_df["bar"] = pd.cut(
-        tick_df["timestamp"],
-        bins=list(bin_edges) + [bin_edges[-1] + (bin_edges[-1] - bin_edges[-2] if len(bin_edges) > 1 else pd.Timedelta(minutes=1))],
-        labels=bin_edges, right=False,
-    )
-    grouped = tick_df.groupby(["bar", "side"], observed=True)["qty"].sum().unstack(fill_value=0)
-    if "buy" not in grouped.columns:
-        grouped["buy"] = 0
-    if "sell" not in grouped.columns:
-        grouped["sell"] = 0
-    grouped.index = pd.to_datetime(grouped.index)
-    out.loc[out.index.isin(grouped.index), "buy_volume"] = grouped.reindex(out.index)["buy"].fillna(0)
-    out.loc[out.index.isin(grouped.index), "sell_volume"] = grouped.reindex(out.index)["sell"].fillna(0)
-
-    no_tick_mask = (out["buy_volume"] + out["sell_volume"]) == 0
-    if no_tick_mask.any():
-        heuristic = compute_volume_delta_bar_heuristic(out.loc[no_tick_mask])
-        out.loc[no_tick_mask, "buy_volume"] = heuristic["buy_volume"]
-        out.loc[no_tick_mask, "sell_volume"] = heuristic["sell_volume"]
-
-    out["delta"] = out["buy_volume"] - out["sell_volume"]
-    out["cvd"] = out["delta"].cumsum()
-    return out
-
-def render_volume_delta_module(df: pd.DataFrame, label: str, live_ticks: list, ticks_available: bool):
-    st.markdown(
-        '<div class="module-note">Order-flow reconstruction: buying vs. selling volume classified '
-        'directly from live Rithmic trade prints via the tick rule (uptick = buy-initiated, downtick '
-        '= sell-initiated), aggregated into Cumulative Volume Delta (CVD). Falls back to a '
-        'close-position volume heuristic for any bar streamed before the tick subscription had data.</div>',
-        unsafe_allow_html=True,
-    )
-    if df["Volume"].sum() == 0:
-        st.warning("No volume streamed yet for this symbol/timeframe — Volume Delta requires non-zero volume.")
-
-    if ticks_available:
-        st.markdown('<span class="source-badge">🟢 LIVE TICK-RULE CVD</span>', unsafe_allow_html=True)
-    else:
-        st.markdown('<span class="source-badge">🟡 BAR-HEURISTIC CVD (waiting on live ticks)</span>', unsafe_allow_html=True)
-
-    vd = compute_volume_delta_from_ticks(df, live_ticks) if ticks_available else compute_volume_delta_bar_heuristic(df)
-    z_thresh = st.slider("Imbalance Spike Sensitivity (Z-score)", 1.0, 4.0, 2.0, step=0.25, key="vd_z")
-
-    delta_mean = vd["delta"].mean()
-    delta_std = vd["delta"].std() if vd["delta"].std() > 0 else 1.0
-    vd["delta_z"] = (vd["delta"] - delta_mean) / delta_std
-    spikes = vd[vd["delta_z"].abs() >= z_thresh]
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Net CVD (Session)", f"{vd['delta'].sum():,.0f}")
-    c2.metric("Buy Volume Share", f"{(vd['buy_volume'].sum() / max(vd['Volume'].sum(),1))*100:.1f}%")
-    c3.metric("Imbalance Spikes Detected", len(spikes))
-
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.25, 0.25], vertical_spacing=0.03,
-                         subplot_titles=(f"{label} Price [Live Rithmic Feed]", "Volume Delta (Buy − Sell)", "Cumulative Volume Delta (CVD)"))
-    fig.add_trace(go.Candlestick(x=vd.index, open=vd["Open"], high=vd["High"], low=vd["Low"], close=vd["Close"],
-                                  name=label, increasing_line_color="#26a69a", decreasing_line_color="#ef5350"), row=1, col=1)
-    if not spikes.empty:
-        fig.add_trace(go.Scatter(x=spikes.index, y=spikes["High"] * 1.001, mode="markers", name="Imbalance Spike",
-                                  marker=dict(color="#f0b90b", size=9, symbol="triangle-down")), row=1, col=1)
-    bar_colors = np.where(vd["delta"] >= 0, "#26a69a", "#ef5350")
-    fig.add_trace(go.Bar(x=vd.index, y=vd["delta"], marker_color=bar_colors, name="Delta"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=vd.index, y=vd["cvd"], mode="lines", name="CVD", line=dict(color="#00e5ff", width=2)), row=3, col=1)
-
-    price_range = price_axis_range(vd["Low"], vd["High"], pad_pct=0.06)
-    if price_range:
-        fig.update_yaxes(range=price_range, row=1, col=1)
-    fig.update_layout(template=PLOTLY_TEMPLATE, height=780, showlegend=False, xaxis_rangeslider_visible=False,
-                       margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
-    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
-
-    with st.expander("⚠️ Detected Order Flow Divergence / Imbalance Events"):
-        if not spikes.empty:
-            show_cols = ["Close", "Volume", "buy_volume", "sell_volume", "delta", "delta_z"]
-            st.dataframe(spikes[show_cols].tail(15).round(2), use_container_width=True)
-        else:
-            st.info("No significant volume imbalance spikes detected at the current sensitivity level.")
-
-# ==================================================================================
-# MODULE 5 — OPTIONS GAMMA EXPOSURE (GEX) & MAX PAIN ENGINE
-# ==================================================================================
-# No live listed-options chain source is wired into this build. This module is a
-# pure Black-Scholes gamma-exposure simulation calibrated off each symbol's live
-# Rithmic spot/futures price — the UI labels it as simulated at all times.
-
-def bs_gamma(spot, strike, t_years, iv, r=0.045):
-    try:
-        if t_years <= 0 or iv <= 0 or spot <= 0 or strike <= 0:
-            return 0.0
-        d1 = (math.log(spot / strike) + (r + 0.5 * iv ** 2) * t_years) / (iv * math.sqrt(t_years))
-        pdf = math.exp(-0.5 * d1 ** 2) / math.sqrt(2 * math.pi)
-        return pdf / (spot * iv * math.sqrt(t_years))
+        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        return feedparser.parse(resp.content)
     except Exception:
-        return 0.0
-
-def simulate_gex(spot: float, n_strikes: int = 25, iv: float = 0.18, days_to_expiry: int = 30, seed: int = 7):
-    rng = np.random.default_rng(seed)
-    spacing = spot * 0.01
-    strikes = np.round(spot + np.arange(-n_strikes, n_strikes + 1) * spacing, 2)
-    t_years = max(days_to_expiry, 1) / 365.0
-    distance = np.abs(strikes - spot)
-    base_oi = 5000 * np.exp(-(distance ** 2) / (2 * (spot * 0.05) ** 2))
-    call_oi = np.clip(base_oi * rng.uniform(0.7, 1.3, len(strikes)), 10, None)
-    put_oi = np.clip(base_oi * rng.uniform(0.7, 1.3, len(strikes)), 10, None)
-    gammas = np.array([bs_gamma(spot, k, t_years, iv) for k in strikes])
-    contract_mult = 100
-    call_gex = gammas * call_oi * contract_mult * spot * spot * 0.01
-    put_gex = -gammas * put_oi * contract_mult * spot * spot * 0.01
-    return pd.DataFrame({"strike": strikes, "call_oi": call_oi, "put_oi": put_oi,
-                          "call_gex": call_gex, "put_gex": put_gex, "net_gex": call_gex + put_gex})
-
-def compute_max_pain_from_sim(gex_df: pd.DataFrame):
-    try:
-        strikes = gex_df["strike"].values
-        call_oi = gex_df["call_oi"].values
-        put_oi = gex_df["put_oi"].values
-        pain = []
-        for s in strikes:
-            call_loss = (np.clip(s - strikes, 0, None) * call_oi).sum()
-            put_loss = (np.clip(strikes - s, 0, None) * put_oi).sum()
-            pain.append(call_loss + put_loss)
-        pain = np.array(pain)
-        max_pain_strike = float(strikes[np.argmin(pain)])
-        return max_pain_strike, pd.DataFrame({"strike": strikes, "total_pain": pain})
-    except Exception:
-        return None, pd.DataFrame()
-
-def render_gex_module(root_symbol: str, live_spot, label: str):
-    st.markdown(
-        '<div class="module-note">Simulated Gamma Exposure (GEX) profile — Black-Scholes gamma '
-        'model calibrated off the live Rithmic spot/futures price — identifying illustrative dealer '
-        'positioning, volatility pin zones, and the gamma flip level.</div>', unsafe_allow_html=True,
-    )
-    st.markdown('<span class="source-badge">🟡 SIMULATED (no live options chain source in this build)</span>', unsafe_allow_html=True)
-
-    if not live_spot:
-        st.error(f"No live Rithmic spot price yet for {label} to calibrate the GEX simulation.")
-        return
-
-    dte = st.slider("Simulated Days to Expiry", 1, 90, 30, key="gex_dte")
-    iv_assumed = st.slider("Assumed Implied Volatility (%)", 5, 80, 18, key="gex_iv") / 100
-    n_strikes = st.slider("Strike Range (± strikes around spot)", 10, 40, 25, key="gex_strikes")
-    gex_df = simulate_gex(live_spot, n_strikes=n_strikes, iv=iv_assumed, days_to_expiry=dte)
-    max_pain, pain_df = compute_max_pain_from_sim(gex_df)
-
-    net_gex_total = gex_df["net_gex"].sum()
-    flip_candidates = gex_df.sort_values("strike").copy()
-    flip_candidates["cum_gex"] = flip_candidates["net_gex"].cumsum()
-    sign_changes = flip_candidates[flip_candidates["cum_gex"] * flip_candidates["cum_gex"].shift(1) < 0]
-    gamma_flip = float(sign_changes["strike"].iloc[0]) if not sign_changes.empty else float(gex_df["strike"].median())
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Live Spot", f"{live_spot:,.2f}")
-    c2.metric("Net GEX (simulated)", f"{net_gex_total:,.0f}")
-    c3.metric("Max Pain Strike (simulated)", f"{max_pain:,.2f}" if max_pain is not None else "N/A")
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=gex_df["strike"], y=gex_df["call_gex"], name="Call GEX", marker_color="#26a69a"))
-    fig.add_trace(go.Bar(x=gex_df["strike"], y=gex_df["put_gex"], name="Put GEX", marker_color="#ef5350"))
-    fig.add_vline(x=live_spot, line_dash="dash", line_color="#f0b90b", annotation_text="Spot", annotation_position="top")
-    fig.add_vline(x=gamma_flip, line_dash="dot", line_color="#00e5ff", annotation_text="Gamma Flip", annotation_position="bottom")
-    if max_pain is not None:
-        fig.add_vline(x=max_pain, line_dash="dashdot", line_color=PURPLE_WALL, annotation_text="Max Pain", annotation_position="top")
-    fig.update_layout(template=PLOTLY_TEMPLATE, height=560, barmode="relative",
-                       title=f"{label} — Simulated Gamma Exposure Profile by Strike",
-                       xaxis_title="Strike", yaxis_title="Gamma Exposure", margin=dict(l=10, r=10, t=50, b=10), dragmode="pan")
-    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
-
-    st.info(
-        "Positive net GEX suggests dealers are net long gamma → they hedge by buying dips / selling "
-        "rallies. Negative net GEX suggests dealers are net short gamma → hedging flows can amplify "
-        "moves, increasing realized volatility, especially below the gamma flip level. This entire "
-        "surface is simulated from assumed volatility/OI shape, not sourced from a real options market."
-    )
-# ==================================================================================
-# MODULE 6 — INSTITUTIONAL EXECUTION ALGORITHMS (VWAP / TWAP / ICEBERG)
-# ==================================================================================
-
-def compute_vwap_bands(df: pd.DataFrame):
-    out = df.copy()
-    typical_price = (out["High"] + out["Low"] + out["Close"]) / 3
-    cum_vol = out["Volume"].cumsum().replace(0, np.nan)
-    cum_tp_vol = (typical_price * out["Volume"]).cumsum()
-    out["vwap"] = (cum_tp_vol / cum_vol).ffill().bfill()
-    sq_diff = ((typical_price - out["vwap"]) ** 2) * out["Volume"]
-    cum_sq_diff = sq_diff.cumsum()
-    variance = (cum_sq_diff / cum_vol).replace([np.inf, -np.inf], np.nan).fillna(0)
-    std = np.sqrt(variance)
-    out["vwap_std"] = std
-    out["vwap_u1"] = out["vwap"] + std
-    out["vwap_u2"] = out["vwap"] + 2 * std
-    out["vwap_l1"] = out["vwap"] - std
-    out["vwap_l2"] = out["vwap"] - 2 * std
-    out["twap"] = typical_price.expanding().mean()
-    return out
-
-def detect_icebergs(df: pd.DataFrame, z_thresh: float = 2.5):
-    out = df.copy()
-    price_range = (out["High"] - out["Low"]).replace(0, np.nan)
-    out["vol_range_ratio"] = out["Volume"] / price_range
-    ratio_mean = out["vol_range_ratio"].mean()
-    ratio_std = out["vol_range_ratio"].std() if out["vol_range_ratio"].std() > 0 else 1.0
-    out["vr_z"] = (out["vol_range_ratio"] - ratio_mean) / ratio_std
-    icebergs = out[(out["vr_z"] >= z_thresh)]
-    return out, icebergs
-
-def render_execution_module(df: pd.DataFrame, order_book_df: pd.DataFrame, label: str):
-    st.markdown(
-        '<div class="module-note">Institutional execution benchmarks — VWAP with statistical '
-        'deviation bands, TWAP baseline, and detection of probable iceberg / hidden-order clusters '
-        'from the live Rithmic bar stream, cross-checked against resting DOM size when available.</div>',
-        unsafe_allow_html=True,
-    )
-    if df["Volume"].sum() == 0:
-        st.warning("No volume streamed yet for this symbol — VWAP and iceberg detection require non-zero volume.")
-
-    vwap_df = compute_vwap_bands(df)
-    z_thresh = st.slider("Iceberg Detection Sensitivity (Z-score)", 1.5, 4.0, 2.5, step=0.25, key="ice_z")
-    vwap_df, icebergs = detect_icebergs(vwap_df, z_thresh=z_thresh)
-
-    last_close = vwap_df["Close"].iloc[-1]
-    last_vwap = vwap_df["vwap"].iloc[-1]
-    last_twap = vwap_df["twap"].iloc[-1]
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Current Price", f"{last_close:,.2f}")
-    c2.metric("VWAP", f"{last_vwap:,.2f}", f"{safe_pct(last_close, last_vwap):.2f}%")
-    c3.metric("TWAP", f"{last_twap:,.2f}", f"{safe_pct(last_close, last_twap):.2f}%")
-    c4.metric("Iceberg Clusters Detected", len(icebergs))
-
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=vwap_df.index, open=vwap_df["Open"], high=vwap_df["High"], low=vwap_df["Low"], close=vwap_df["Close"],
-                                  name=label, increasing_line_color="#26a69a", decreasing_line_color="#ef5350"))
-    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap"], mode="lines", name="VWAP", line=dict(color="#f0b90b", width=2)))
-    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["twap"], mode="lines", name="TWAP", line=dict(color=PURPLE_WALL, width=2, dash="dash")))
-    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap_u1"], mode="lines", name="+1 SD", line=dict(color="rgba(38,166,154,0.6)", width=1)))
-    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap_u2"], mode="lines", name="+2 SD", line=dict(color="rgba(38,166,154,0.35)", width=1)))
-    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap_l1"], mode="lines", name="-1 SD", line=dict(color="rgba(239,83,80,0.6)", width=1)))
-    fig.add_trace(go.Scatter(x=vwap_df.index, y=vwap_df["vwap_l2"], mode="lines", name="-2 SD", line=dict(color="rgba(239,83,80,0.35)", width=1)))
-    if not icebergs.empty:
-        fig.add_trace(go.Scatter(x=icebergs.index, y=icebergs["Low"] * 0.999, mode="markers", name="Iceberg Cluster",
-                                  marker=dict(color="#00e5ff", size=10, symbol="diamond")))
-
-    price_range = price_axis_range(vwap_df["Low"], vwap_df["High"], vwap_df["vwap_l2"], vwap_df["vwap_u2"], pad_pct=0.06)
-    fig.update_layout(template=PLOTLY_TEMPLATE, height=650, xaxis_rangeslider_visible=False, dragmode="pan",
-                       title=f"{label} — VWAP / TWAP Execution Benchmarks & Iceberg Detection (Live Rithmic Feed)",
-                       margin=dict(l=10, r=10, t=50, b=10), yaxis=dict(range=price_range, autorange=False if price_range else True))
-    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
-
-    fig_vol = go.Figure(go.Bar(x=vwap_df.index, y=vwap_df["Volume"], marker_color="#5c6bc0", name="Volume"))
-    if not icebergs.empty:
-        fig_vol.add_trace(go.Bar(x=icebergs.index, y=icebergs["Volume"], marker_color="#00e5ff", name="Iceberg Volume"))
-    fig_vol.update_layout(template=PLOTLY_TEMPLATE, height=280, title="Volume Profile & Anomaly Bars", margin=dict(l=10, r=10, t=40, b=10), dragmode="pan")
-    st.plotly_chart(fig_vol, use_container_width=True, config=PLOTLY_CONFIG)
-
-    if not order_book_df.empty:
-        st.subheader("📒 Live DOM Size at Nearest Levels (Iceberg Cross-Check)")
-        near = order_book_df.copy()
-        near["dollar_value"] = near["price"] * near["qty"]
-        near = near.sort_values("dollar_value", ascending=False).head(10)
-        st.dataframe(near.rename(columns={"price": "Price", "qty": "Size", "side": "Side", "dollar_value": "$ Value"}),
-                     use_container_width=True, hide_index=True)
-
-    with st.expander("🧊 Detected Iceberg / Hidden Order Clusters"):
-        if not icebergs.empty:
-            show_cols = ["Close", "Volume", "vol_range_ratio", "vr_z"]
-            st.dataframe(icebergs[show_cols].tail(15).round(3), use_container_width=True)
-        else:
-            st.info("No statistically significant iceberg clusters detected at the current sensitivity level.")
-# ==================================================================================
-# SIDEBAR — Rithmic auth only (no hardcoded credentials, works on share.streamlit.io)
-# ==================================================================================
-
-st.sidebar.markdown("## 📊 Rithmic Quant Terminal")
-
-if RITHMIC_IMPORT_ERROR:
-    st.sidebar.error(f"`async_rithmic` import failed: {RITHMIC_IMPORT_ERROR}")
-    with st.sidebar.expander("🔍 Import diagnostics (send me this if it still fails)"):
-        st.code(RITHMIC_IMPORT_DIAGNOSTICS or "No diagnostics captured.")
-        st.caption(
-            "This shows the *actual* installed async_rithmic version and its real "
-            "exported names — paste it back and I'll wire the exact names your "
-            "installed version uses instead of guessing."
-        )
-
-# ------------------------------------------------------------------------
-# ZERO-TYPING AUTO-CONNECT via st.secrets — this is the mechanism Streamlit
-# itself provides for exactly this need (one-click connect with no runtime
-# typing), WITHOUT the credential living inside app.py's source. app.py never
-# contains your actual password anywhere — only the KEY NAME it expects.
-#
-# Local dev: create .streamlit/secrets.toml (add it to .gitignore!) with:
-#   [rithmic]
-#   user = "your_email@example.com"
-#   password = "your_real_password"
-#   system_name = "Rithmic Paper Trading"
-#   gateway_region = "Chicago Area"
-#   gateway_url = ""   # only if you have a verified server address
-#
-# Streamlit Community Cloud: paste the same TOML into your app's
-# Settings -> Secrets panel (encrypted at rest, never touches git).
-# ------------------------------------------------------------------------
-_secrets = st.secrets.get("rithmic", {}) if hasattr(st, "secrets") else {}
-has_saved_secrets = bool(_secrets.get("user")) and bool(_secrets.get("password"))
-
-if has_saved_secrets:
-    if st.sidebar.button("⚡ Auto-Connect (using saved secrets)", use_container_width=True, type="primary"):
-        st.session_state["rt_user"] = sanitize_input(_secrets.get("user", ""))
-        st.session_state["rt_password"] = sanitize_input(_secrets.get("password", ""))
-        _secret_system = sanitize_input(_secrets.get("system_name", ""))
-        if _secret_system in SYSTEM_NAMES:
-            st.session_state["rt_system_name"] = _secret_system
-        _secret_gateway = sanitize_input(_secrets.get("gateway_region", ""))
-        if _secret_gateway in GATEWAY_REGIONS:
-            st.session_state["rt_gateway_region"] = _secret_gateway
-        if _secrets.get("gateway_url"):
-            st.session_state["rt_gateway_url"] = clean_gateway_url(_secrets["gateway_url"])
-        st.session_state["rt_auto_connect_requested"] = True
-        st.rerun()
-    st.sidebar.caption("Credentials loaded from st.secrets — nothing typed, nothing in this file.")
-else:
-    st.sidebar.info(
-        "No saved secrets found yet. Add a `[rithmic]` section with `user`/`password` to "
-        "`.streamlit/secrets.toml` (local) or your Streamlit Cloud app's Secrets panel to "
-        "enable one-click Auto-Connect. Manual fields below still work in the meantime.",
-        icon="🔒",
-    )
-
-st.sidebar.divider()
-
-st.session_state.setdefault("rt_system_name", "Rithmic Paper Trading")
-st.session_state.setdefault("rt_gateway_region", "Chicago Area")
-
-rt_user = sanitize_input(st.sidebar.text_input("User ID (e.g. your 14-day trial email)", key="rt_user"))
-rt_password = sanitize_input(st.sidebar.text_input("Password", type="password", key="rt_password"))
-rt_system_name = st.sidebar.selectbox(
-    "System", SYSTEM_NAMES, key="rt_system_name",
-    help="Matches R|Trader Pro's 'System' dropdown. Pick 'Custom / Broker-Specific System' if "
-         "your prop firm/broker has its own named system (e.g. shown as their own brand in "
-         "R|Trader Pro's System list).",
-)
-rt_gateway_region = st.sidebar.selectbox(
-    "Gateway", GATEWAY_REGIONS, key="rt_gateway_region",
-    help="Matches R|Trader Pro's 'Gateway' dropdown — pick whichever region you selected there.",
-)
-
-if rt_system_name == "Custom / Broker-Specific System":
-    rt_system_name = sanitize_input(st.sidebar.text_input(
-        "Exact System name (from your broker's R|Trader Pro System list)", key="rt_system_name_custom",
-    ))
-if rt_gateway_region == "Not sure / Custom":
-    rt_gateway_region = sanitize_input(st.sidebar.text_input(
-        "Exact Gateway region (optional label, for your reference)", key="rt_gateway_region_custom", value="",
-    ))
-
-_auto_url = VERIFIED_URL_TABLE.get((rt_system_name, rt_gateway_region), "")
-if _auto_url:
-    st.sidebar.caption(f"✅ Server address resolved automatically: `{_auto_url}`")
-    gateway_url = _auto_url
-else:
-    _raw_gateway_url = st.sidebar.text_input(
-        "Server Address (Rithmic doesn't publish this combo publicly)", key="rt_gateway_url",
-        help=(
-            "Rithmic only publishes ONE System+Gateway → server address pair "
-            "(Rithmic Test). Every other combination — including standard Paper "
-            "Trading regions — is issued privately per developer/broker (confirmed: "
-            "even other open-source Rithmic clients in other languages ship this as "
-            "a literal '{ASK_RITHMIC_FOR_DEV_KIT}' placeholder for every region), so "
-            "I can't pre-fill it without guessing. Get it from your broker's Rithmic "
-            "welcome email, or by asking Rithmic/your broker directly. Paste it in "
-            "as host:port — 'wss://', 'ssl://' etc. prefixes are stripped "
-            "automatically if you include them."
-        ),
-    )
-    gateway_url = clean_gateway_url(_raw_gateway_url)
-    if _raw_gateway_url and gateway_url != _raw_gateway_url.strip():
-        st.sidebar.caption(f"Cleaned to: `{gateway_url}`")
-    if gateway_url and not re.match(r'^[A-Za-z0-9.\-]+:\d{2,5}$', gateway_url):
-        st.sidebar.warning(
-            f"`{gateway_url}` doesn't look like a valid host:port (e.g. "
-            f"`rituz00100.rithmic.com:443`) — double-check it before connecting.",
-            icon="⚠️",
-        )
+        try:
+            return feedparser.parse(url)
+        except Exception:
+            return None
 
 
-gateway_label = f"{rt_system_name} / {rt_gateway_region}"
-rt_symbols_raw = st.sidebar.text_area(
-    "Symbols (SYMBOL:EXCHANGE, comma-separated)", value=DEFAULT_SYMBOLS, key="rt_symbols",
-    help="Any symbol + exchange your Rithmic account is entitled to. Crypto-linked CME futures "
-         "example: BTC:CME, ETH:CME, MBT:CME, MET:CME.",
-)
-connect_clicked = st.sidebar.button("🔌 Connect to Rithmic", use_container_width=True)
-if st.session_state.pop("rt_auto_connect_requested", False):
-    connect_clicked = True
-st.sidebar.caption(
-    "Because 14-day demo credentials expire, just paste your newest Rithmic User ID/Password here "
-    "and click Connect — nothing needs to change in the source code."
-)
-
-if st.session_state.get("rt_last_credentials_debug"):
-    with st.sidebar.expander("🧾 Last credentials sent (password redacted)"):
-        st.json(st.session_state["rt_last_credentials_debug"])
-
-def parse_symbols(raw: str):
-    out = []
-    for chunk in sanitize_input(raw).split(","):
-        chunk = chunk.strip()
-        if not chunk:
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_news():
+    headlines = []
+    for source, url in RSS_FEEDS.items():
+        feed = _parse_feed(url)
+        if feed is None or not getattr(feed, "entries", None):
             continue
-        if ":" in chunk:
-            sym, exch = chunk.split(":", 1)
-        else:
-            sym, exch = chunk, "CME"
-        sym, exch = sym.strip().upper(), exch.strip().upper()
-        out.append((sym, exch, sym))
-    return out
+        for entry in feed.entries[:10]:
+            headlines.append({
+                "source": source,
+                "title": entry.get("title", "").strip(),
+                "published": entry.get("published", entry.get("updated", "")),
+                "link": entry.get("link", ""),
+            })
+    return headlines
 
-# ==================================================================================
-# CONNECTION STATUS BANNER
-# ==================================================================================
 
-st.title("📊 Rithmic Institutional Quantitative Trading Terminal")
+def compute_sentiment(headlines):
+    if not headlines:
+        return "Neutral", 0
+    score, relevant = 0, 0
+    for h in headlines:
+        title = h["title"].lower()
+        if any(k in title for k in RELEVANCE_KEYWORDS):
+            relevant += 1
+            if any(k in title for k in BULLISH_KEYWORDS):
+                score += 1
+            elif any(k in title for k in BEARISH_KEYWORDS):
+                score -= 1
+    if relevant == 0 or score == 0:
+        return "Neutral", score
+    return ("Bullish", score) if score > 0 else ("Bearish", score)
 
-state: LiveMarketState = st.session_state.get("rt_state")
-worker: RithmicMarketDataWorker = st.session_state.get("rt_worker")
-conn_error = st.session_state.get("rt_conn_error")
 
-is_live = bool(worker and worker.is_alive() and state and state.status()["connected"] and state.status()["authorized"])
+# ============================================================================
+# PHASE 7 — HURST EXPONENT ROLLING ENGINE
+# ============================================================================
 
-if is_live:
-    st.markdown(f'<div class="conn-banner-up">🟢 CONNECTED TO {gateway_label.upper()}</div>', unsafe_allow_html=True)
-else:
-    st.markdown('<div class="conn-banner-down">🔴 DISCONNECTED</div>', unsafe_allow_html=True)
+def _hurst_single(ts, min_lag=2, max_lag=13):
+    ts = np.asarray(ts, dtype=float)
+    max_lag = min(max_lag, len(ts) // 2)
+    if max_lag <= min_lag:
+        return np.nan
+    lags = range(min_lag, max_lag)
+    tau = []
+    for lag in lags:
+        diff = ts[lag:] - ts[:-lag]
+        s = np.std(diff)
+        tau.append(s if s > 1e-10 else 1e-10)
+    poly = np.polyfit(np.log(list(lags)), np.log(tau), 1)
+    return poly[0] * 2.0
 
-if conn_error:
-    st.error(f"⚠️ {conn_error}")
-elif state and state.status()["last_error"]:
-    st.warning(f"⚠️ {state.status()['last_error']}")
 
-# ==================================================================================
-# CONNECT ACTION — everything wrapped so failures show as banners, never a traceback
-# ==================================================================================
+def calc_hurst_rolling(series, window=30):
+    values = series.values
+    n = len(values)
+    out = np.full(n, np.nan)
+    for i in range(window, n):
+        try:
+            out[i] = _hurst_single(values[i - window:i])
+        except Exception:
+            out[i] = np.nan
+    return pd.Series(out, index=series.index)
 
-if connect_clicked:
-    st.session_state["rt_conn_error"] = None
-    if RithmicClient is None:
-        st.session_state["rt_conn_error"] = (
-            f"async_rithmic isn't fully resolved yet ({RITHMIC_IMPORT_ERROR or 'unknown reason'}) — "
-            "open the '🔍 Import diagnostics' expander in the sidebar for the exact cause."
-        )
-    elif not rt_user or not rt_password:
-        st.session_state["rt_conn_error"] = "Rithmic User ID and Password are required."
-    elif Gateway is None and not gateway_url:
-        st.session_state["rt_conn_error"] = (
-            "Your installed async_rithmic (1.6.6) has no Gateway enum, so it needs the exact "
-            "Gateway URL from your Rithmic dev-kit/broker welcome email — fill in the "
-            "'Gateway URL' field in the sidebar (e.g. rituz00100.rithmic.com:443 for Test)."
-        )
-    elif not rt_system_name:
-        st.session_state["rt_conn_error"] = "System Name is required (pick a preset above, or fill it in under Custom)."
-    else:
-        symbols = parse_symbols(rt_symbols_raw)
-        if not symbols:
-            st.session_state["rt_conn_error"] = "Enter at least one SYMBOL:EXCHANGE pair."
-        else:
-            try:
-                old_worker = st.session_state.get("rt_worker")
-                if old_worker is not None:
-                    old_worker.stop()
 
-                new_state = LiveMarketState(symbols=symbols)
+# ============================================================================
+# SIGNAL CONFLUENCE (Phase 1-7 combined)
+# ============================================================================
 
-                # Explicit credentials audit trail — printed to the console AND
-                # kept in session_state so the sidebar can show exactly what was
-                # about to be sent, before any connection is attempted. Password
-                # is deliberately redacted from both.
-                debug_creds = {
-                    "system_name": rt_system_name,
-                    "url": gateway_url or "(none — using legacy gateway= enum)",
-                    "user": rt_user,
-                    "domain": (gateway_url.split(":")[0] if gateway_url else None),
-                    "gateway_preset_selected": gateway_label,
-                }
-                logging.getLogger("rithmic_terminal").info(
-                    "Connecting with credentials: %s", {**debug_creds, "password": "***redacted***"}
-                )
-                st.session_state["rt_last_credentials_debug"] = debug_creds
+def generate_confluence_signals(df, obs, hurst_series, lookback=300, hurst_threshold=0.40):
+    signals = []
+    if df.empty:
+        return signals
+    sub = df.tail(lookback)
+    bullish_obs = [o for o in obs if o["type"] == "bullish"][-50:]
+    bearish_obs = [o for o in obs if o["type"] == "bearish"][-50:]
+    close = sub["Close"]
+    for t, price in zip(sub.index, close.values):
+        h = hurst_series.loc[t] if t in hurst_series.index else np.nan
+        if pd.isna(h) or h >= hurst_threshold:
+            continue
+        if any(o["bottom"] <= price <= o["top"] and o["idx"] <= t for o in bullish_obs):
+            signals.append({"idx": t, "price": price, "type": "buy"})
+        elif any(o["bottom"] <= price <= o["top"] and o["idx"] <= t for o in bearish_obs):
+            signals.append({"idx": t, "price": price, "type": "sell"})
+    return signals
 
-                new_worker = RithmicMarketDataWorker(
-                    user=rt_user, password=rt_password, system_name=rt_system_name,
-                    gateway_label=gateway_label, gateway_url=gateway_url,
-                    symbols=symbols, state=new_state,
-                )
-                new_worker.start()
 
-                st.session_state["rt_state"] = new_state
-                st.session_state["rt_worker"] = new_worker
-                st.session_state["rt_symbols_list"] = symbols
-                st.session_state["rt_conn_error"] = None
-                with st.spinner("Authenticating with Rithmic and subscribing to symbols..."):
-                    time.sleep(2.5)  # give the background thread a moment before first rerun
-                st.rerun()
-            except Exception as e:
-                st.session_state["rt_conn_error"] = f"Unexpected error while connecting: {e}"
+# ============================================================================
+# CHART BUILDER
+# ============================================================================
 
-if not is_live:
-    st.info("Enter your Rithmic credentials in the sidebar and click **Connect to Rithmic** to start streaming.")
-    st.caption(
-        "Once connected, quotes, Level 2 DOM (where entitled), tick trades, and multi-timeframe "
-        "candles stream automatically in the background for every symbol you listed."
+def build_chart(df, ema20, ema50, fvgs, obs, signals):
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        name="Price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+    ))
+    fig.add_trace(go.Scatter(x=df.index, y=ema20, name="EMA 20",
+                              line=dict(color="#42a5f5", width=1.3)))
+    fig.add_trace(go.Scatter(x=df.index, y=ema50, name="EMA 50",
+                              line=dict(color="#ffa726", width=1.3)))
+
+    x_end = df.index[-1]
+    for f in fvgs[-20:]:
+        color = "rgba(38,166,154,0.18)" if f["type"] == "bullish" else "rgba(239,83,80,0.18)"
+        fig.add_shape(type="rect", x0=f["start_idx"], x1=x_end, y0=f["bottom"], y1=f["top"],
+                      fillcolor=color, line=dict(width=0), layer="below")
+    for o in obs[-20:]:
+        color = "rgba(66,165,245,0.16)" if o["type"] == "bullish" else "rgba(255,167,38,0.16)"
+        fig.add_shape(type="rect", x0=o["idx"], x1=x_end, y0=o["bottom"], y1=o["top"],
+                      fillcolor=color, line=dict(width=1, color=color), layer="below")
+
+    buys = [s for s in signals if s["type"] == "buy"]
+    sells = [s for s in signals if s["type"] == "sell"]
+    if buys:
+        fig.add_trace(go.Scatter(x=[s["idx"] for s in buys], y=[s["price"] for s in buys],
+                                  mode="markers", name="Buy",
+                                  marker=dict(symbol="triangle-up", size=13, color="#00e676",
+                                              line=dict(width=1, color="#003d1f"))))
+    if sells:
+        fig.add_trace(go.Scatter(x=[s["idx"] for s in sells], y=[s["price"] for s in sells],
+                                  mode="markers", name="Sell",
+                                  marker=dict(symbol="triangle-down", size=13, color="#ff1744",
+                                              line=dict(width=1, color="#3d0009"))))
+
+    fig.update_layout(
+        template="plotly_dark", height=620, xaxis_rangeslider_visible=False,
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h", y=1.03, x=0),
+        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
     )
-    st.stop()
+    return fig
 
-# ==================================================================================
-# SYMBOL FOCUS & INTERVAL (main area — sidebar is reserved for connection controls)
-# ==================================================================================
 
-symbols_list = st.session_state.get("rt_symbols_list", [])
-roots = [root for _, _, root in symbols_list]
+# ============================================================================
+# MAIN APP
+# ============================================================================
 
-focus_col, interval_col = st.columns([2, 1])
-focus_root = focus_col.selectbox("Focused Symbol", roots, key="focus_root")
-interval = interval_col.selectbox("Chart Interval", INTERVAL_CHOICES, index=INTERVAL_CHOICES.index("5m"), key="interval_choice")
+def main():
+    with st.sidebar:
+        st.markdown("## ⚙️ Terminal Settings")
+        lang_choice = st.radio("Language / ቋንቋ",
+                                ["English 🇬🇧", "አማርኛ (Amharic) 🇪🇹"], index=0)
+        lang = "en" if lang_choice.startswith("English") else "am"
+        tr = T[lang]
 
-base_df = state.snapshot_base_bars(focus_root)
-main_df = resample_bars(base_df, interval)
-order_book_df = state.snapshot_dom(focus_root)
-quote_snapshot = state.snapshot_quote(focus_root)
-live_ticks = state.snapshot_ticks(focus_root)
-daily_bars_by_root = {root: resample_bars(state.snapshot_base_bars(root), "1D") for root in roots}
+        st.markdown("---")
+        asset_label = st.selectbox(tr["asset"], list(ASSET_TICKERS.keys()), index=0)
+        timeframe = st.selectbox(tr["timeframe"], list(INTERVAL_PERIOD_MAP.keys()), index=6)
 
-st.caption(f"Focused Symbol: **{focus_root}** · System: {gateway_label} · Interval: {interval}")
-st.markdown(
-    f'<span class="source-badge">📡 CANDLES: RITHMIC TIME BAR STREAM (LIVE, resampled)</span>'
-    f'<span class="source-badge">{"🟢 LIVE L2 DOM" if not order_book_df.empty else "🟡 DOM AWAITING FIRST SNAPSHOT / NOT ENTITLED"}</span>',
-    unsafe_allow_html=True,
-)
+        if asset_label == "XAU/USD (Gold)":
+            st.caption(tr["gold_note"])
 
-if main_df.empty:
-    st.info(f"Waiting on the first live bar snapshot for **{focus_root}** ({interval})...")
-    time.sleep(AUTO_REFRESH_SECONDS)
-    st.rerun()
+        st.markdown("---")
+        if st.button(tr["refresh"], use_container_width=True):
+            st.cache_data.clear()
+        st.caption(tr["disclaimer"])
 
-if len(main_df) < 20:
-    st.warning("Limited bar history streamed so far for this interval — some modules need more bars to compute.")
+    period = INTERVAL_PERIOD_MAP[timeframe]
 
-last_row = main_df.iloc[-1]
-prev_row = main_df.iloc[-2] if len(main_df) > 1 else last_row
-chg = safe_pct(last_row["Close"], prev_row["Close"])
-live_last = quote_snapshot.get("last")
-display_price = live_last if live_last is not None else last_row["Close"]
+    st.title(f"📊 {tr['app_title']}")
+    st.caption(tr["app_subtitle"])
 
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Last Price", f"{display_price:,.2f}", f"{chg:.2f}%")
-m2.metric("Bid / Ask", f"{quote_snapshot.get('bidPrice', '—')} / {quote_snapshot.get('askPrice', '—')}")
-m3.metric("Session High", f"{main_df['High'].max():,.2f}")
-m4.metric("Session Low", f"{main_df['Low'].min():,.2f}")
-m5.metric("Bars Loaded", f"{len(main_df):,}")
+    with st.spinner("..."):
+        df = get_price_data(asset_label, period, timeframe)
 
-st.divider()
+    if df is None or len(df) < 40:
+        st.error("⚠️ " + (tr["dxy_error"] if asset_label == "DXY Index" else tr["data_error"]))
+        st.stop()
 
-# ==================================================================================
-# TAB NAVIGATION — 6 MODULES (each wrapped so a module error is a banner, not a crash)
-# ==================================================================================
+    # ---- Phase 2 / 3 indicators ----
+    atr = calc_atr(df)
+    bb_mid, bb_upper, bb_lower = calc_bollinger(df)
+    rsi = calc_rsi(df)
+    ema20 = df["Close"].ewm(span=20, adjust=False).mean()
+    ema50 = df["Close"].ewm(span=50, adjust=False).mean()
+    ema200 = df["Close"].ewm(span=200, adjust=False).mean()
+    trend = determine_trend(df, ema20, ema50, ema200)
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "🌊 Liquidity & Order Flow", "🤖 ML Classifier", "🔗 Cross-Asset Correlation",
-    "📊 Volume Delta / CVD", "🎯 Options GEX & Max Pain", "⚙️ VWAP / TWAP / Iceberg",
-])
+    # ---- Phase 4 SMC/ICT ----
+    fvgs = find_fvg(df)
+    obs = find_order_blocks(df)
+    structure_events = detect_bos_and_sweeps(df)
 
-with tab1:
-    try:
-        render_liquidity_module(main_df, order_book_df, focus_root, dom_is_live=is_live)
-    except Exception as e:
-        st.error(f"Liquidity module encountered an error: {e}")
+    # ---- Phase 7 Hurst ----
+    hurst_series = calc_hurst_rolling(df["Close"], window=30)
+    hurst_valid = hurst_series.dropna()
+    last_hurst = hurst_valid.iloc[-1] if not hurst_valid.empty else np.nan
 
-with tab2:
-    try:
-        render_ml_module(main_df, focus_root)
-    except Exception as e:
-        st.error(f"ML Classifier module encountered an error: {e}")
+    # ---- Confluence signals (uses Phases 4 + 7) ----
+    signals = generate_confluence_signals(df, obs, hurst_series)
 
-with tab3:
-    try:
-        render_correlation_module(daily_bars_by_root, focus_root)
-    except Exception as e:
-        st.error(f"Correlation module encountered an error: {e}")
+    # ---- Phase 6 news ----
+    headlines = fetch_news()
+    sentiment_label, _ = compute_sentiment(headlines)
 
-with tab4:
-    try:
-        render_volume_delta_module(main_df, focus_root, live_ticks, ticks_available=len(live_ticks) > 20)
-    except Exception as e:
-        st.error(f"Volume Delta module encountered an error: {e}")
+    # ---- Phase 5 macro yield correlation ----
+    yield_df = fetch_yield(period, timeframe)
+    corr_series = None
+    if yield_df is not None:
+        corr_series = calc_rolling_correlation(df["Close"], yield_df["Close"])
 
-with tab5:
-    try:
-        render_gex_module(focus_root, float(display_price) if display_price else None, focus_root)
-    except Exception as e:
-        st.error(f"GEX module encountered an error: {e}")
+    # ================= METRICS ROW =================
+    last_price = df["Close"].iloc[-1]
+    last_atr = atr.iloc[-1] if not atr.dropna().empty else np.nan
+    last_rsi = rsi.iloc[-1] if not rsi.dropna().empty else np.nan
 
-with tab6:
-    try:
-        render_execution_module(main_df, order_book_df, focus_root)
-    except Exception as e:
-        st.error(f"Execution Algorithms module encountered an error: {e}")
+    cols = st.columns(6)
+    cols[0].metric(tr["price"], f"{last_price:,.5f}")
+    cols[1].metric(tr["atr"], f"{last_atr:,.5f}" if not np.isnan(last_atr) else "—")
 
-st.divider()
-st.caption(
-    "⚠️ Disclaimer: research/educational purposes only — not investment advice. "
-    "Trading futures involves substantial risk of loss."
-)
+    rsi_state = (tr["overbought"] if last_rsi > 70 else
+                 tr["oversold"] if last_rsi < 30 else tr["neutral_rsi"])
+    cols[2].metric(tr["rsi"], f"{last_rsi:,.1f}" if not np.isnan(last_rsi) else "—", rsi_state)
 
-time.sleep(AUTO_REFRESH_SECONDS)
-st.rerun()
+    hurst_state = (tr["mean_reverting"] if (not np.isnan(last_hurst) and last_hurst < 0.45) else
+                   tr["trending"] if (not np.isnan(last_hurst) and last_hurst > 0.55) else
+                   tr["random_walk"])
+    cols[3].metric(tr["hurst"], f"{last_hurst:,.2f}" if not np.isnan(last_hurst) else "—")
+
+    cols[4].metric(tr["trend"], tr.get(trend, trend))
+    cols[5].metric(tr["sentiment"], tr.get(sentiment_label.lower(), sentiment_label))
+
+    st.caption(f"🧭 RSI: {rsi_state}   |   🌊 Hurst: {hurst_state}   |   {tr['signals_legend']}")
+
+    # ================= CHART =================
+    st.subheader(tr["chart_title"])
+    fig = build_chart(df, ema20, ema50, fvgs, obs, signals)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ================= PANELS =================
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.subheader(f"🧭 {tr['smc_panel']}")
+
+        st.markdown(f"**{tr['fvg']}** ({len(fvgs)})")
+        if fvgs:
+            for f in fvgs[-5:][::-1]:
+                icon = "🟢" if f["type"] == "bullish" else "🔴"
+                st.write(f"{icon} {f['bottom']:.5f} – {f['top']:.5f}  ·  {f['start_idx']}")
+        else:
+            st.caption(tr["no_fvg"])
+
+        st.markdown(f"**{tr['order_blocks']}** ({len(obs)})")
+        if obs:
+            for o in obs[-5:][::-1]:
+                icon = "🟢" if o["type"] == "bullish" else "🔴"
+                st.write(f"{icon} {o['bottom']:.5f} – {o['top']:.5f}  ·  {o['idx']}")
+        else:
+            st.caption(tr["no_ob"])
+
+        st.markdown(f"**{tr['structure_events']}** ({len(structure_events)})")
+        if structure_events:
+            for e in structure_events[-5:][::-1]:
+                st.write(f"⚡ {e['type']} @ {e['level']:.5f}  ·  {e['idx']}")
+        else:
+            st.caption(tr["no_events"])
+
+    with c2:
+        st.subheader(f"📈 {tr['correlation_panel']}")
+        if corr_series is not None and not corr_series.dropna().empty:
+            last_corr = corr_series.dropna().iloc[-1]
+            st.metric(f"{tr['us10y']} — {tr['correlation_label']}", f"{last_corr:.2f}")
+        else:
+            st.caption(tr["correlation_unavailable"])
+
+        st.subheader(f"📰 {tr['news_panel']}")
+        st.markdown(f"**{tr['sentiment']}: {tr.get(sentiment_label.lower(), sentiment_label)}**")
+        if headlines:
+            for h in headlines[:8]:
+                st.write(f"• [{h['source']}] {h['title']}")
+        else:
+            st.caption(tr["no_news"])
+
+    st.subheader(f"🎙️ {tr['squawk_panel']}")
+    sq_cols = st.columns(len(SQUAWK_CHANNELS))
+    for i, sq in enumerate(SQUAWK_CHANNELS):
+        with sq_cols[i]:
+            st.markdown(f"**[{sq['name']}]({sq['url']})**")
+            st.caption(sq["desc_en"] if lang == "en" else sq["desc_am"])
+
+    st.markdown("---")
+    st.caption(f"{tr['disclaimer']}  ·  Last refreshed {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+
+
+if __name__ == "__main__":
+    main()
