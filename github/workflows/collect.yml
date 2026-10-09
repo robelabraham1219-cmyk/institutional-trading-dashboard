@@ -1,0 +1,43 @@
+name: collect-fx-history
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install yfinance pandas
+      - name: Keep collector outside the working tree
+        run: cp collect.py "$RUNNER_TEMP/collect.py"
+      - name: Switch to the data branch (create it if missing)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin data || true
+          if git show-ref --verify --quiet refs/remotes/origin/data; then
+            git checkout -B data origin/data
+          else
+            git checkout --orphan data
+            git rm -rf . > /dev/null 2>&1 || true
+          fi
+      - name: Collect bars
+        run: python "$RUNNER_TEMP/collect.py"
+      - name: Commit and push to the data branch only
+        run: |
+          git add data
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Update FX history [skip ci]"
+          git push origin data
