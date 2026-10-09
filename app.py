@@ -1,726 +1,654 @@
-"""
-Institutional Quantitative FX Terminal
-========================================
-A single-file Streamlit application combining:
-  Phase 1 - Official DXY geometric-mean formula + multi-asset engine
-  Phase 2 - Volatility & Range engine (ATR, Bollinger Bands)
-  Phase 3 - Momentum & Trend engine (RSI, EMA 20/50/200)
-  Phase 4 - SMC / ICT engine (Fair Value Gaps, Order Blocks, BOS/MSS, liquidity sweeps)
-  Phase 5 - Macro Yield & Correlation engine (US 10Y vs asset)
-  Phase 6 - Multi-source fundamental news sentiment (RSS, no paid API)
-  Phase 7 - Hurst Exponent rolling volatility-regime engine
+"""app.py - mobile-first Streamlit UI for FX regime detection/forecast (DXY focus).
 
-Zero paid API keys. Data: yfinance + feedparser only.
+Analytical tool, not financial advice. Regimes are forecast; direction is shown only as descriptive context.
 """
+from __future__ import annotations
 
+import json
 import time
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import requests
-import feedparser
-import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
+import streamlit.components.v1 as components
 
-# ============================================================================
-# CONFIG / CONSTANTS
-# ============================================================================
+import core
 
-st.set_page_config(
-    page_title="Institutional FX Quant Terminal",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# ----------------------------------------------------------------------------- constants
+LWC_URL = "https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"
+SHORT = ["Stagnant", "Steady", "Choppy", "Volatile"]
 
-ASSET_TICKERS = {
-    "DXY Index": None,          # computed via Phase 1 geometric formula
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "USDJPY=X",
-    "AUD/USD": "AUDUSD=X",
-    "USD/CAD": "USDCAD=X",
-    "XAU/USD (Gold)": "GC=F",   # COMEX Gold futures, most reliable free XAU/USD proxy
-}
 
-DXY_COMPONENT_TICKERS = {
-    "EURUSD": "EURUSD=X",
-    "USDJPY": "USDJPY=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDCAD": "USDCAD=X",
-    "USDSEK": "USDSEK=X",
-    "USDCHF": "USDCHF=X",
-}
-
-# interval -> lookback period, tuned to keep candle counts sane on yfinance's
-# own intraday retention limits (1m ~7d, intraday <60m ~60d, 60m ~730d)
-INTERVAL_PERIOD_MAP = {
-    "1m": "5d",
-    "2m": "5d",
-    "5m": "5d",
-    "15m": "1mo",
-    "30m": "1mo",
-    "60m": "3mo",
-    "1d": "1y",
-    "1wk": "5y",
-}
-
-RSS_FEEDS = {
-    "ForexFactory": "https://www.forexfactory.com/rss.php",
-    "FXStreet": "https://www.fxstreet.com/rss/news",
-    "DailyFX": "https://www.dailyfx.com/feeds/all",
-}
-
-BULLISH_KEYWORDS = [
-    "rate hike", "hawkish", "beats expectations", "stronger than expected",
-    "inflation rises", "gdp beats", "jobs beat", "raises rates", "tightening",
-]
-BEARISH_KEYWORDS = [
-    "rate cut", "dovish", "misses expectations", "weaker than expected",
-    "recession", "gdp falls", "jobs miss", "cuts rates", "easing", "slowdown",
-]
-RELEVANCE_KEYWORDS = [
-    "cpi", "nfp", "fomc", "inflation", "rate hike", "rate cut", "federal reserve",
-    "ecb", "boe", "boj", "payrolls", "gdp", "ppi", "unemployment", "fed",
-]
-
-SQUAWK_CHANNELS = [
-    {
-        "name": "Newsquawk",
-        "url": "https://www.newsquawk.com",
-        "desc_en": "Institutional-grade live audio news squawk covering macro, rates and FX.",
-        "desc_am": "ለማክሮ፣ ለወለድ ምጣኔ እና ለውጭ ምንዛሪ ገበያ ተቋማዊ ደረጃ ያለው ቀጥታ የድምጽ ዜና ሽፋን።",
-    },
-    {
-        "name": "Livesquawk",
-        "url": "https://www.livesquawk.com",
-        "desc_en": "Real-time audio and text news squawk service for FX and rates traders.",
-        "desc_am": "ለውጭ ምንዛሪ እና ለወለድ ነጋዴዎች የቀጥታ ጊዜ የድምጽ እና የጽሑፍ ዜና አገልግሎት።",
-    },
-    {
-        "name": "Bloomberg Audio",
-        "url": "https://www.bloomberg.com/audio",
-        "desc_en": "Bloomberg Radio / Surveillance live audio market coverage.",
-        "desc_am": "የብሉምበርግ ራዲዮ/ሰርቬይላንስ ቀጥታ የገበያ የድምጽ ሽፋን።",
-    },
-]
-
-# ============================================================================
-# TRANSLATIONS
-# ============================================================================
-
-T = {
-    "en": {
-        "app_title": "Institutional Quantitative FX Terminal",
-        "app_subtitle": "7-Phase Quant Engine · SMC/ICT Structure · News Sentiment · Multi-Asset Correlation",
-        "language": "Language",
-        "asset": "Asset",
-        "timeframe": "Timeframe",
-        "refresh": "🔄 Refresh Data",
-        "price": "Price",
-        "atr": "ATR (14)",
-        "rsi": "RSI (14)",
-        "hurst": "Hurst Exponent",
-        "trend": "Trend",
-        "sentiment": "News Sentiment",
-        "overbought": "Overbought",
-        "oversold": "Oversold",
-        "neutral_rsi": "Neutral",
-        "strong_bullish": "Strong Bullish",
-        "strong_bearish": "Strong Bearish",
-        "bullish": "Bullish",
-        "bearish": "Bearish",
-        "neutral": "Neutral",
-        "mean_reverting": "Mean-Reverting (Volatility Spike Risk)",
-        "trending": "Trending / Persistent",
-        "random_walk": "Random Walk / Noise",
-        "chart_title": "Price Action — SMC/ICT Confluence Chart",
-        "smc_panel": "SMC / ICT Structure",
-        "fvg": "Fair Value Gaps",
-        "order_blocks": "Order Blocks",
-        "structure_events": "Structure Events (BOS / Liquidity Sweeps)",
-        "no_fvg": "No recent Fair Value Gaps detected.",
-        "no_ob": "No recent Order Blocks detected.",
-        "no_events": "No recent structure events.",
-        "correlation_panel": "Macro Yield & Correlation",
-        "us10y": "US 10Y Yield (^TNX)",
-        "correlation_label": "Correlation",
-        "correlation_unavailable": "Correlation data unavailable for this timeframe.",
-        "news_panel": "Fundamental News Sentiment",
-        "squawk_panel": "Live Audio Squawk",
-        "no_news": "No headlines available right now.",
-        "gold_note": "Sourced from COMEX Gold futures (GC=F) as a free XAU/USD proxy.",
-        "dxy_error": "Could not build a full DXY basket for this timeframe (thin intraday coverage on one or more component pairs). Try Daily or Weekly.",
-        "data_error": "Unable to retrieve sufficient market data for this asset/timeframe. Try a different selection.",
-        "disclaimer": "For educational and informational purposes only. Not financial advice. Trade at your own risk.",
-        "signals_legend": "▲ Buy confluence   ▼ Sell confluence",
-    },
-    "am": {
-        "app_title": "የተቋማት መጠናዊ የውጭ ምንዛሪ ተርሚናል",
-        "app_subtitle": "7-ደረጃ መጠናዊ ሞተር · SMC/ICT አወቃቀር · የዜና ስሜት · የብዙ ንብረት ትስስር",
-        "language": "ቋንቋ",
-        "asset": "ንብረት",
-        "timeframe": "የጊዜ ገደብ",
-        "refresh": "🔄 መረጃ አድስ",
-        "price": "ዋጋ",
-        "atr": "ATR (14)",
-        "rsi": "RSI (14)",
-        "hurst": "የሁርስት ኤክስፖነንት",
-        "trend": "አዝማሚያ",
-        "sentiment": "የዜና ስሜት",
-        "overbought": "ከመጠን በላይ የተገዛ",
-        "oversold": "ከመጠን በላይ የተሸጠ",
-        "neutral_rsi": "ገለልተኛ",
-        "strong_bullish": "በጣም ወደ ላይ",
-        "strong_bearish": "በጣም ወደ ታች",
-        "bullish": "ወደ ላይ",
-        "bearish": "ወደ ታች",
-        "neutral": "ገለልተኛ",
-        "mean_reverting": "ወደ አማካይ የመመለስ አዝማሚያ (የመዋዠቅ ስጋት)",
-        "trending": "ቀጣይነት ያለው አዝማሚያ",
-        "random_walk": "ዘፈቀደ እንቅስቃሴ / ጫጫታ",
-        "chart_title": "የዋጋ እንቅስቃሴ — SMC/ICT ቻርት",
-        "smc_panel": "SMC / ICT አወቃቀር",
-        "fvg": "የፍትሃዊ ዋጋ ክፍተቶች (FVG)",
-        "order_blocks": "የትዕዛዝ ብሎኮች",
-        "structure_events": "የአወቃቀር ክስተቶች (BOS / የፈሳሽ ማጥመጃ)",
-        "no_fvg": "በቅርብ ጊዜ የፍትሃዊ ዋጋ ክፍተት አልተገኘም።",
-        "no_ob": "በቅርብ ጊዜ የትዕዛዝ ብሎክ አልተገኘም።",
-        "no_events": "በቅርብ ጊዜ የአወቃቀር ክስተት የለም።",
-        "correlation_panel": "የማክሮ ምርት እና ትስስር",
-        "us10y": "የአሜሪካ 10-ዓመት ምርት (^TNX)",
-        "correlation_label": "ትስስር",
-        "correlation_unavailable": "ለዚህ የጊዜ ገደብ የትስስር መረጃ የለም።",
-        "news_panel": "የመሠረታዊ ዜና ስሜት",
-        "squawk_panel": "ቀጥታ የድምጽ ዜና",
-        "no_news": "በአሁኑ ጊዜ ዜናዎች የሉም።",
-        "gold_note": "ከኮሜክስ ወርቅ ፊውቸርስ (GC=F) የተገኘ፣ ለ XAU/USD ነፃ አማራጭ።",
-        "dxy_error": "ለዚህ የጊዜ ገደብ ሙሉ የ DXY ቅርጫት መገንባት አልተቻለም። እባክዎ ዕለታዊ ወይም ሳምንታዊ ይሞክሩ።",
-        "data_error": "ለዚህ ንብረት/የጊዜ ገደብ በቂ የገበያ መረጃ ማግኘት አልተቻለም። እባክዎ ሌላ ይምረጡ።",
-        "disclaimer": "ለትምህርት እና መረጃ አገልግሎት ብቻ። የፋይናንስ ምክር አይደለም። በራስዎ ኃላፊነት ይነግዱ።",
-        "signals_legend": "▲ የግዢ ውህደት   ▼ የሽያጭ ውህደት",
-    },
-}
-
-# ============================================================================
-# PHASE 1 — DATA FETCHING + DXY GEOMETRIC FORMULA
-# ============================================================================
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_ohlc(ticker, period, interval):
-    """Fetch OHLC data for a single ticker via yfinance. Cached 60s."""
+def _secret(name: str, default: str) -> str:
     try:
-        df = yf.download(
-            ticker, period=period, interval=interval,
-            progress=False, auto_adjust=False, threads=False,
-        )
-        if df is None or df.empty:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df[["Open", "High", "Low", "Close"]].dropna()
-        return df if not df.empty else None
+        return str(st.secrets.get(name, default))
     except Exception:
-        return None
+        return default
 
 
-def compute_dxy_ohlc(period, interval):
-    """Phase 1: build a synthetic DXY OHLC series from the official
-    ICE weighted-geometric-mean formula, applied independently to the
-    Open/High/Low/Close of each component pair."""
-    data = {}
-    for key, ticker in DXY_COMPONENT_TICKERS.items():
-        d = fetch_ohlc(ticker, period, interval)
-        if d is None:
-            return None
-        data[key] = d
+OWNER = _secret("OWNER", "")
+REPO = _secret("REPO", "")
+DATA_BRANCH = _secret("DATA_BRANCH", "data")
+CFG = (OWNER, REPO, DATA_BRANCH)
 
-    idx = None
-    for d in data.values():
-        idx = d.index if idx is None else idx.intersection(d.index)
-    if idx is None or len(idx) < 5:
-        return None
-
-    aligned = {k: d.reindex(idx) for k, d in data.items()}
-    out = pd.DataFrame(index=idx)
-    for col in ["Open", "High", "Low", "Close"]:
-        eur = aligned["EURUSD"][col]
-        jpy = aligned["USDJPY"][col]
-        gbp = aligned["GBPUSD"][col]
-        cad = aligned["USDCAD"][col]
-        sek = aligned["USDSEK"][col]
-        chf = aligned["USDCHF"][col]
-        out[col] = (
-            50.14348112
-            * (eur ** -0.576)
-            * (jpy ** 0.136)
-            * (gbp ** -0.119)
-            * (cad ** 0.091)
-            * (sek ** 0.042)
-            * (chf ** 0.036)
-        )
-    out = out.dropna()
-    return out if not out.empty else None
+st.set_page_config(page_title="FX Regime Monitor", layout="wide", initial_sidebar_state="collapsed")
+st.markdown("<style>.block-container{padding:0.6rem 0.7rem 2rem 0.7rem}h1{font-size:1.35rem}"
+            "div[data-testid='stMetricValue']{font-size:1.15rem}</style>", unsafe_allow_html=True)
 
 
-def get_price_data(asset_label, period, interval):
-    if asset_label == "DXY Index":
-        return compute_dxy_ohlc(period, interval)
-    ticker = ASSET_TICKERS[asset_label]
-    return fetch_ohlc(ticker, period, interval)
-
-
-# ============================================================================
-# PHASE 2 — VOLATILITY & RANGE ENGINE
-# ============================================================================
-
-def calc_atr(df, period=14):
-    high, low, close = df["High"], df["Low"], df["Close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-
-def calc_bollinger(df, period=20, num_std=2):
-    mid = df["Close"].rolling(period).mean()
-    std = df["Close"].rolling(period).std()
-    return mid, mid + num_std * std, mid - num_std * std
-
-
-# ============================================================================
-# PHASE 3 — MOMENTUM & TREND ENGINE
-# ============================================================================
-
-def calc_rsi(df, period=14):
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
-
-
-def determine_trend(df, ema20, ema50, ema200):
-    last_close = df["Close"].iloc[-1]
-    e20, e50, e200 = ema20.iloc[-1], ema50.iloc[-1], ema200.iloc[-1]
-    if last_close > e20 > e50 > e200:
-        return "strong_bullish"
-    if last_close < e20 < e50 < e200:
-        return "strong_bearish"
-    if last_close > e50:
-        return "bullish"
-    if last_close < e50:
-        return "bearish"
-    return "neutral"
-
-
-# ============================================================================
-# PHASE 4 — SMC / ICT & PRICE ACTION ENGINE
-# ============================================================================
-
-def find_fvg(df):
-    """3-candle Fair Value Gap imbalance detection."""
-    fvgs = []
-    highs, lows, idx = df["High"].values, df["Low"].values, df.index
-    for i in range(2, len(df)):
-        if lows[i] > highs[i - 2]:
-            fvgs.append({"type": "bullish", "start_idx": idx[i - 2], "end_idx": idx[i],
-                         "top": lows[i], "bottom": highs[i - 2]})
-        if highs[i] < lows[i - 2]:
-            fvgs.append({"type": "bearish", "start_idx": idx[i - 2], "end_idx": idx[i],
-                         "top": lows[i - 2], "bottom": highs[i]})
-    return fvgs
-
-
-def find_order_blocks(df):
-    """Bullish OB = last down-candle before an up-expansion that clears its high.
-    Bearish OB = last up-candle before a down-expansion that clears its low."""
-    obs = []
-    o, c = df["Open"].values, df["Close"].values
-    h, l = df["High"].values, df["Low"].values
-    idx = df.index
-    for i in range(len(df) - 1):
-        if c[i] < o[i] and c[i + 1] > h[i]:
-            obs.append({"type": "bullish", "idx": idx[i], "top": h[i], "bottom": l[i]})
-        if c[i] > o[i] and c[i + 1] < l[i]:
-            obs.append({"type": "bearish", "idx": idx[i], "top": h[i], "bottom": l[i]})
-    return obs
-
-
-def find_swings(df, n=3):
-    highs, lows, idx = df["High"].values, df["Low"].values, df.index
-    swing_highs, swing_lows = [], []
-    for i in range(n, len(df) - n):
-        wh = highs[i - n:i + n + 1]
-        wl = lows[i - n:i + n + 1]
-        if highs[i] == wh.max():
-            swing_highs.append((idx[i], highs[i]))
-        if lows[i] == wl.min():
-            swing_lows.append((idx[i], lows[i]))
-    return swing_highs, swing_lows
-
-
-def detect_bos_and_sweeps(df, n=3):
-    """Single-pass detector for Break of Structure (MSS) and liquidity
-    sweeps of the most recent unbroken swing high/low."""
-    swing_highs, swing_lows = find_swings(df, n)
-    sh_map = dict(swing_highs)
-    sl_map = dict(swing_lows)
-    idx = df.index
-    closes, highs, lows = df["Close"].values, df["High"].values, df["Low"].values
-    events = []
-    last_sh = last_sl = None
-    for i in range(len(df)):
-        t = idx[i]
-        if t in sh_map:
-            last_sh = sh_map[t]
-        if t in sl_map:
-            last_sl = sl_map[t]
-        if last_sh is not None:
-            if closes[i] > last_sh:
-                events.append({"type": "BOS_up", "idx": t, "level": last_sh})
-                last_sh = None
-            elif highs[i] > last_sh and closes[i] < last_sh:
-                events.append({"type": "liquidity_sweep_high", "idx": t, "level": last_sh})
-        if last_sl is not None:
-            if closes[i] < last_sl:
-                events.append({"type": "BOS_down", "idx": t, "level": last_sl})
-                last_sl = None
-            elif lows[i] < last_sl and closes[i] > last_sl:
-                events.append({"type": "liquidity_sweep_low", "idx": t, "level": last_sl})
-    return events
-
-
-# ============================================================================
-# PHASE 5 — MACRO YIELD & CORRELATION ENGINE
-# ============================================================================
-
+# ----------------------------------------------------------------------------- cached loaders
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_yield(period, interval):
-    safe_interval = interval if interval in ("1d", "1wk") else "1d"
-    safe_period = period if interval in ("1d", "1wk") else "1y"
-    return fetch_ohlc("^TNX", safe_period, safe_interval)
+def load_intraday(interval: str, cfg: tuple):
+    """Native intraday download (5 min cache)."""
+    return core.load_native(interval, cfg)
 
 
-def calc_rolling_correlation(series_a, series_b, window=20):
-    a, b = series_a.pct_change(), series_b.pct_change()
-    combined = pd.concat([a, b], axis=1, join="inner").dropna()
-    combined.columns = ["a", "b"]
-    if len(combined) < window:
-        return pd.Series(dtype=float)
-    return combined["a"].rolling(window).corr(combined["b"])
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_daily():
+    """Native daily download (1 h cache)."""
+    return core.load_native("1d", None)
 
 
-# ============================================================================
-# PHASE 6 — MULTI-SOURCE FUNDAMENTAL NEWS ENGINE
-# ============================================================================
-
-def _parse_feed(url, timeout=6):
-    try:
-        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        return feedparser.parse(resp.content)
-    except Exception:
-        try:
-            return feedparser.parse(url)
-        except Exception:
-            return None
+def load(interval: str):
+    return load_daily() if interval == "1d" else load_intraday(interval, CFG)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_news():
-    headlines = []
-    for source, url in RSS_FEEDS.items():
-        feed = _parse_feed(url)
-        if feed is None or not getattr(feed, "entries", None):
-            continue
-        for entry in feed.entries[:10]:
-            headlines.append({
-                "source": source,
-                "title": entry.get("title", "").strip(),
-                "published": entry.get("published", entry.get("updated", "")),
-                "link": entry.get("link", ""),
-            })
-    return headlines
+def get_set(tf: str, anchor: int, choice: str, cfg: tuple, daily_stamp: int):
+    """Closed-bar frames at a timeframe (cached; daily_stamp refreshes hourly for daily-based rungs)."""
+    native, errs = load(core.TF_NATIVE[tf])
+    return core.build_set(native, tf, anchor, choice), errs
 
 
-def compute_sentiment(headlines):
-    if not headlines:
-        return "Neutral", 0
-    score, relevant = 0, 0
-    for h in headlines:
-        title = h["title"].lower()
-        if any(k in title for k in RELEVANCE_KEYWORDS):
-            relevant += 1
-            if any(k in title for k in BULLISH_KEYWORDS):
-                score += 1
-            elif any(k in title for k in BEARISH_KEYWORDS):
-                score -= 1
-    if relevant == 0 or score == 0:
-        return "Neutral", score
-    return ("Bullish", score) if score > 0 else ("Bearish", score)
+def S_for(tf: str, anchor: int, choice: str):
+    stamp = int(time.time() // 3600) if core.TF_NATIVE[tf] == "1d" else 0
+    return get_set(tf, anchor if tf in ("2h", "3h", "4h") else 0, choice, CFG, stamp)
 
 
-# ============================================================================
-# PHASE 7 — HURST EXPONENT ROLLING ENGINE
-# ============================================================================
-
-def _hurst_single(ts, min_lag=2, max_lag=13):
-    ts = np.asarray(ts, dtype=float)
-    max_lag = min(max_lag, len(ts) // 2)
-    if max_lag <= min_lag:
-        return np.nan
-    lags = range(min_lag, max_lag)
-    tau = []
-    for lag in lags:
-        diff = ts[lag:] - ts[:-lag]
-        s = np.std(diff)
-        tau.append(s if s > 1e-10 else 1e-10)
-    poly = np.polyfit(np.log(list(lags)), np.log(tau), 1)
-    return poly[0] * 2.0
+@st.cache_resource(show_spinner=False, max_entries=6)
+def get_ml(symbol, tf, H, qa, qe, atr_n, anchor, choice, last_ts, cfg):
+    """Walk-forward + live model; cached on (symbol, timeframe, H, quantiles, DXY source, last closed bar)."""
+    S, _ = S_for(tf, anchor, choice)
+    df = core.get_series(S, symbol)
+    tgt = core.core_frame(df, atr_n, H)
+    Xb = core.base_features(df, core.neighbour_frames(S, symbol), H, atr_n, tf)
+    return core.run_ml(tgt, Xb, H, qa, qe)
 
 
-def calc_hurst_rolling(series, window=30):
-    values = series.values
-    n = len(values)
-    out = np.full(n, np.nan)
-    for i in range(window, n):
-        try:
-            out[i] = _hurst_single(values[i - window:i])
-        except Exception:
-            out[i] = np.nan
-    return pd.Series(out, index=series.index)
+# ----------------------------------------------------------------------------- small helpers
+def hex_rgba(h: str, a: float) -> str:
+    return f"rgba({int(h[1:3], 16)},{int(h[3:5], 16)},{int(h[5:7], 16)},{a})"
 
 
-# ============================================================================
-# SIGNAL CONFLUENCE (Phase 1-7 combined)
-# ============================================================================
-
-def generate_confluence_signals(df, obs, hurst_series, lookback=300, hurst_threshold=0.40):
-    signals = []
-    if df.empty:
-        return signals
-    sub = df.tail(lookback)
-    bullish_obs = [o for o in obs if o["type"] == "bullish"][-50:]
-    bearish_obs = [o for o in obs if o["type"] == "bearish"][-50:]
-    close = sub["Close"]
-    for t, price in zip(sub.index, close.values):
-        h = hurst_series.loc[t] if t in hurst_series.index else np.nan
-        if pd.isna(h) or h >= hurst_threshold:
-            continue
-        if any(o["bottom"] <= price <= o["top"] and o["idx"] <= t for o in bullish_obs):
-            signals.append({"idx": t, "price": price, "type": "buy"})
-        elif any(o["bottom"] <= price <= o["top"] and o["idx"] <= t for o in bearish_obs):
-            signals.append({"idx": t, "price": price, "type": "sell"})
-    return signals
+def chip(k: int) -> str:
+    c = core.REGIME_COLORS[k]
+    return (f"<span style='background:{hex_rgba(c, .25)};border:1px solid {c};padding:1px 8px;"
+            f"border-radius:10px;font-weight:600'>{core.REGIME_NAMES[k]}</span>")
 
 
-# ============================================================================
-# CHART BUILDER
-# ============================================================================
-
-def build_chart(df, ema20, ema50, fvgs, obs, signals):
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-        name="Price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-    ))
-    fig.add_trace(go.Scatter(x=df.index, y=ema20, name="EMA 20",
-                              line=dict(color="#42a5f5", width=1.3)))
-    fig.add_trace(go.Scatter(x=df.index, y=ema50, name="EMA 50",
-                              line=dict(color="#ffa726", width=1.3)))
-
-    x_end = df.index[-1]
-    for f in fvgs[-20:]:
-        color = "rgba(38,166,154,0.18)" if f["type"] == "bullish" else "rgba(239,83,80,0.18)"
-        fig.add_shape(type="rect", x0=f["start_idx"], x1=x_end, y0=f["bottom"], y1=f["top"],
-                      fillcolor=color, line=dict(width=0), layer="below")
-    for o in obs[-20:]:
-        color = "rgba(66,165,245,0.16)" if o["type"] == "bullish" else "rgba(255,167,38,0.16)"
-        fig.add_shape(type="rect", x0=o["idx"], x1=x_end, y0=o["bottom"], y1=o["top"],
-                      fillcolor=color, line=dict(width=1, color=color), layer="below")
-
-    buys = [s for s in signals if s["type"] == "buy"]
-    sells = [s for s in signals if s["type"] == "sell"]
-    if buys:
-        fig.add_trace(go.Scatter(x=[s["idx"] for s in buys], y=[s["price"] for s in buys],
-                                  mode="markers", name="Buy",
-                                  marker=dict(symbol="triangle-up", size=13, color="#00e676",
-                                              line=dict(width=1, color="#003d1f"))))
-    if sells:
-        fig.add_trace(go.Scatter(x=[s["idx"] for s in sells], y=[s["price"] for s in sells],
-                                  mode="markers", name="Sell",
-                                  marker=dict(symbol="triangle-down", size=13, color="#ff1744",
-                                              line=dict(width=1, color="#3d0009"))))
-
-    fig.update_layout(
-        template="plotly_dark", height=620, xaxis_rangeslider_visible=False,
-        margin=dict(l=10, r=10, t=30, b=10),
-        legend=dict(orientation="h", y=1.03, x=0),
-        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-    )
-    return fig
+def html_table(headers, rows) -> None:
+    th = "".join(f"<th style='text-align:left;padding:2px 6px;font-weight:600'>{h}</th>" for h in headers)
+    body = "".join("<tr>" + "".join(f"<td style='padding:2px 6px'>{c}</td>" for c in r) + "</tr>" for r in rows)
+    st.markdown(f"<table style='font-size:13px;border-collapse:collapse;width:100%'><tr>{th}</tr>{body}</table>",
+                unsafe_allow_html=True)
 
 
-# ============================================================================
-# MAIN APP
-# ============================================================================
+def prob_bars(p) -> str:
+    out = ""
+    for k in range(4):
+        c = core.REGIME_COLORS[k]
+        out += (f"<div style='display:flex;align-items:center;font-size:12px;margin:1px 0'>"
+                f"<span style='width:96px'>{core.REGIME_NAMES[k]}</span>"
+                f"<div style='flex:1;background:#8883;height:8px;border-radius:4px'>"
+                f"<div style='width:{p[k] * 100:.0f}%;background:{c};height:8px;border-radius:4px'></div></div>"
+                f"<span style='width:42px;text-align:right'>{p[k]:.0%}</span></div>")
+    return out
 
-def main():
-    with st.sidebar:
-        st.markdown("## ⚙️ Terminal Settings")
-        lang_choice = st.radio("Language / ቋንቋ",
-                                ["English 🇬🇧", "አማርኛ (Amharic) 🇪🇹"], index=0)
-        lang = "en" if lang_choice.startswith("English") else "am"
-        tr = T[lang]
 
-        st.markdown("---")
-        asset_label = st.selectbox(tr["asset"], list(ASSET_TICKERS.keys()), index=0)
-        timeframe = st.selectbox(tr["timeframe"], list(INTERVAL_PERIOD_MAP.keys()), index=6)
+def span_text(H: int, tf: str) -> str:
+    h = H * core.TF_SECONDS[tf] / 3600.0
+    return f"{h:g} hours" if h < 48 else f"{h / 24:g} days"
 
-        if asset_label == "XAU/USD (Gold)":
-            st.caption(tr["gold_note"])
 
-        st.markdown("---")
-        if st.button(tr["refresh"], use_container_width=True):
-            st.cache_data.clear()
-        st.caption(tr["disclaimer"])
+def disp_secs(idx: pd.DatetimeIndex, tz: str) -> np.ndarray:
+    loc = idx.tz_convert(tz).tz_localize(None)
+    return ((loc - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)).to_numpy().astype("int64")
 
-    period = INTERVAL_PERIOD_MAP[timeframe]
 
-    st.title(f"📊 {tr['app_title']}")
-    st.caption(tr["app_subtitle"])
+def fmt_ts(ts: pd.Timestamp, tz: str) -> str:
+    return ts.tz_convert(tz).strftime("%Y-%m-%d %H:%M") + f" {tz}"
 
-    with st.spinner("..."):
-        df = get_price_data(asset_label, period, timeframe)
 
-    if df is None or len(df) < 40:
-        st.error("⚠️ " + (tr["dxy_error"] if asset_label == "DXY Index" else tr["data_error"]))
-        st.stop()
+def tz_options() -> list:
+    try:
+        import zoneinfo
+        z = sorted(zoneinfo.available_timezones())
+        if "UTC" in z:
+            return z
+    except Exception:
+        pass
+    return ["UTC", "Europe/London", "Europe/Stockholm", "America/New_York", "Asia/Tokyo"]
 
-    # ---- Phase 2 / 3 indicators ----
-    atr = calc_atr(df)
-    bb_mid, bb_upper, bb_lower = calc_bollinger(df)
-    rsi = calc_rsi(df)
-    ema20 = df["Close"].ewm(span=20, adjust=False).mean()
-    ema50 = df["Close"].ewm(span=50, adjust=False).mean()
-    ema200 = df["Close"].ewm(span=200, adjust=False).mean()
-    trend = determine_trend(df, ema20, ema50, ema200)
 
-    # ---- Phase 4 SMC/ICT ----
-    fvgs = find_fvg(df)
-    obs = find_order_blocks(df)
-    structure_events = detect_bos_and_sweeps(df)
+# ----------------------------------------------------------------------------- chart
+def swing_points(h: np.ndarray, l: np.ndarray):
+    """5-bar fractal swing highs/lows (confirmed 2 bars later)."""
+    hi, lo = [], []
+    for i in range(2, len(h) - 2):
+        if h[i] > max(h[i - 2], h[i - 1], h[i + 1], h[i + 2]):
+            hi.append(i)
+        if l[i] < min(l[i - 2], l[i - 1], l[i + 1], l[i + 2]):
+            lo.append(i)
+    return hi, lo
 
-    # ---- Phase 7 Hurst ----
-    hurst_series = calc_hurst_rolling(df["Close"], window=30)
-    hurst_valid = hurst_series.dropna()
-    last_hurst = hurst_valid.iloc[-1] if not hurst_valid.empty else np.nan
 
-    # ---- Confluence signals (uses Phases 4 + 7) ----
-    signals = generate_confluence_signals(df, obs, hurst_series)
+def chart_html(cf, R, theta, gamma, tz, opts, levels, overlay, dark) -> str:
+    """Three synchronized TradingView Lightweight Charts panes (v4 API)."""
+    n0 = len(cf)
+    sl = slice(max(0, n0 - 1500), n0)
+    c = cf.iloc[sl]
+    t = disp_secs(c.index, tz)
+    keep = t > np.r_[-1, t[:-1]]
+    c, t, Rs = c[keep], t[keep], R[sl][keep]
+    e20 = core.ema(cf["close"], 20).iloc[sl][keep].to_numpy()
+    e50 = core.ema(cf["close"], 50).iloc[sl][keep].to_numpy()
 
-    # ---- Phase 6 news ----
-    headlines = fetch_news()
-    sentiment_label, _ = compute_sentiment(headlines)
+    def ser(vals):
+        return [{"time": int(a), "value": float(v)} if np.isfinite(v) else {"time": int(a)} for a, v in zip(t, vals)]
 
-    # ---- Phase 5 macro yield correlation ----
-    yield_df = fetch_yield(period, timeframe)
-    corr_series = None
-    if yield_df is not None:
-        corr_series = calc_rolling_correlation(df["Close"], yield_df["Close"])
+    data = {
+        "dark": dark, "intraday": bool(opts["intraday"]), "n": int(len(c)),
+        "candles": [{"time": int(a), "open": float(o), "high": float(h), "low": float(l), "close": float(k)}
+                    for a, o, h, l, k in zip(t, c["open"], c["high"], c["low"], c["close"])],
+        "regime": [{"time": int(a), "value": 1,
+                    "color": hex_rgba(core.REGIME_COLORS[r], 0.15) if r >= 0 else "rgba(0,0,0,0)"}
+                   for a, r in zip(t, Rs)],
+        "natr": ser(c["natr"].to_numpy()), "er": ser(c["er"].to_numpy()),
+        "theta": float(theta), "gamma": float(gamma), "overlay": overlay, "levels": levels,
+        "ema20": ser(e20) if opts["ema"] else [], "ema50": ser(e50) if opts["ema"] else [],
+        "swh": [], "swl": [], "markers": [],
+    }
+    if opts["swing"]:
+        hi, lo = swing_points(c["high"].to_numpy(), c["low"].to_numpy())
+        data["swh"] = [{"time": int(t[i]), "value": float(c["high"].iloc[i])} for i in hi]
+        data["swl"] = [{"time": int(t[i]), "value": float(c["low"].iloc[i])} for i in lo]
+    if opts["markers"]:
+        ch = np.where((Rs[1:] != Rs[:-1]) & (Rs[1:] >= 0) & (Rs[:-1] >= 0))[0] + 1
+        data["markers"] = [{"time": int(t[i]), "position": "belowBar", "shape": "circle",
+                            "color": core.REGIME_COLORS[Rs[i]], "text": ""} for i in ch]
+    legend = "".join(f"<span style='margin-right:10px'><i style='display:inline-block;width:10px;height:10px;"
+                     f"background:{hex_rgba(col, .6)};border:1px solid {col};margin-right:3px'></i>{nm}</span>"
+                     for col, nm in zip(core.REGIME_COLORS, core.REGIME_NAMES))
+    tpl = """
+<div style="font-family:-apple-system,system-ui,sans-serif;width:100%">
+<div id="c1" style="height:380px;position:relative;width:100%">
+<div id="ov" style="position:absolute;top:6px;left:8px;z-index:5;font-size:11px;background:rgba(20,20,25,.65);color:#eee;padding:3px 6px;border-radius:4px;max-width:90%;pointer-events:none"></div></div>
+<div id="c2" style="height:120px;width:100%"></div><div id="c3" style="height:120px;width:100%"></div>
+<div style="font-size:11px;color:#888;padding:4px 2px;line-height:1.6">__LEGEND__<br>
+pane 2: nATR (dashed = theta) | pane 3: ER (dashed = gamma)</div></div>
+<script src="__URL__"></script>
+<script>
+(function(){
+const D=__DATA__;
+if(typeof LightweightCharts==='undefined'){document.getElementById('c1').innerHTML='<p style="padding:12px;color:#c33">Chart library failed to load (CDN blocked or offline).</p>';return;}
+const bg=D.dark?'#0e1117':'#ffffff',tc=D.dark?'#cbd5e1':'#334155',gc=D.dark?'#1f2937':'#e5e7eb';
+function mk(id,h){const el=document.getElementById(id);return LightweightCharts.createChart(el,{width:el.clientWidth,height:h,
+layout:{background:{type:'solid',color:bg},textColor:tc,fontSize:11},grid:{vertLines:{color:gc},horzLines:{color:gc}},
+rightPriceScale:{borderColor:gc},timeScale:{borderColor:gc,timeVisible:D.intraday,secondsVisible:false,rightOffset:3},
+handleScroll:{vertTouchDrag:false}});}
+const c1=mk('c1',380),c2=mk('c2',120),c3=mk('c3',120);
+const rg=c1.addHistogramSeries({priceScaleId:'regime',priceLineVisible:false,lastValueVisible:false,
+autoscaleInfoProvider:()=>({priceRange:{minValue:0,maxValue:1}})});
+c1.priceScale('regime').applyOptions({scaleMargins:{top:0,bottom:0},visible:false});
+rg.setData(D.regime);
+const cs=c1.addCandlestickSeries({upColor:'#26a69a',downColor:'#ef5350',borderVisible:false,wickUpColor:'#26a69a',wickDownColor:'#ef5350'});
+cs.setData(D.candles);
+function ln(ch,color,data,style){const s=ch.addLineSeries({color:color,lineWidth:1,priceLineVisible:false,lastValueVisible:false,lineStyle:style||0});s.setData(data);return s;}
+if(D.ema20.length){ln(c1,'#facc15',D.ema20);ln(c1,'#a78bfa',D.ema50);}
+if(D.swh.length){ln(c1,'#94a3b8',D.swh,2);}
+if(D.swl.length){ln(c1,'#94a3b8',D.swl,2);}
+if(D.markers.length){cs.setMarkers(D.markers);}
+D.levels.forEach(l=>cs.createPriceLine({price:l.p,color:l.c,lineWidth:1,lineStyle:2,axisLabelVisible:true,title:l.t}));
+const s2=ln(c2,'#38bdf8',D.natr);
+if(isFinite(D.theta))s2.createPriceLine({price:D.theta,color:'#f59e0b',lineWidth:1,lineStyle:2,axisLabelVisible:true,title:'theta'});
+const s3=ln(c3,'#34d399',D.er);
+if(isFinite(D.gamma))s3.createPriceLine({price:D.gamma,color:'#f59e0b',lineWidth:1,lineStyle:2,axisLabelVisible:true,title:'gamma'});
+document.getElementById('ov').innerHTML=D.overlay;
+const cs_=[c1,c2,c3];let lock=false;
+cs_.forEach((ch,i)=>ch.timeScale().subscribeVisibleLogicalRangeChange(r=>{if(lock||!r)return;lock=true;
+cs_.forEach((o,j)=>{if(j!==i)o.timeScale().setVisibleLogicalRange(r);});lock=false;}));
+c1.timeScale().setVisibleLogicalRange({from:Math.max(0,D.n-150),to:D.n+3});
+window.addEventListener('resize',()=>{cs_.forEach((ch,i)=>ch.applyOptions({width:document.getElementById('c'+(i+1)).clientWidth}));});
+})();
+</script>"""
+    return (tpl.replace("__DATA__", json.dumps(data)).replace("__URL__", LWC_URL).replace("__LEGEND__", legend))
 
-    # ================= METRICS ROW =================
-    last_price = df["Close"].iloc[-1]
-    last_atr = atr.iloc[-1] if not atr.dropna().empty else np.nan
-    last_rsi = rsi.iloc[-1] if not rsi.dropna().empty else np.nan
 
-    cols = st.columns(6)
-    cols[0].metric(tr["price"], f"{last_price:,.5f}")
-    cols[1].metric(tr["atr"], f"{last_atr:,.5f}" if not np.isnan(last_atr) else "—")
-
-    rsi_state = (tr["overbought"] if last_rsi > 70 else
-                 tr["oversold"] if last_rsi < 30 else tr["neutral_rsi"])
-    cols[2].metric(tr["rsi"], f"{last_rsi:,.1f}" if not np.isnan(last_rsi) else "—", rsi_state)
-
-    hurst_state = (tr["mean_reverting"] if (not np.isnan(last_hurst) and last_hurst < 0.45) else
-                   tr["trending"] if (not np.isnan(last_hurst) and last_hurst > 0.55) else
-                   tr["random_walk"])
-    cols[3].metric(tr["hurst"], f"{last_hurst:,.2f}" if not np.isnan(last_hurst) else "—")
-
-    cols[4].metric(tr["trend"], tr.get(trend, trend))
-    cols[5].metric(tr["sentiment"], tr.get(sentiment_label.lower(), sentiment_label))
-
-    st.caption(f"🧭 RSI: {rsi_state}   |   🌊 Hurst: {hurst_state}   |   {tr['signals_legend']}")
-
-    # ================= CHART =================
-    st.subheader(tr["chart_title"])
-    fig = build_chart(df, ema20, ema50, fvgs, obs, signals)
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ================= PANELS =================
+# ----------------------------------------------------------------------------- settings
+st.title("FX Regime Monitor")
+with st.expander("Settings", expanded=False):
     c1, c2 = st.columns(2)
+    symbol = c1.selectbox("Instrument", core.TARGETS, index=0)
+    choice = c2.radio("DXY source", ["Auto", "Real", "Synthetic"], horizontal=True)
+    c1, c2 = st.columns(2)
+    tf = c1.selectbox("Timeframe", core.TF_ORDER, index=1)
+    pres = core.PRESETS[tf]
+    labels = [f"{h} bars ({lab})" for h, lab, _ in pres] + ["Custom"]
+    dflt = [i for i, p in enumerate(pres) if p[2]][0]
+    pick = c2.selectbox("Horizon", labels, index=dflt, key=f"hz_{tf}")
+    if pick == "Custom":
+        H = int(st.number_input("Custom horizon (bars)", 3, 300, core.default_H(tf), key=f"hc_{tf}"))
+    else:
+        H = pres[labels.index(pick)][0]
+    H = max(3, H)
+    c1, c2 = st.columns(2)
+    qa = c1.slider("ATR percentile (theta)", 30, 70, 50)
+    qe = c2.slider("ER percentile (gamma)", 30, 70, 50)
+    c1, c2 = st.columns(2)
+    atr_n = int(c1.number_input("ATR length N", 3, 50, 10))
+    tz = c2.selectbox("Timezone", tz_options(), index=tz_options().index("UTC") if "UTC" in tz_options() else 0)
+    anchor = 0
+    if tf in ("2h", "3h", "4h"):
+        b = int(tf[0])
+        anchor = st.slider("UTC anchor offset (hours)", 0, b - 1, 0)
+    t1, t2, t3, t4, t5 = st.columns(5)
+    o_ema = t1.toggle("EMA", True)
+    o_sw = t2.toggle("Swings", False)
+    o_mk = t3.toggle("Changes", True)
+    o_lv = t4.toggle("PDH/PWH", True)
+    o_dark = t5.toggle("Dark", True)
+    if st.button("Refresh data"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
 
-    with c1:
-        st.subheader(f"🧭 {tr['smc_panel']}")
+# ----------------------------------------------------------------------------- data
+with st.spinner("Loading data..."):
+    S0, errs = S_for(tf, anchor, choice)
+    resolved = "Real" if S0["use_real"] else "Synthetic"
+    S, _ = S_for(tf, anchor, resolved)
+df = core.get_series(S, symbol)
+FOOT = "Analytical tool, not financial advice."
+warns = list(errs) + list(S["warnings"])
+if len(df) < 30:
+    st.error("No usable data for this selection (Yahoo returned too little data). Try Refresh data, "
+             "another timeframe, or retry later.")
+    for w in warns:
+        st.warning(w)
+    st.caption(FOOT)
+    st.stop()
 
-        st.markdown(f"**{tr['fvg']}** ({len(fvgs)})")
-        if fvgs:
-            for f in fvgs[-5:][::-1]:
-                icon = "🟢" if f["type"] == "bullish" else "🔴"
-                st.write(f"{icon} {f['bottom']:.5f} – {f['top']:.5f}  ·  {f['start_idx']}")
+now = pd.Timestamp.now(tz="UTC")
+last_ts = df.index[-1]
+cf = core.core_frame(df, atr_n, H)
+with st.spinner("Training CPU regime model (about 20 s on first run)..."):
+    ml = get_ml(symbol, tf, H, qa, qe, atr_n, anchor, resolved, str(last_ts), CFG)
+if ml["ok"]:
+    theta, gamma = ml["theta"], ml["gamma"]
+else:
+    theta, gamma = core.fit_thresholds(cf["natr"], cf["er"], qa, qe)
+R = core.regimes(cf["natr"], cf["er"], theta, gamma)
+ylab = core.make_labels(R, H)
+age_arr = core.run_length(R)
+cur_R = int(R[-1])
+age = int(age_arr[-1])
+live = ml.get("live") if ml["ok"] else None
+bias = core.bias_detail(cf, gamma, H)
+wend = core.window_end(last_ts, tf, H)
+stale = (now.weekday() < 5 and tf in ("30m", "1h", "2h", "3h", "4h", "1D")
+         and (now - last_ts).total_seconds() > (4 * 86400 if tf == "1D" else 3 * core.TF_SECONDS[tf] + 1800))
+if stale:
+    warns.append("Data may be stale: the last closed bar is older than expected for a weekday.")
+if tf == "30m":
+    warns.append("30m: only ~60 days of history are available from Yahoo.")
+if ml["ok"]:
+    warns += ml["warnings"]
+elif ml.get("msg"):
+    warns.append(ml["msg"])
+
+# multi-timeframe table (descriptive)
+rungs = [tf] + [r for r in core.LADDER if core.TF_ORDER.index(r) > core.TF_ORDER.index(tf)]
+mtf = []
+with st.spinner("Building multi-timeframe context..."):
+    for r in rungs:
+        if r == tf:
+            row = core.mtf_row(df, H, qa, qe, atr_n)
         else:
-            st.caption(tr["no_fvg"])
+            Sr, _ = S_for(r, anchor if r in ("2h", "3h", "4h") else 0, resolved)
+            row = core.mtf_row(core.get_series(Sr, symbol), core.default_H(r), qa, qe, atr_n)
+        mtf.append((r, row))
+valid_m = [m for m in mtf if m[1]]
+up = sum(1 for _, m in valid_m if m["bias"] == 1)
+dn = sum(1 for _, m in valid_m if m["bias"] == -1)
+if valid_m and max(up, dn) > 0 and up != dn:
+    align = f"{max(up, dn)} of {len(valid_m)} timeframes: {'up' if up > dn else 'down'} bias"
+elif valid_m:
+    align = f"Mixed: {up} up, {dn} down, {len(valid_m) - up - dn} neutral of {len(valid_m)} timeframes"
+else:
+    align = "Multi-timeframe alignment unavailable (insufficient history)"
 
-        st.markdown(f"**{tr['order_blocks']}** ({len(obs)})")
-        if obs:
-            for o in obs[-5:][::-1]:
-                icon = "🟢" if o["type"] == "bullish" else "🔴"
-                st.write(f"{icon} {o['bottom']:.5f} – {o['top']:.5f}  ·  {o['idx']}")
+# prior day/week levels
+levels = []
+if o_lv:
+    for r, lab_h, lab_l, colr in (("1D", "PDH", "PDL", "#60a5fa"), ("1W", "PWH", "PWL", "#c084fc")):
+        try:
+            Sr, _ = S_for(r, 0, resolved)
+            dd = core.get_series(Sr, symbol)
+            if len(dd):
+                levels += [{"p": float(dd["high"].iloc[-1]), "c": colr, "t": lab_h},
+                           {"p": float(dd["low"].iloc[-1]), "c": colr, "t": lab_l}]
+        except Exception:
+            pass
+
+pip = core.pip_size(symbol)
+atr_pips = cf["atr"].iloc[-1] / pip if np.isfinite(cf["atr"].iloc[-1]) else np.nan
+nat = cf["natr"].dropna()
+nat_pct = float((nat <= nat.iloc[-1]).mean()) if len(nat) else np.nan
+unit = "points" if symbol == "DXY" else "pips"
+prov = (f"Yahoo (free, unofficial) | last closed bar {fmt_ts(last_ts, 'UTC')} | {len(df)} bars | "
+        f"{df.index[0].strftime('%Y-%m-%d')} to {last_ts.strftime('%Y-%m-%d')} | "
+        f"{'derived from ' + core.TF_NATIVE[tf] + ' bars | ' if tf not in ('30m', '1h', '1D') else ''}"
+        f"{S['source_label'] if symbol == 'DXY' else 'DXY neighbour: ' + S['source_label']}"
+        f"{' | synthetic series in use' if (symbol == 'DXY' and not S['use_real']) else ''}")
+
+
+def head() -> None:
+    st.caption(prov)
+    if symbol == "DXY":
+        st.markdown(f"**{S['source_label']}**")
+
+
+T_chart, T_fc, T_dir, T_ctx, T_stats, T_method = st.tabs(
+    ["Chart", "Forecast", "Direction", "Context", "Stats", "Method"])
+
+# ----------------------------------------------------------------------------- Chart tab
+with T_chart:
+    head()
+    for w in warns:
+        st.warning(w)
+    if age <= 3 and age < len(R) and R[-1 - age] >= 0:
+        st.info(f"Regime changed within the last 3 bars (now {core.REGIME_NAMES[cur_R]}).")
+    if live is not None:
+        top = np.argsort(live)[::-1]
+        fc_txt = (f"Model estimate for the next {H} bars (about {span_text(H, tf)}): " +
+                  ", ".join(f"{core.REGIME_NAMES[k]} {live[k]:.0%}" for k in top[:3]) + ".")
+    else:
+        fc_txt = "No model forecast is available for this selection (rule-based layer only)."
+    if ml["ok"]:
+        mb, mn = ml["metrics"][ml["best"]]["bal"], ml["metrics"]["Naive"]["bal"]
+        vs = (f"Out-of-sample balanced accuracy: model {mb:.2f} vs naive persistence {mn:.2f} "
+              f"({'model beat naive' if ml['beats_naive'] else 'model did NOT beat naive'}).")
+    else:
+        vs = "No out-of-sample test was possible."
+    bias_txt = (f"Direction context (past bars, not a forecast): {bias.get('label', 'n/a')}; {align}." if bias else "")
+    st.info(f"{symbol} {tf} is in the **{core.REGIME_NAMES[cur_R]}** regime (age {age} bars). {fc_txt} {bias_txt} "
+            f"ATR is {atr_pips:.{2 if symbol == 'DXY' else 1}f} {unit}. {vs}")
+    c1, c2 = st.columns(2)
+    c1.markdown(f"**Current regime**<br>{chip(cur_R)} age {age} bars", unsafe_allow_html=True)
+    if live is not None:
+        k = int(np.argmax(live))
+        c2.markdown(f"**Next {H} bars** (model estimate)<br>{chip(k)} {live[k]:.0%}", unsafe_allow_html=True)
+        c2.markdown(prob_bars(live), unsafe_allow_html=True)
+    else:
+        c2.markdown("**Next bars**<br>forecast unavailable", unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    c1.markdown(f"**Direction bias**<br>{bias.get('label', 'n/a')} <span style='font-size:12px'>"
+                f"(describes past bars)</span>", unsafe_allow_html=True)
+    c2.markdown(f"**Multi-timeframe**<br>{align}", unsafe_allow_html=True)
+    if live is not None:
+        ov_fc = " ".join(f"<span style='color:{core.REGIME_COLORS[k]}'>{core.REGIME_NAMES[k]} {live[k]:.0%}</span>"
+                         for k in np.argsort(live)[::-1][:3])
+    else:
+        ov_fc = "n/a"
+    overlay = (f"Now: <b style='color:{core.REGIME_COLORS[cur_R]}'>{core.REGIME_NAMES[cur_R]}</b> (age {age} bars)"
+               f" | Next {H} bars: {ov_fc}")
+    components.html(chart_html(cf, R, theta, gamma, tz, {"ema": o_ema, "swing": o_sw, "markers": o_mk,
+                                                        "intraday": tf not in ("1D", "3D", "1W")},
+                               levels, overlay, o_dark), height=700, scrolling=False)
+    st.caption("Regime colours use thresholds fitted on all labeled rows (descriptive). Probabilities are model "
+               "estimates, not facts. The forming bar is excluded.")
+
+# ----------------------------------------------------------------------------- Forecast tab
+with T_fc:
+    head()
+    st.markdown(f"**Window:** next {H} bars (about {span_text(H, tf)}), until about {fmt_ts(wend, tz)}; "
+                "weekend closures can extend the clock time.")
+    st.caption("Forecast = probability of the regime TYPE over a rolling window after the last closed bar; not a "
+               "direction forecast. For the rest of today use the 6h or 12h presets.")
+    st.markdown("**CPU regime model (graph-inspired features)**")
+    if not ml["ok"]:
+        st.warning(ml.get("msg", "Model unavailable."))
+        st.markdown(f"Rule-based regime now: {chip(cur_R)}", unsafe_allow_html=True)
+    else:
+        if live is not None:
+            st.markdown(prob_bars(live), unsafe_allow_html=True)
+            st.caption(f"Model estimate ({ml['best']}, chosen by walk-forward balanced accuracy), not a fact.")
+        met = ml["metrics"]
+        rows = [[k, f"{m['acc']:.3f}", f"{m['bal']:.3f}", f"{m['f1']:.3f}"] for k, m in met.items()]
+        st.dataframe(pd.DataFrame(rows, columns=["Model", "Acc", "BalAcc", "F1"]), hide_index=True, width="stretch")
+        if not ml["beats_naive"]:
+            st.warning("The model did NOT beat naive persistence on balanced accuracy out of sample. "
+                       "Treat the probabilities with caution.")
         else:
-            st.caption(tr["no_ob"])
+            st.success("The model beat naive persistence on balanced accuracy out of sample (a historical "
+                       "test, not a guarantee).")
+        rc = pd.DataFrame({k: [f"{x:.2f}" if np.isfinite(x) else "-" for x in m["recall"]] for k, m in met.items()},
+                          index=SHORT)
+        rc["Support"] = met["HGB"]["support"]
+        st.markdown("**Per-class recall and support**")
+        st.dataframe(rc.reset_index().rename(columns={"index": "Class"}), hide_index=True, width="stretch")
+        b = ml["best"]
+        for nm in (b, "Naive"):
+            st.markdown(f"**Confusion matrix: {nm}** (rows true, cols predicted)")
+            st.dataframe(pd.DataFrame(met[nm]["cm"], index=SHORT, columns=[s[:3] for s in SHORT])
+                         .reset_index().rename(columns={"index": "True"}), hide_index=True, width="stretch")
+        with st.expander("Trading risk score"):
+            st.caption("R = sum(CM * C) / N with the paper's example cost matrix (rows true, cols predicted). "
+                       "Example, trend-following perspective. Lower is better.")
+            st.dataframe(pd.DataFrame([[k, f"{m['risk']:.3f}"] for k, m in met.items()], columns=["Model", "Risk"]),
+                         hide_index=True, width="stretch")
+        st.markdown("**Outcome separation** (out-of-sample, grouped by predicted class)")
+        sp = ml["sep"].copy()
+        sp.insert(0, "Class", SHORT)
+        sp = sp.rename(columns={"n": "N", "move": "|move|/ATR", "rng": "range/ATR", "trend": "Trend later"})
+        sp["Trend later"] = sp["Trend later"].map(lambda v: f"{v:.0%}" if np.isfinite(v) else "-")
+        for cn in ("|move|/ATR", "range/ATR"):
+            sp[cn] = sp[cn].map(lambda v: f"{v:.2f}" if np.isfinite(v) else "-")
+        sp["N"] = sp["N"].fillna(0).astype(int)
+        st.dataframe(sp, hide_index=True, width="stretch")
+        st.markdown("**Calibration** (top-class probability vs observed accuracy)")
+        cal = ml["cal"].copy()
+        cal = pd.DataFrame({"Bin": cal.index.astype(str), "N": cal["n"].fillna(0).astype(int),
+                            "Observed": cal["acc"].map(lambda v: f"{v:.0%}" if np.isfinite(v) else "-")})
+        st.dataframe(cal, hide_index=True, width="stretch")
+        if ml["imp"] is not None:
+            st.markdown("**Top-10 features** (" + ("permutation importance, last test block"
+                                                   if ml["best"] == "HGB" else "mean |LR coefficient|") + ")")
+            st.dataframe(ml["imp"].rename("Importance").round(4).reset_index().rename(columns={"index": "Feature"}),
+                         hide_index=True, width="stretch")
 
-        st.markdown(f"**{tr['structure_events']}** ({len(structure_events)})")
-        if structure_events:
-            for e in structure_events[-5:][::-1]:
-                st.write(f"⚡ {e['type']} @ {e['level']:.5f}  ·  {e['idx']}")
+# ----------------------------------------------------------------------------- Direction tab
+with T_dir:
+    head()
+    st.caption("Descriptive context from past bars; not a forecast and not a signal.")
+    if bias:
+        st.markdown(f"**{bias['label']}** | signed ER {bias['ser']:+.2f} | net move {bias['net_atr']:+.1f} ATR over "
+                    f"{H} bars | {bias['ema_state']} | EMA20 slope {bias['slope_atr']:+.2f} ATR/5 bars")
+        st.caption("Neutral if |signed ER| < gamma or the EMA state disagrees.")
+    st.markdown("**Direction persistence evidence**")
+    raw_sign = np.sign(cf["ser"].fillna(0).to_numpy())
+    pe = core.persistence(cf["close"].to_numpy(), raw_sign, R, H)
+    html_table(["Regime group", "Hit rate", "N", "95% CI"],
+               [[p["group"], f"{p['rate']:.0%}" if p["n"] else "-", p["n"],
+                 f"{p['lo']:.0%}-{p['hi']:.0%}" if p["n"] else "-"] for p in pe])
+    st.caption(f"Share of times sign(C[T+{H}] - C[T]) matched the sign of signed ER at T; non-overlapping samples "
+               "(every H-th bar), Wilson interval. Rates near 50% mean no persistence evidence.")
+    for p in pe:
+        if p["n"] and abs(p["rate"] - 0.5) < 0.05:
+            st.info(f"{p['group']}: hit rate is close to 50%, i.e. direction at T says little about direction later.")
+    st.markdown("**Multi-timeframe (descriptive)**")
+    rows = []
+    for r, m in mtf:
+        if m is None:
+            rows.append([r, "insufficient history", "-", "-", "-"])
         else:
-            st.caption(tr["no_events"])
+            rows.append([r, chip(m["regime"]), {1: "Up", -1: "Down", 0: "Neutral"}[m["bias"]],
+                         f"{m['er']:.2f}", f"{m['pct']:.0%}"])
+    html_table(["TF", "Regime", "Bias", "ER", "nATR pct"], rows)
+    st.markdown(f"**{align}**")
+    st.caption("Thresholds for each timeframe come from its full sample (descriptive, not out-of-sample).")
 
-    with c2:
-        st.subheader(f"📈 {tr['correlation_panel']}")
-        if corr_series is not None and not corr_series.dropna().empty:
-            last_corr = corr_series.dropna().iloc[-1]
-            st.metric(f"{tr['us10y']} — {tr['correlation_label']}", f"{last_corr:.2f}")
+# ----------------------------------------------------------------------------- Context tab
+with T_ctx:
+    head()
+    st.markdown("**Volatility context**")
+    st.markdown(f"ATR({atr_n}) = **{atr_pips:.{2 if symbol == 'DXY' else 1}f} {unit}** | nATR percentile {nat_pct:.0%}")
+    cs_df = core.conditional_stats(cf, R, H)
+    html_table(["R(T)", f"|move|/ATR med / p80", "H-range/ATR med / p80", "N"],
+               [[chip(int(r.regime)), f"{r.mv_med:.2f} / {r.mv_p80:.2f}" if r.n else "-",
+                 f"{r.rg_med:.2f} / {r.rg_p80:.2f}" if r.n else "-", int(r.n)] for r in cs_df.itertuples()])
+    st.caption(f"Empirical history over horizon H={H} (overlapping windows; not a forecast). "
+               f"Current regime highlighted: {core.REGIME_NAMES[cur_R]}.")
+    if tf in ("30m", "1h", "2h", "3h", "4h"):
+        st.markdown("**Session profile (UTC)**")
+        byh, byd = core.session_profile(cf["natr"])
+        if len(byh):
+            cur_h = last_ts.hour
+            hdf = pd.DataFrame({"other": byh.where(byh.index != cur_h), "current hour": byh.where(byh.index == cur_h)})
+            st.bar_chart(hdf, color=["#64748b", "#f59e0b"], height=150)
+            ddf = pd.DataFrame({"nATR": byd.rename(index={i: n for i, n in enumerate(
+                ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])})})
+            st.bar_chart(ddf, height=130)
+    if symbol == "DXY":
+        st.markdown("**DXY basket**")
+        cdf, tot = core.contributions(S["pairs"], H)
+        if cdf is None:
+            st.info("Not enough aligned history for the basket decomposition.")
         else:
-            st.caption(tr["correlation_unavailable"])
-
-        st.subheader(f"📰 {tr['news_panel']}")
-        st.markdown(f"**{tr['sentiment']}: {tr.get(sentiment_label.lower(), sentiment_label)}**")
-        if headlines:
-            for h in headlines[:8]:
-                st.write(f"• [{h['source']}] {h['title']}")
+            cdf = cdf.reindex(cdf["contrib"].abs().sort_values(ascending=False).index)
+            mx = max(cdf["contrib"].abs().max(), 1e-12)
+            rows = []
+            for r in cdf.itertuples():
+                pr = core.mtf_row(S["pairs"][r.pair], H, qa, qe, atr_n)
+                bar = "█" * int(round(8 * abs(r.contrib) / mx))
+                rows.append([r.pair, f"{r.weight:.1%}", chip(pr["regime"]) if pr else "-",
+                             {1: "USD up", -1: "USD down", 0: "flat"}[int(r.usd_dir)],
+                             f"{r.contrib * 100:+.3f}% {bar}"])
+            html_table(["Pair", "Wt", "Regime", "USD", f"Contrib ({H} bars)"], rows)
+            st.caption("contrib = exponent x ln(P_t / P_t-H); positive pushed DXY up; contributions sum exactly to "
+                       f"ln(DXY_t / DXY_t-H) of the synthetic series ({tot * 100:+.3f}%).")
+            if S["use_real"] and len(S["real"]) > H:
+                rl = float(np.log(S["real"]["close"].iloc[-1] / S["real"]["close"].iloc[-1 - H]))
+                st.markdown(f"Real DXY log change {rl * 100:+.3f}% | unexplained (real minus contributions): "
+                            f"{(rl - tot) * 100:+.3f}%")
+            signs = cdf["usd_dir"].to_numpy()
+            breadth = float((cdf["weight"].to_numpy() * signs).sum())
+            trend_share = np.mean([1 if (core.mtf_row(S["pairs"][p], H, qa, qe, atr_n) or {"regime": 0})["regime"]
+                                   in (1, 3) else 0 for p in core.PAIRS])
+            st.markdown(f"Weighted USD breadth: **{breadth:+.2f}** (-1 all USD down, +1 all USD up) | "
+                        f"basket trend breadth: **{trend_share:.0%}** of pairs in a trending regime")
+        v = S["validation"]
+        st.markdown("**Validation (synthetic vs real DX-Y.NYB)**")
+        if v:
+            st.markdown(f"Return correlation {v['corr']:.3f} | mean abs level difference {v['mad']:.3f} | "
+                        f"overlapping bars {v['n']}")
         else:
-            st.caption(tr["no_news"])
+            st.caption("Real DX-Y.NYB not available for this selection; validation not possible.")
+    st.markdown("**Cross-asset**")
+    eu = S["pairs"]["EURUSD"]
+    ref = core.get_series(S, "DXY") if symbol != "DXY" else df
+    j = pd.concat([eu["close"].pct_change().rename("e"), ref["close"].pct_change().rename("d")],
+                  axis=1, join="inner").dropna()
+    if symbol != "EURUSD":
+        if len(j) >= 100:
+            cor = j["e"].rolling(100).corr(j["d"]).iloc[-1]
+            r_eu = core.mtf_row(eu, H, qa, qe, atr_n)
+            r_dx = core.mtf_row(ref, H, qa, qe, atr_n)
+            agree = ""
+            if r_eu and r_dx:
+                same = r_eu["regime"] == r_dx["regime"]
+                typ = (r_eu["regime"] in (1, 3)) == (r_dx["regime"] in (1, 3))
+                agree = f" | regime agreement: {'same regime' if same else ('same type' if typ else 'disagree')}"
+            st.markdown(f"Rolling 100-bar return correlation EURUSD vs DXY: **{cor:+.2f}**{agree}")
+        else:
+            st.caption("Not enough overlapping bars for the correlation.")
+    else:
+        st.caption("Select DXY or another pair for the EURUSD vs DXY comparison.")
+    st.markdown("**Regime meanings**")
+    for m in core.MEANINGS:
+        st.markdown(f"- {m}")
 
-    st.subheader(f"🎙️ {tr['squawk_panel']}")
-    sq_cols = st.columns(len(SQUAWK_CHANNELS))
-    for i, sq in enumerate(SQUAWK_CHANNELS):
-        with sq_cols[i]:
-            st.markdown(f"**[{sq['name']}]({sq['url']})**")
-            st.caption(sq["desc_en"] if lang == "en" else sq["desc_am"])
+# ----------------------------------------------------------------------------- Stats tab
+with T_stats:
+    head()
+    st.markdown("**Regime dynamics**")
+    st.markdown(f"Current: {chip(cur_R)} age {age} bars", unsafe_allow_html=True)
+    tm = core.transition_matrix(R, ylab)
+    dur = core.median_durations(R)
+    tdf = pd.DataFrame([[f"{v:.0%}" if np.isfinite(v) else "-" for v in row] for row in tm],
+                       index=SHORT, columns=[s[:3] for s in SHORT])
+    tdf["Med dur"] = [f"{d:g}" if np.isfinite(d) else "-" for d in dur]
+    st.dataframe(tdf.reset_index().rename(columns={"index": "R(T) to next-H"}), hide_index=True, width="stretch")
+    st.caption(f"Empirical transitions from R(T) to the label over the next {H} bars; durations in bars.")
+    exp = pd.DataFrame({"time_utc": cf.index, **{c: cf[c].to_numpy() for c in core.OHLC},
+                        "atr": cf["atr"].to_numpy(), "natr": cf["natr"].to_numpy(), "er": cf["er"].to_numpy(),
+                        "regime": R, "label": ylab}).set_index("time_utc")
+    if ml["ok"]:
+        oos = ml["oos"]
+        pcol = "h" if ml["best"] == "HGB" else "l"
+        for k in range(4):
+            exp[f"p{k}_oos"] = np.nan
+            exp.iloc[oos["pos"].to_numpy(), exp.columns.get_loc(f"p{k}_oos")] = oos[f"{pcol}{k}"].to_numpy()
+        if live is not None:
+            for k in range(4):
+                exp.iloc[-1, exp.columns.get_loc(f"p{k}_oos")] = live[k]
+    Xb = core.base_features(df, core.neighbour_frames(S, symbol), H, atr_n, tf)
+    exp = exp.join(Xb.add_prefix("f_").drop(columns=["f_natr", "f_er"], errors="ignore")).tail(5000)
+    st.download_button("Download CSV (regimes, probabilities, features)", exp.to_csv().encode(),
+                       file_name=f"{symbol}_{tf}_regimes.csv", mime="text/csv")
+    with st.expander("Diagnostics"):
+        st.markdown(f"Rows: target {len(df)} | labeled {ml.get('n_labeled', 'n/a')} | "
+                    f"first bar {df.index[0]} | last bar {last_ts}")
+        st.markdown(f"Model training time: {ml['train_time']:.1f} s" if ml["ok"] else "Model not trained.")
+        st.markdown(f"theta {theta:.6f} | gamma {gamma:.3f} | DXY choice: {choice} -> {S['source_reason']}")
+        if ml["ok"]:
+            st.dataframe(pd.DataFrame(ml["folds"]).round(5), hide_index=True, width="stretch")
+        for p in core.PAIRS:
+            st.caption(f"{p}: {len(S['pairs'][p])} bars")
+        for w in warns:
+            st.caption(f"Warning: {w}")
 
-    st.markdown("---")
-    st.caption(f"{tr['disclaimer']}  ·  Last refreshed {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+# ----------------------------------------------------------------------------- Method tab
+with T_method:
+    head()
+    st.markdown("""
+**What this is.** A CPU-friendly *adaptation* inspired by ABN AMRO's 2005 FX Regime Prediction Indicator
+(trend-vs-range probability from volatility and positioning) and the 2026 paper *Macroeconomic Message Passing for
+Anticipating Foreign Exchange Regime Changes: A Deep Logical Learning Approach using Graph Tsetlin Machines*
+(arXiv 2607.06719). Those need a GPU or proprietary data. This app is **not a replication**.
 
+**Model.** The model here is called *CPU regime model (graph-inspired features)*: gradient boosting and logistic
+regression on own features plus neighbour-pair features (the "graph" idea). The real Graph Tsetlin Machine requires an
+NVIDIA GPU (pycuda/CUDA) and is **not run in this app**.
 
-if __name__ == "__main__":
-    main()
+**Regimes.** True range, Wilder ATR (N adjustable), nATR = ATR/close, Efficiency Ratio over H bars.
+theta and gamma are percentiles of nATR and ER fitted on training rows only. 0 Stagnant, 1 Steady trend, 2 Choppy,
+3 Volatile trend. Label for a bar T = most frequent regime over the next H bars (ties go to the last bar).
+
+**Forecast.** The probability of the regime *type* over the next H bars after the last closed bar. It is not a
+direction forecast. Direction items are descriptive statistics of past bars.
+
+**Validation and leakage.** Walk-forward, expanding window, first 50% minimum training set, remaining 50% in 4 test
+blocks. Training rows whose label window reaches the test block are purged. Thresholds, labels, scalers and
+percentile ranks are fitted on training data only; features use data up to bar T. Baselines: naive persistence and
+majority class. Probabilities are model estimates and can be miscalibrated (see the calibration table).
+
+**Data.** Yahoo Finance via yfinance (free, unofficial, may be gappy). 30m has about 60 days, 1h about 730 days.
+2h/3h/4h are resampled from 1h, 3D from daily bars, 1W from daily bars (weeks ending Friday). The forming bar is
+excluded. Yahoo FX has no volume. Synthetic DXY = 50.14348112 x EURUSD^-0.576 x USDJPY^0.136 x GBPUSD^-0.119 x
+USDCAD^0.091 x USDSEK^0.042 x USDCHF^0.036; its high/low are an upper bound of the true range.
+
+**Not provided.** No buy/sell signals, no price-direction prediction, no stop/target or position sizing.
+""")
+st.divider()
+st.caption(FOOT)
