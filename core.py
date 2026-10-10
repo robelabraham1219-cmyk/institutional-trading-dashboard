@@ -186,6 +186,7 @@ def load_native(interval: str, stored_cfg: tuple | None = None):
     names = PAIRS + ["DXY_REAL"]
     errs: list[str] = []
     stats: list[dict] = []
+    fetched = pd.Timestamp.now(tz="UTC").strftime("%H:%M")
 
     def one(nm):
         fresh, err = fetch_yf(YF[nm], interval)
@@ -201,7 +202,8 @@ def load_native(interval: str, stored_cfg: tuple | None = None):
         merged = merge_history(stored, fresh)
         msg = "; ".join(x for x in [f"stored: {serr}" if serr else "", f"fresh: {err}" if err else ""] if x)
         return nm, merged, err, {"ticker": YF[nm], "interval": interval, "stored": int(len(stored)),
-                                 "fresh": int(len(fresh)), "merged": int(len(merged)), "error": msg}
+                                 "fresh": int(len(fresh)), "merged": int(len(merged)), "error": msg,
+                                 "fetched": fetched}
 
     out = {}
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -311,14 +313,14 @@ def next_closure(t: pd.Timestamp):
 
 
 def abnormal_gaps(idx: pd.DatetimeIndex, tf: str):
-    """Abnormal gaps: longer than max(3 bars, 26 h) and not spanning the weekend closure.
+    """Abnormal gaps: longer than max(3 bars, 40 h) and not spanning the weekend closure (gaps up to 40 h are holiday closures).
 
     Returns (count, total length in seconds); gap length = bar start to next bar start.
     """
     if len(idx) < 2:
         return 0, 0.0
     dur = TF_SECONDS[tf]
-    thr = max(3 * dur, 26 * 3600)
+    thr = max(3 * dur, 40 * 3600)
     gaps = np.diff(_secs(idx))
     cnt, tot = 0, 0.0
     for i in np.where(gaps > thr)[0]:
@@ -380,8 +382,8 @@ def decide_source(choice: str, synth: pd.DataFrame, real: pd.DataFrame, tf: str)
     if sst is None:
         return False, "auto: real DX-Y.NYB unavailable"
     detail = (f"real covers {sst['coverage']:.0%} of synthetic bars (need >= 90%); {sst['gap_n']} abnormal gap(s) "
-              f"totalling {sst['gap_hours']:.1f} h = {sst['gap_frac']:.2%} of the covered period (need <= 1%)")
-    if sst["coverage"] >= 0.90 and sst["gap_frac"] <= 0.01:
+              f"totalling {sst['gap_hours']:.1f} h = {sst['gap_frac']:.2%} of the covered period (need <= 2%)")
+    if sst["coverage"] >= 0.90 and sst["gap_frac"] <= 0.02:
         return True, "auto: accepted real; " + detail
     return False, "auto: used synthetic; " + detail
 
@@ -876,6 +878,18 @@ def transition_matrix(R: np.ndarray, y: np.ndarray) -> np.ndarray:
     np.add.at(cnt, (np.asarray(R)[m], np.asarray(y)[m]), 1)
     s = cnt.sum(axis=1, keepdims=True)
     return np.where(s > 0, cnt / np.maximum(s, 1), np.nan)
+
+
+def base_rate(R: np.ndarray, y: np.ndarray, k: int):
+    """Empirical base rate: share of each next-H label among bars whose current regime was k. Returns (probs, N)."""
+    R, y = np.asarray(R), np.asarray(y)
+    if not (0 <= int(k) < 4):
+        return np.full(4, np.nan), 0
+    m = (R == k) & (y >= 0)
+    n = int(m.sum())
+    if n == 0:
+        return np.full(4, np.nan), 0
+    return np.bincount(y[m], minlength=4)[:4] / n, n
 
 
 def median_durations(R: np.ndarray) -> list:
