@@ -4,9 +4,14 @@ No Streamlit import here, so every function can be unit-tested. Analytical tool,
 """
 from __future__ import annotations
 
+import io
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -49,6 +54,18 @@ COST = np.array([[0, 1, 3, 1], [4, 0, 4, 2], [2, 10, 0, 10], [8, 2, 4, 0]], dtyp
 MIN_ML_ROWS = 600
 LOW_SAMPLE = 1500
 EPOCH = pd.Timestamp("1970-01-01", tz="UTC")
+WEEKDAY_LABELS = ["1 Mon", "2 Tue", "3 Wed", "4 Thu", "5 Fri", "6 Sat", "7 Sun"]
+UNDEFINED_NAME = "Undefined (not enough bars)"
+
+
+def regime_name(k) -> str:
+    """Regime name; safe for the undefined state (-1)."""
+    return REGIME_NAMES[int(k)] if 0 <= int(k) < 4 else UNDEFINED_NAME
+
+
+def regime_color(k) -> str:
+    """Regime colour; grey for the undefined state (-1)."""
+    return REGIME_COLORS[int(k)] if 0 <= int(k) < 4 else "#6b7280"
 
 
 # ----------------------------------------------------------------------------- data helpers
@@ -123,17 +140,31 @@ def fetch_yf(ticker: str, interval: str, retries: int = 3):
     return empty_ohlc(), f"{ticker} {interval}: {last}"
 
 
-def load_stored_csv(url: str) -> pd.DataFrame:
-    """Optional stored history from a raw GitHub CSV; empty frame on any failure."""
+def load_stored_csv(url: str):
+    """Optional stored history from a raw GitHub CSV. Returns (frame, error text or None)."""
     try:
-        d = pd.read_csv(url)
+        req = urllib.request.Request(url, headers={"User-Agent": "fx-regime-app"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        return empty_ohlc(), f"HTTP {e.code} {e.reason}"
+    except Exception as e:
+        return empty_ohlc(), f"{type(e).__name__}: {str(e)[:120]}"
+    try:
+        d = pd.read_csv(io.BytesIO(raw))
         d.columns = [str(c).lower() for c in d.columns]
+        missing = [c for c in OHLC if c not in d.columns]
+        if missing:
+            return empty_ohlc(), f"CSV is missing columns: {', '.join(missing)}"
         tcol = "timestamp" if "timestamp" in d.columns else d.columns[0]
         d.index = pd.to_datetime(d[tcol], utc=True, errors="coerce")
         d = d[d.index.notna()]
-        return clean_ohlc(d[OHLC])
-    except Exception:
-        return empty_ohlc()
+        out = clean_ohlc(d[OHLC])
+    except Exception as e:
+        return empty_ohlc(), f"parse error {type(e).__name__}: {str(e)[:120]}"
+    if len(out) == 0:
+        return out, "CSV loaded but contains no valid rows"
+    return out, None
 
 
 def merge_history(stored: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
@@ -150,28 +181,48 @@ def load_native(interval: str, stored_cfg: tuple | None = None):
     """Load all 7 tickers at a native interval ('30m','1h','1d').
 
     stored_cfg = (owner, repo, branch) enables optional CSV history for 30m/1h.
-    Returns (dict name -> frame, list of error strings).
+    Returns (dict name -> frame, list of error strings, list of per-ticker load stats).
     """
     names = PAIRS + ["DXY_REAL"]
     errs: list[str] = []
+    stats: list[dict] = []
 
     def one(nm):
         fresh, err = fetch_yf(YF[nm], interval)
-        if stored_cfg and stored_cfg[0] and interval in ("30m", "1h"):
+        stored, serr = empty_ohlc(), None
+        if interval not in ("30m", "1h"):
+            serr = "n/a (daily bars come from Yahoo only)"
+        elif not (stored_cfg and stored_cfg[0]):
+            serr = "not configured (OWNER secret not set)"
+        else:
             o, r, b = stored_cfg
             url = f"https://raw.githubusercontent.com/{o}/{r}/{b}/data/{quote(YF[nm])}_{interval}.csv"
-            fresh = merge_history(load_stored_csv(url), fresh)
-        return nm, fresh, err
+            stored, serr = load_stored_csv(url)
+        merged = merge_history(stored, fresh)
+        msg = "; ".join(x for x in [f"stored: {serr}" if serr else "", f"fresh: {err}" if err else ""] if x)
+        return nm, merged, err, {"ticker": YF[nm], "interval": interval, "stored": int(len(stored)),
+                                 "fresh": int(len(fresh)), "merged": int(len(merged)), "error": msg}
 
     out = {}
     with ThreadPoolExecutor(max_workers=4) as ex:
-        for nm, fr, err in ex.map(one, names):
+        for nm, fr, err, st_ in ex.map(one, names):
             out[nm] = fr
+            stats.append(st_)
             if err and nm != "DXY_REAL":
                 errs.append(err)
             elif err:
                 errs.append(f"DX-Y.NYB {interval} unavailable ({err.split(': ')[-1]})")
-    return out, errs
+    return out, errs, stats
+
+
+def stored_bars(stats: list, symbol: str, use_real: bool) -> int:
+    """Stored-history rows behind the target series at the native interval (0 = not used)."""
+    rows = {x["ticker"]: x["stored"] for x in stats or []}
+    if symbol == "DXY":
+        if use_real:
+            return int(rows.get(YF["DXY_REAL"], 0))
+        return int(min([rows.get(YF[p], 0) for p in PAIRS] or [0]))
+    return int(rows.get(YF.get(symbol, ""), 0))
 
 
 # ----------------------------------------------------------------------------- resampling
@@ -244,18 +295,40 @@ def split_forming(df: pd.DataFrame, now=None):
     return (df.iloc[:-1] if flag else df), flag
 
 
-def abnormal_gaps(idx: pd.DatetimeIndex, tf: str) -> int:
-    """Count gaps beyond normal market closures (weekends/holidays) or a couple of missing bars."""
+def next_closure(t: pd.Timestamp):
+    """First FX closure (Fri 17:00 to Sun 17:00 America/New_York) ending after t, as UTC timestamps."""
+    tz = ZoneInfo("America/New_York")
+    d = t.tz_convert(tz).date()
+    wd = d.weekday()
+    fri = d + timedelta(days=4 - wd) if wd <= 4 else d - timedelta(days=wd - 4)
+    while True:
+        sun = fri + timedelta(days=2)
+        cs = pd.Timestamp(datetime(fri.year, fri.month, fri.day, 17), tz=tz)
+        ce = pd.Timestamp(datetime(sun.year, sun.month, sun.day, 17), tz=tz)
+        if ce > t:
+            return cs.tz_convert("UTC"), ce.tz_convert("UTC")
+        fri += timedelta(days=7)
+
+
+def abnormal_gaps(idx: pd.DatetimeIndex, tf: str):
+    """Abnormal gaps: longer than max(3 bars, 26 h) and not spanning the weekend closure.
+
+    Returns (count, total length in seconds); gap length = bar start to next bar start.
+    """
     if len(idx) < 2:
-        return 0
+        return 0, 0.0
     dur = TF_SECONDS[tf]
+    thr = max(3 * dur, 26 * 3600)
     gaps = np.diff(_secs(idx))
-    if tf in ("3D", "1W"):
-        return int((gaps > 1.5 * dur).sum())
-    big = gaps > 3 * dur
-    ws, we = idx[:-1].weekday.to_numpy(), idx[1:].weekday.to_numpy()
-    weekend_like = np.isin(ws, (4, 5)) & np.isin(we, (6, 0, 1)) & (gaps <= 4 * 86400)
-    return int((big & ~weekend_like).sum())
+    cnt, tot = 0, 0.0
+    for i in np.where(gaps > thr)[0]:
+        g_start = idx[i] + pd.Timedelta(seconds=dur)
+        cs, _ = next_closure(g_start)
+        if cs < idx[i + 1]:  # the gap overlaps the weekend closure
+            continue
+        cnt += 1
+        tot += float(gaps[i])
+    return cnt, tot
 
 
 # ----------------------------------------------------------------------------- DXY
@@ -286,7 +359,7 @@ def synth_dxy(frames: dict):
 
 
 def decide_source(choice: str, synth: pd.DataFrame, real: pd.DataFrame, tf: str):
-    """Pick the DXY series. Returns (use_real, reason)."""
+    """Pick the DXY series. Returns (use_real, reason string)."""
     if choice == "Synthetic":
         return False, "manual: synthetic"
     if choice == "Real":
@@ -295,10 +368,14 @@ def decide_source(choice: str, synth: pd.DataFrame, real: pd.DataFrame, tf: str)
         return False, "auto: real DX-Y.NYB unavailable"
     cov = real.index.isin(synth.index).sum() / len(synth)
     r = real[(real.index >= synth.index[0]) & (real.index <= synth.index[-1])]
-    gaps = abnormal_gaps(r.index, tf)
-    if cov >= 0.90 and gaps == 0:
-        return True, f"auto: real covers {cov:.0%} of bars, no abnormal gaps"
-    return False, f"auto: real covers {cov:.0%} of bars, {gaps} abnormal gap(s)"
+    n_gap, tot = abnormal_gaps(r.index, tf)
+    span = (r.index[-1] - r.index[0]).total_seconds() if len(r) > 1 else 0.0
+    frac = tot / span if span > 0 else 0.0
+    detail = (f"real covers {cov:.0%} of synthetic bars (need >= 90%); {n_gap} abnormal gap(s) totalling "
+              f"{tot / 3600:.1f} h = {frac:.2%} of the covered period (need <= 1%)")
+    if cov >= 0.90 and frac <= 0.01:
+        return True, "auto: accepted real; " + detail
+    return False, "auto: used synthetic; " + detail
 
 
 def validate_dxy(synth: pd.DataFrame, real: pd.DataFrame):
@@ -621,15 +698,21 @@ def run_ml(tgt: pd.DataFrame, Xb: pd.DataFrame, H: int, qa: float, qe: float) ->
     for bi, te in enumerate(blocks):
         t0 = te[0]
         tr = rows[(rows < t0) & (rows + H < t0)]  # purge: T+H < test_start
-        assert not np.any(tr + H >= t0), "purge violated"
+        if np.any(tr + H >= t0):
+            res["warnings"].append(f"Fold {bi + 1} skipped: purge check failed (train labels overlap the test block).")
+            continue
         if len(tr) < 50:
             continue
         th, ga = fit_thresholds(natr[:t0], er[:t0], qa, qe)
         R = regimes(natr, er, th, ga)
         y = make_labels(R, H)
         Xf = np.hstack([Xv, regime_feat_array(R)])
-        assert (y[tr] >= 0).all() and (y[te] >= 0).all()
-        assert np.isfinite(Xf[tr]).all() and np.isfinite(Xf[te]).all(), "NaN/inf reached the models"
+        if not ((y[tr] >= 0).all() and (y[te] >= 0).all()):
+            res["warnings"].append(f"Fold {bi + 1} skipped: undefined labels in the train or test rows.")
+            continue
+        if not (np.isfinite(Xf[tr]).all() and np.isfinite(Xf[te]).all()):
+            res["warnings"].append(f"Fold {bi + 1} skipped: non-finite features (NaN/inf) would reach the models.")
+            continue
         ph, mh = fit_proba("HGB", Xf[tr], y[tr], Xf[te])
         pl, ml = fit_proba("LR", Xf[tr], y[tr], Xf[te])
         major = int(np.bincount(y[tr], minlength=4).argmax())
@@ -825,5 +908,40 @@ def session_profile(natr: pd.Series):
 
 
 def window_end(last_ts: pd.Timestamp, tf: str, H: int) -> pd.Timestamp:
-    """Nominal end of the forecast window (last closed bar end + H bars; weekends can extend it)."""
-    return last_ts + pd.Timedelta(seconds=TF_SECONDS[tf] * (H + 1))
+    """End of the forecast window counted in open-market time only.
+
+    last_ts = start of the last closed bar (UTC). Intraday: H bars of open time, skipping the FX closure
+    (Fri 17:00 to Sun 17:00 America/New_York). 1D/3D: weekdays only. 1W: whole weeks.
+    """
+    last_ts = pd.Timestamp(last_ts)
+    last_ts = last_ts.tz_localize("UTC") if last_ts.tz is None else last_ts.tz_convert("UTC")
+    dur = TF_SECONDS[tf]
+    if tf in ("30m", "1h", "2h", "3h", "4h"):
+        t = last_ts + pd.Timedelta(seconds=dur)
+        rem = pd.Timedelta(seconds=dur * int(H))
+        for _ in range(2000):
+            cs, ce = next_closure(t)
+            if t >= cs:
+                t = ce
+                continue
+            if rem <= cs - t:
+                return t + rem
+            rem -= cs - t
+            t = ce
+        return t
+    if tf in ("1D", "3D"):
+        m = 1 if tf == "1D" else 3
+        d0 = np.datetime64(last_ts.date())
+        last_member = np.busday_offset(d0, m - 1, roll="forward")
+        final = np.busday_offset(last_member, m * int(H), roll="forward")
+        return pd.Timestamp(final, tz="UTC") + pd.Timedelta(days=1)
+    wd = last_ts.weekday()
+    end_last = last_ts.normalize() + pd.Timedelta(days=((4 - wd) % 7) + 1)
+    return end_last + pd.Timedelta(days=7 * int(H))
+
+
+def weekday_profile(byd: pd.Series) -> pd.Series:
+    """Weekday series with Monday-first labels ('1 Mon' ... '7 Sun') so charts sort chronologically."""
+    s = byd.sort_index().copy()
+    s.index = [WEEKDAY_LABELS[int(i)] for i in s.index]
+    return s
