@@ -330,6 +330,7 @@ b.setAttribute('aria-pressed',on?'true':'false');b.innerHTML='<span>'+LAB[id]+'<
 b.style.background=on?'#2563eb':t.off;b.style.color=on?'#ffffff':t.offc;b.style.borderColor=on?'#2563eb':t.bd;});}
 paint();
 if(typeof LightweightCharts==='undefined'){document.getElementById('c1').innerHTML='<p style="padding:12px;color:#c33">Chart library failed to load (CDN blocked or offline).</p>';return;}
+function boot(){
 const bg=TH.dark.bg,tc=TH.dark.tc,gc=TH.dark.gc;
 function mk(id,h){const el=document.getElementById(id);return LightweightCharts.createChart(el,{width:el.clientWidth,height:h,
 layout:{background:{type:'solid',color:bg},textColor:tc,fontSize:11},grid:{vertLines:{color:gc},horzLines:{color:gc}},
@@ -371,8 +372,15 @@ setMk();applyTheme();paint();
 const cs_=[c1,c2,c3];let lock=false;
 cs_.forEach((ch,i)=>ch.timeScale().subscribeVisibleLogicalRangeChange(r=>{if(lock||!r)return;lock=true;
 cs_.forEach((o,j)=>{if(j!==i)o.timeScale().setVisibleLogicalRange(r);});lock=false;}));
-c1.timeScale().setVisibleLogicalRange({from:Math.max(0,D.n-150),to:D.n+3});
-window.addEventListener('resize',()=>{cs_.forEach((ch,i)=>ch.applyOptions({width:document.getElementById('c'+(i+1)).clientWidth}));});
+let ranged=false;
+function applyWidth(){cs_.forEach((ch,i)=>{const w=document.getElementById('c'+(i+1)).clientWidth;if(w>0)ch.applyOptions({width:w});});}
+function setRange(){const r={from:Math.max(0,D.n-150),to:D.n-1+3};cs_.forEach(ch=>ch.timeScale().setVisibleLogicalRange(r));}
+function fit(){applyWidth();if(!ranged&&document.getElementById('c1').clientWidth>0){ranged=true;setRange();}}
+if(typeof ResizeObserver!=='undefined'){const ro=new ResizeObserver(fit);['c1','c2','c3'].forEach(id=>ro.observe(document.getElementById(id)));}
+window.addEventListener('resize',fit);
+requestAnimationFrame(fit);
+}
+requestAnimationFrame(()=>requestAnimationFrame(boot));
 })();
 </script>"""
     return (tpl.replace("__DATA__", json.dumps(data)).replace("__URL__", LWC_URL).replace("__LEGEND__", legend))
@@ -483,11 +491,14 @@ nat = cf["natr"].dropna()
 nat_pct = float((nat <= nat.iloc[-1]).mean()) if len(nat) else np.nan
 unit = "points" if symbol == "DXY" else "pips"
 n_stored = core.stored_bars(S.get("load_stats", []), symbol, S["use_real"]) if core.TF_NATIVE[tf] != "1d" else 0
+fetched_at = next((r_["fetched"] for r_ in S.get("load_stats", []) if r_.get("fetched")), None)
+fetch_txt = f"data fetched {fetched_at} UTC (cache up to 30 min)" if fetched_at else "data fetch time n/a"
 prov = (f"Yahoo (free, unofficial) | last closed bar {fmt_ts(last_ts, 'UTC')} | {len(df)} bars | "
         f"{df.index[0].strftime('%Y-%m-%d')} to {last_ts.strftime('%Y-%m-%d')} | "
         f"{'derived from ' + core.TF_NATIVE[tf] + ' bars | ' if tf not in ('30m', '1h', '1D') else ''}"
         f"{S['source_label'] if symbol == 'DXY' else 'DXY neighbour: ' + S['source_label']}"
         f"{' | synthetic series in use' if (symbol == 'DXY' and not S['use_real']) else ''} | "
+        f"{fetch_txt} | "
         f"{('stored history: used (' + str(n_stored) + ' bars)') if n_stored > 0 else 'stored history: not used'}")
 
 
@@ -553,6 +564,20 @@ with T_chart:
                "estimates, not facts. The forming bar is excluded.")
 
 # ----------------------------------------------------------------------------- Forecast tab
+def show_base_rate() -> None:
+    """One-row table: empirical next-H label frequencies from the current regime (descriptive base rate)."""
+    st.markdown("**Historical base rate from the current regime**")
+    br, n_br = core.base_rate(R, ylab, cur_R)
+    if n_br == 0:
+        st.caption("Not available: the current regime is undefined or has no labeled history.")
+        return
+    row = {nm: f"{br[k]:.0%}" for k, nm in enumerate(SHORT)}
+    row["N"] = n_br
+    st.dataframe(pd.DataFrame([row]), hide_index=True, width="stretch")
+    st.caption("The model adds value only if it beats these base rates and the naive baseline "
+               "(base rates use thresholds fitted on all labeled rows; descriptive).")
+
+
 with T_fc:
     head()
     st.markdown(f"**Window:** next {H} bars (about {span_text(H, tf)} of open-market time), until about "
@@ -568,12 +593,14 @@ with T_fc:
     if not ml["ok"]:
         st.warning(ml.get("msg", "Model unavailable."))
         st.markdown(f"Rule-based regime now: {chip(cur_R)}", unsafe_allow_html=True)
+        show_base_rate()
     else:
         if live is not None:
             st.markdown(prob_bars(live), unsafe_allow_html=True)
             how = ("chosen by walk-forward balanced accuracy" if len(ml["models"]) > 1
                    else "the only model run")
             st.caption(f"Model estimate ({ml['best']}, {how}), not a fact.")
+            show_base_rate()
         met = ml["metrics"]
         rows = [[k, f"{m['acc']:.3f}", f"{m['bal']:.3f}", f"{m['f1']:.3f}"] for k, m in met.items()]
         st.dataframe(pd.DataFrame(rows, columns=["Model", "Acc", "BalAcc", "F1"]), hide_index=True, width="stretch")
@@ -785,6 +812,7 @@ with T_stats:
         st.markdown("**Stored history and fresh bars, per ticker and interval**")
         if STATS:
             sdf = pd.DataFrame(sorted(STATS.values(), key=lambda r: (r["interval"], r["ticker"])))
+            sdf = sdf.drop(columns=["fetched"], errors="ignore")
             sdf = sdf.rename(columns={"ticker": "Ticker", "interval": "Int", "stored": "Stored", "fresh": "Fresh",
                                       "merged": "Merged", "error": "Error"})
             st.dataframe(sdf, hide_index=True, width="stretch")
