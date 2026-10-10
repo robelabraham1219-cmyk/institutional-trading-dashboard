@@ -56,13 +56,21 @@ def load(interval: str):
 @st.cache_data(ttl=300, show_spinner=False)
 def get_set(tf: str, anchor: int, choice: str, cfg: tuple, daily_stamp: int):
     """Closed-bar frames at a timeframe (cached; daily_stamp refreshes hourly for daily-based rungs)."""
-    native, errs = load(core.TF_NATIVE[tf])
-    return core.build_set(native, tf, anchor, choice), errs
+    native, errs, stats = load(core.TF_NATIVE[tf])
+    S = core.build_set(native, tf, anchor, choice)
+    S["load_stats"] = stats
+    return S, errs
+
+
+STATS: dict = {}  # per-run record of (ticker, interval) load statistics for Diagnostics
 
 
 def S_for(tf: str, anchor: int, choice: str):
     stamp = int(time.time() // 3600) if core.TF_NATIVE[tf] == "1d" else 0
-    return get_set(tf, anchor if tf in ("2h", "3h", "4h") else 0, choice, CFG, stamp)
+    S_, errs_ = get_set(tf, anchor if tf in ("2h", "3h", "4h") else 0, choice, CFG, stamp)
+    for row in S_.get("load_stats", []):
+        STATS[(row["ticker"], row["interval"])] = row
+    return S_, errs_
 
 
 @st.cache_resource(show_spinner=False, max_entries=6)
@@ -81,9 +89,9 @@ def hex_rgba(h: str, a: float) -> str:
 
 
 def chip(k: int) -> str:
-    c = core.REGIME_COLORS[k]
+    c = core.regime_color(k)
     return (f"<span style='background:{hex_rgba(c, .25)};border:1px solid {c};padding:1px 8px;"
-            f"border-radius:10px;font-weight:600'>{core.REGIME_NAMES[k]}</span>")
+            f"border-radius:10px;font-weight:600'>{core.regime_name(k)}</span>")
 
 
 def html_table(headers, rows) -> None:
@@ -117,6 +125,17 @@ def disp_secs(idx: pd.DatetimeIndex, tz: str) -> np.ndarray:
 
 def fmt_ts(ts: pd.Timestamp, tz: str) -> str:
     return ts.tz_convert(tz).strftime("%Y-%m-%d %H:%M") + f" {tz}"
+
+
+def render_html(html: str, height: int) -> None:
+    """Render chart HTML: stable components.html, or st.iframe (falls back to stable on any exception)."""
+    if renderer.startswith("New") and hasattr(st, "iframe"):
+        try:
+            st.iframe(html.lstrip(), height=height)
+            return
+        except Exception:
+            st.caption("st.iframe failed; showing the stable renderer instead.")
+    components.html(html, height=height, scrolling=False)
 
 
 def tz_options() -> list:
@@ -203,15 +222,15 @@ c1.priceScale('regime').applyOptions({scaleMargins:{top:0,bottom:0},visible:fals
 rg.setData(D.regime);
 const cs=c1.addCandlestickSeries({upColor:'#26a69a',downColor:'#ef5350',borderVisible:false,wickUpColor:'#26a69a',wickDownColor:'#ef5350'});
 cs.setData(D.candles);
-function ln(ch,color,data,style){const s=ch.addLineSeries({color:color,lineWidth:1,priceLineVisible:false,lastValueVisible:false,lineStyle:style||0});s.setData(data);return s;}
+function ln(ch,color,data,style,pf){const o={color:color,lineWidth:1,priceLineVisible:false,lastValueVisible:false,lineStyle:style||0};if(pf)o.priceFormat=pf;const s=ch.addLineSeries(o);s.setData(data);return s;}
 if(D.ema20.length){ln(c1,'#facc15',D.ema20);ln(c1,'#a78bfa',D.ema50);}
 if(D.swh.length){ln(c1,'#94a3b8',D.swh,2);}
 if(D.swl.length){ln(c1,'#94a3b8',D.swl,2);}
 if(D.markers.length){cs.setMarkers(D.markers);}
 D.levels.forEach(l=>cs.createPriceLine({price:l.p,color:l.c,lineWidth:1,lineStyle:2,axisLabelVisible:true,title:l.t}));
-const s2=ln(c2,'#38bdf8',D.natr);
+const s2=ln(c2,'#38bdf8',D.natr,0,{type:'price',precision:5,minMove:0.00001});
 if(isFinite(D.theta))s2.createPriceLine({price:D.theta,color:'#f59e0b',lineWidth:1,lineStyle:2,axisLabelVisible:true,title:'theta'});
-const s3=ln(c3,'#34d399',D.er);
+const s3=ln(c3,'#34d399',D.er,0,{type:'price',precision:2,minMove:0.01});
 if(isFinite(D.gamma))s3.createPriceLine({price:D.gamma,color:'#f59e0b',lineWidth:1,lineStyle:2,axisLabelVisible:true,title:'gamma'});
 document.getElementById('ov').innerHTML=D.overlay;
 const cs_=[c1,c2,c3];let lock=false;
@@ -257,6 +276,8 @@ with st.expander("Settings", expanded=False):
     o_mk = t3.toggle("Changes", True)
     o_lv = t4.toggle("PDH/PWH", True)
     o_dark = t5.toggle("Dark", True)
+    rend_opts = ["Stable (components.html)"] + (["New (st.iframe)"] if hasattr(st, "iframe") else [])
+    renderer = st.radio("Chart renderer", rend_opts, horizontal=True)
     if st.button("Refresh data"):
         st.cache_data.clear()
         st.cache_resource.clear()
@@ -292,6 +313,8 @@ ylab = core.make_labels(R, H)
 age_arr = core.run_length(R)
 cur_R = int(R[-1])
 age = int(age_arr[-1])
+age_txt = f" age {age} bars" if cur_R >= 0 else ""
+cur_name = core.regime_name(cur_R)
 live = ml.get("live") if ml["ok"] else None
 bias = core.bias_detail(cf, gamma, H)
 wend = core.window_end(last_ts, tf, H)
@@ -345,11 +368,13 @@ atr_pips = cf["atr"].iloc[-1] / pip if np.isfinite(cf["atr"].iloc[-1]) else np.n
 nat = cf["natr"].dropna()
 nat_pct = float((nat <= nat.iloc[-1]).mean()) if len(nat) else np.nan
 unit = "points" if symbol == "DXY" else "pips"
+n_stored = core.stored_bars(S.get("load_stats", []), symbol, S["use_real"]) if core.TF_NATIVE[tf] != "1d" else 0
 prov = (f"Yahoo (free, unofficial) | last closed bar {fmt_ts(last_ts, 'UTC')} | {len(df)} bars | "
         f"{df.index[0].strftime('%Y-%m-%d')} to {last_ts.strftime('%Y-%m-%d')} | "
         f"{'derived from ' + core.TF_NATIVE[tf] + ' bars | ' if tf not in ('30m', '1h', '1D') else ''}"
         f"{S['source_label'] if symbol == 'DXY' else 'DXY neighbour: ' + S['source_label']}"
-        f"{' | synthetic series in use' if (symbol == 'DXY' and not S['use_real']) else ''}")
+        f"{' | synthetic series in use' if (symbol == 'DXY' and not S['use_real']) else ''} | "
+        f"{('stored history: used (' + str(n_stored) + ' bars)') if n_stored > 0 else 'stored history: not used'}")
 
 
 def head() -> None:
@@ -367,7 +392,7 @@ with T_chart:
     for w in warns:
         st.warning(w)
     if age <= 3 and age < len(R) and R[-1 - age] >= 0:
-        st.info(f"Regime changed within the last 3 bars (now {core.REGIME_NAMES[cur_R]}).")
+        st.info(f"Regime changed within the last 3 bars (now {cur_name}).")
     if live is not None:
         top = np.argsort(live)[::-1]
         fc_txt = (f"Model estimate for the next {H} bars (about {span_text(H, tf)}): " +
@@ -381,10 +406,12 @@ with T_chart:
     else:
         vs = "No out-of-sample test was possible."
     bias_txt = (f"Direction context (past bars, not a forecast): {bias.get('label', 'n/a')}; {align}." if bias else "")
-    st.info(f"{symbol} {tf} is in the **{core.REGIME_NAMES[cur_R]}** regime (age {age} bars). {fc_txt} {bias_txt} "
+    now_txt = (f"is in the **{cur_name}** regime (age {age} bars)." if cur_R >= 0
+               else f"has no defined regime yet: **{cur_name}**.")
+    st.info(f"{symbol} {tf} {now_txt} {fc_txt} {bias_txt} "
             f"ATR is {atr_pips:.{2 if symbol == 'DXY' else 1}f} {unit}. {vs}")
     c1, c2 = st.columns(2)
-    c1.markdown(f"**Current regime**<br>{chip(cur_R)} age {age} bars", unsafe_allow_html=True)
+    c1.markdown(f"**Current regime**<br>{chip(cur_R)}{age_txt}", unsafe_allow_html=True)
     if live is not None:
         k = int(np.argmax(live))
         c2.markdown(f"**Next {H} bars** (model estimate)<br>{chip(k)} {live[k]:.0%}", unsafe_allow_html=True)
@@ -400,19 +427,23 @@ with T_chart:
                          for k in np.argsort(live)[::-1][:3])
     else:
         ov_fc = "n/a"
-    overlay = (f"Now: <b style='color:{core.REGIME_COLORS[cur_R]}'>{core.REGIME_NAMES[cur_R]}</b> (age {age} bars)"
+    overlay = (f"Now: <b style='color:{core.regime_color(cur_R)}'>{cur_name}</b>"
+               f"{f' (age {age} bars)' if cur_R >= 0 else ''}"
                f" | Next {H} bars: {ov_fc}")
-    components.html(chart_html(cf, R, theta, gamma, tz, {"ema": o_ema, "swing": o_sw, "markers": o_mk,
-                                                        "intraday": tf not in ("1D", "3D", "1W")},
-                               levels, overlay, o_dark), height=700, scrolling=False)
+    render_html(chart_html(cf, R, theta, gamma, tz, {"ema": o_ema, "swing": o_sw, "markers": o_mk,
+                                                    "intraday": tf not in ("1D", "3D", "1W")},
+                           levels, overlay, o_dark), 700)
+    st.caption('Chart renderer: use "New" only if the chart still renders.')
     st.caption("Regime colours use thresholds fitted on all labeled rows (descriptive). Probabilities are model "
                "estimates, not facts. The forming bar is excluded.")
 
 # ----------------------------------------------------------------------------- Forecast tab
 with T_fc:
     head()
-    st.markdown(f"**Window:** next {H} bars (about {span_text(H, tf)}), until about {fmt_ts(wend, tz)}; "
-                "weekend closures can extend the clock time.")
+    st.markdown(f"**Window:** next {H} bars (about {span_text(H, tf)} of open-market time), until about "
+                f"{fmt_ts(wend, tz)}.")
+    st.caption("Counted in open-market time only: FX is closed Friday 17:00 to Sunday 17:00 New York time, "
+               "so the end timestamp skips the weekend (1D/3D count weekdays, 1W whole weeks).")
     st.caption("Forecast = probability of the regime TYPE over a rolling window after the last closed bar; not a "
                "direction forecast. For the rest of today use the 6h or 12h presets.")
     st.markdown("**CPU regime model (graph-inspired features)**")
@@ -508,7 +539,7 @@ with T_ctx:
                [[chip(int(r.regime)), f"{r.mv_med:.2f} / {r.mv_p80:.2f}" if r.n else "-",
                  f"{r.rg_med:.2f} / {r.rg_p80:.2f}" if r.n else "-", int(r.n)] for r in cs_df.itertuples()])
     st.caption(f"Empirical history over horizon H={H} (overlapping windows; not a forecast). "
-               f"Current regime highlighted: {core.REGIME_NAMES[cur_R]}.")
+               f"Current regime highlighted: {cur_name}.")
     if tf in ("30m", "1h", "2h", "3h", "4h"):
         st.markdown("**Session profile (UTC)**")
         byh, byd = core.session_profile(cf["natr"])
@@ -516,8 +547,7 @@ with T_ctx:
             cur_h = last_ts.hour
             hdf = pd.DataFrame({"other": byh.where(byh.index != cur_h), "current hour": byh.where(byh.index == cur_h)})
             st.bar_chart(hdf, color=["#64748b", "#f59e0b"], height=150)
-            ddf = pd.DataFrame({"nATR": byd.rename(index={i: n for i, n in enumerate(
-                ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])})})
+            ddf = pd.DataFrame({"nATR": core.weekday_profile(byd)})
             st.bar_chart(ddf, height=130)
     if symbol == "DXY":
         st.markdown("**DXY basket**")
@@ -582,7 +612,7 @@ with T_ctx:
 with T_stats:
     head()
     st.markdown("**Regime dynamics**")
-    st.markdown(f"Current: {chip(cur_R)} age {age} bars", unsafe_allow_html=True)
+    st.markdown(f"Current: {chip(cur_R)}{age_txt}", unsafe_allow_html=True)
     tm = core.transition_matrix(R, ylab)
     dur = core.median_durations(R)
     tdf = pd.DataFrame([[f"{v:.0%}" if np.isfinite(v) else "-" for v in row] for row in tm],
@@ -610,7 +640,16 @@ with T_stats:
         st.markdown(f"Rows: target {len(df)} | labeled {ml.get('n_labeled', 'n/a')} | "
                     f"first bar {df.index[0]} | last bar {last_ts}")
         st.markdown(f"Model training time: {ml['train_time']:.1f} s" if ml["ok"] else "Model not trained.")
-        st.markdown(f"theta {theta:.6f} | gamma {gamma:.3f} | DXY choice: {choice} -> {S['source_reason']}")
+        st.markdown(f"theta {theta:.6f} | gamma {gamma:.3f}")
+        st.markdown(f"DXY source reason ({choice}): {S['source_reason']}")
+        st.markdown("**Stored history and fresh bars, per ticker and interval**")
+        if STATS:
+            sdf = pd.DataFrame(sorted(STATS.values(), key=lambda r: (r["interval"], r["ticker"])))
+            sdf = sdf.rename(columns={"ticker": "Ticker", "interval": "Int", "stored": "Stored", "fresh": "Fresh",
+                                      "merged": "Merged", "error": "Error"})
+            st.dataframe(sdf, hide_index=True, width="stretch")
+        else:
+            st.caption("No load statistics recorded.")
         if ml["ok"]:
             st.dataframe(pd.DataFrame(ml["folds"]).round(5), hide_index=True, width="stretch")
         for p in core.PAIRS:
