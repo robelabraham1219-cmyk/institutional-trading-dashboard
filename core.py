@@ -358,22 +358,30 @@ def synth_dxy(frames: dict):
     return out, float(lost)
 
 
+def source_stats(synth: pd.DataFrame, real: pd.DataFrame, tf: str):
+    """Coverage of real DXY vs synthetic bars and abnormal-gap totals; None if either is unavailable."""
+    if len(real) == 0 or len(synth) == 0:
+        return None
+    cov = real.index.isin(synth.index).sum() / len(synth)
+    r = real[(real.index >= synth.index[0]) & (real.index <= synth.index[-1])]
+    n_gap, tot = abnormal_gaps(r.index, tf)
+    span = (r.index[-1] - r.index[0]).total_seconds() if len(r) > 1 else 0.0
+    return {"coverage": float(cov), "gap_n": int(n_gap), "gap_hours": float(tot / 3600.0),
+            "gap_frac": float(tot / span) if span > 0 else 0.0}
+
+
 def decide_source(choice: str, synth: pd.DataFrame, real: pd.DataFrame, tf: str):
     """Pick the DXY series. Returns (use_real, reason string)."""
     if choice == "Synthetic":
         return False, "manual: synthetic"
     if choice == "Real":
         return (len(real) > 0), ("manual: real" if len(real) else "real DX-Y.NYB unavailable, fell back to synthetic")
-    if len(real) == 0 or len(synth) == 0:
+    sst = source_stats(synth, real, tf)
+    if sst is None:
         return False, "auto: real DX-Y.NYB unavailable"
-    cov = real.index.isin(synth.index).sum() / len(synth)
-    r = real[(real.index >= synth.index[0]) & (real.index <= synth.index[-1])]
-    n_gap, tot = abnormal_gaps(r.index, tf)
-    span = (r.index[-1] - r.index[0]).total_seconds() if len(r) > 1 else 0.0
-    frac = tot / span if span > 0 else 0.0
-    detail = (f"real covers {cov:.0%} of synthetic bars (need >= 90%); {n_gap} abnormal gap(s) totalling "
-              f"{tot / 3600:.1f} h = {frac:.2%} of the covered period (need <= 1%)")
-    if cov >= 0.90 and frac <= 0.01:
+    detail = (f"real covers {sst['coverage']:.0%} of synthetic bars (need >= 90%); {sst['gap_n']} abnormal gap(s) "
+              f"totalling {sst['gap_hours']:.1f} h = {sst['gap_frac']:.2%} of the covered period (need <= 1%)")
+    if sst["coverage"] >= 0.90 and sst["gap_frac"] <= 0.01:
         return True, "auto: accepted real; " + detail
     return False, "auto: used synthetic; " + detail
 
@@ -410,7 +418,8 @@ def build_set(native: dict, tf: str, anchor: int = 0, choice: str = "Auto", now=
     use_real, why = decide_source(choice, synth, real, tf)
     dxy = real if use_real else synth
     return {"tf": tf, "pairs": pairs, "synth": synth, "real": real, "dxy": dxy, "use_real": use_real,
-            "source_reason": why, "validation": validate_dxy(synth, real), "lost": lost,
+            "source_reason": why, "source_stats": source_stats(synth, real, tf),
+            "validation": validate_dxy(synth, real), "lost": lost,
             "forming": forming, "warnings": warns,
             "source_label": ("DXY source: Real DX-Y.NYB" if use_real
                              else "Synthetic from 6 pairs (approximate range)")}
@@ -664,10 +673,11 @@ def future_move(close, atr, H: int) -> np.ndarray:
     return out
 
 
-def run_ml(tgt: pd.DataFrame, Xb: pd.DataFrame, H: int, qa: float, qe: float) -> dict:
+def run_ml(tgt: pd.DataFrame, Xb: pd.DataFrame, H: int, qa: float, qe: float, include_hgb: bool = False) -> dict:
     """Walk-forward evaluation (expanding window, purged, thresholds per fold) and live fit.
 
     tgt: core_frame output; Xb: base_features aligned to tgt. All fitted quantities use training rows only.
+    Logistic regression always runs; gradient boosting (slow) only when include_hgb is True.
     """
     t_start = time.time()
     res = {"ok": False, "warnings": [], "msg": ""}
@@ -713,12 +723,14 @@ def run_ml(tgt: pd.DataFrame, Xb: pd.DataFrame, H: int, qa: float, qe: float) ->
         if not (np.isfinite(Xf[tr]).all() and np.isfinite(Xf[te]).all()):
             res["warnings"].append(f"Fold {bi + 1} skipped: non-finite features (NaN/inf) would reach the models.")
             continue
-        ph, mh = fit_proba("HGB", Xf[tr], y[tr], Xf[te])
+        ph, mh = fit_proba("HGB", Xf[tr], y[tr], Xf[te]) if include_hgb else (None, None)
         pl, ml = fit_proba("LR", Xf[tr], y[tr], Xf[te])
         major = int(np.bincount(y[tr], minlength=4).argmax())
-        recs.append(pd.DataFrame({"pos": te, "y": y[te], "naive": R[te], "major": major, "fold": bi,
-                                  **{f"h{k}": ph[:, k] for k in range(4)},
-                                  **{f"l{k}": pl[:, k] for k in range(4)}}))
+        cols = {"pos": te, "y": y[te], "naive": R[te], "major": major, "fold": bi}
+        if ph is not None:
+            cols.update({f"h{k}": ph[:, k] for k in range(4)})
+        cols.update({f"l{k}": pl[:, k] for k in range(4)})
+        recs.append(pd.DataFrame(cols))
         folds.append({"fold": bi + 1, "train_rows": int(len(tr)), "test_rows": int(len(te)),
                       "theta": th, "gamma": ga})
         last = (Xf[te], y[te], mh, ml)
@@ -726,14 +738,18 @@ def run_ml(tgt: pd.DataFrame, Xb: pd.DataFrame, H: int, qa: float, qe: float) ->
         res["msg"] = "Walk-forward produced no usable folds: ML skipped."
         return res
     oos = pd.concat(recs, ignore_index=True)
-    ph = oos[[f"h{k}" for k in range(4)]].to_numpy()
-    pl = oos[[f"l{k}" for k in range(4)]].to_numpy()
+    probs = {}
+    if include_hgb:
+        probs["HGB"] = oos[[f"h{k}" for k in range(4)]].to_numpy()
+    probs["LR"] = oos[[f"l{k}" for k in range(4)]].to_numpy()
     yo = oos["y"].to_numpy()
-    preds = {"HGB": ph.argmax(1), "LR": pl.argmax(1), "Naive": oos["naive"].to_numpy(),
-             "Majority": oos["major"].to_numpy()}
+    preds = {k: v.argmax(1) for k, v in probs.items()}
+    preds["Naive"] = oos["naive"].to_numpy()
+    preds["Majority"] = oos["major"].to_numpy()
     met = {k: metrics(yo, v) for k, v in preds.items()}
-    best = "HGB" if np.nan_to_num(met["HGB"]["bal"]) >= np.nan_to_num(met["LR"]["bal"]) else "LR"
-    pb = ph if best == "HGB" else pl
+    ran = list(probs)  # models that actually ran (HGB first, so it wins an exact tie as before)
+    best = max(ran, key=lambda k: np.nan_to_num(met[k]["bal"]))
+    pb = probs[best]
     pos = oos["pos"].to_numpy()
     oos["pred"] = pb.argmax(1)
     oos["ptop"] = pb.max(1)
@@ -779,7 +795,7 @@ def run_ml(tgt: pd.DataFrame, Xb: pd.DataFrame, H: int, qa: float, qe: float) ->
     res.update({"ok": True, "oos": oos, "metrics": met, "best": best, "sep": sep, "cal": cal, "imp": imp,
                 "live": live, "theta": th, "gamma": ga, "folds": folds, "rows": rows,
                 "beats_naive": bool(np.nan_to_num(met[best]["bal"]) > np.nan_to_num(met["Naive"]["bal"])),
-                "train_time": time.time() - t_start, "names": names})
+                "train_time": time.time() - t_start, "names": names, "models": ran, "include_hgb": bool(include_hgb)})
     return res
 
 
