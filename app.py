@@ -322,6 +322,11 @@ const D=__DATA__;
 const IDS=['b_ema','b_sw','b_mk','b_lv','b_dk'];
 const LAB={b_ema:'EMA',b_sw:'Swings',b_mk:'Changes',b_lv:'PDH/PWH',b_dk:'Dark'};
 const st={b_ema:true,b_sw:false,b_mk:true,b_lv:true,b_dk:true};
+const SKEY='fxr_toolbar_v1';
+function loadSt(){try{const raw=window.localStorage.getItem(SKEY);if(!raw)return;const o=JSON.parse(raw);
+IDS.forEach(id=>{if(o&&typeof o[id]==='boolean')st[id]=o[id];});}catch(e){}}
+function saveSt(){try{window.localStorage.setItem(SKEY,JSON.stringify(st));}catch(e){}}
+loadSt();
 const TH={dark:{bg:'#0e1117',tc:'#cbd5e1',gc:'#1f2937',ov:'rgba(20,20,25,.65)',ovc:'#eeeeee',off:'#1f2937',offc:'#cbd5e1',bd:'#475569',leg:'#8b95a5',e20:'#facc15',e50:'#a78bfa',sw:'#94a3b8',na:'#38bdf8',er:'#34d399',th:'#f59e0b'},
 light:{bg:'#ffffff',tc:'#334155',gc:'#e5e7eb',ov:'rgba(255,255,255,.88)',ovc:'#111827',off:'#f1f5f9',offc:'#334155',bd:'#cbd5e1',leg:'#64748b',e20:'#b45309',e50:'#6d28d9',sw:'#64748b',na:'#0369a1',er:'#047857',th:'#b45309'}};
 function T(){return st.b_dk?TH.dark:TH.light;}
@@ -366,7 +371,7 @@ if(thL)thL.applyOptions({color:t.th});if(gmL)gmL.applyOptions({color:t.th});
 setLv();}
 const ACT={b_ema:()=>emaS.forEach(s=>s.applyOptions({visible:st.b_ema})),
 b_sw:()=>swS.forEach(s=>s.applyOptions({visible:st.b_sw})),b_mk:setMk,b_lv:setLv,b_dk:applyTheme};
-IDS.forEach(id=>{const b=document.getElementById(id);b.onclick=function(){st[id]=!st[id];ACT[id]();paint();};});
+IDS.forEach(id=>{const b=document.getElementById(id);b.onclick=function(){st[id]=!st[id];ACT[id]();paint();saveSt();};});
 document.getElementById('ov').innerHTML=D.overlay;
 setMk();applyTheme();paint();
 const cs_=[c1,c2,c3];let lock=false;
@@ -388,38 +393,127 @@ requestAnimationFrame(()=>requestAnimationFrame(boot));
 
 # ----------------------------------------------------------------------------- settings
 st.title("FX Regime Monitor")
+TZS = tz_options()
+RENDERERS = ["Stable (components.html)"] + (["New (st.iframe)"] if hasattr(st, "iframe") else [])
+
+
+def hz_label(h: int, lab: str) -> str:
+    return f"{h} bars ({lab})"
+
+
+def reset_settings() -> None:
+    """Clear URL parameters and session state (button callback: runs before the widgets are created)."""
+    st.query_params.clear()
+    for k_ in list(st.session_state.keys()):
+        del st.session_state[k_]
+
+
+if "_init" not in st.session_state:  # first run of a session: restore validated settings from the URL
+    cfg0 = core.parse_settings(st.query_params.to_dict(), TZS, hasattr(st, "iframe"))
+    ss = st.session_state
+    t0 = cfg0["tf"]
+    ss["w_sym"], ss["w_dx"], ss["w_tf"] = cfg0["symbol"], cfg0["dx"], t0
+    if cfg0["custom"]:
+        ss[f"hz_{t0}"], ss[f"hc_{t0}"] = "Custom", str(cfg0["H"])
+    else:
+        ss[f"hz_{t0}"] = next(hz_label(h, lab) for h, lab, _ in core.PRESETS[t0] if h == cfg0["H"])
+    ss["w_qa"], ss["w_qe"], ss["w_an"], ss["w_tz"] = cfg0["qa"], cfg0["qe"], cfg0["an"], cfg0["tz"]
+    ss[f"w_ao_{t0}"] = cfg0["ao"]
+    ss["w_hg"] = cfg0["hgb"]
+    ss["w_rd"] = RENDERERS[1] if (cfg0["rd"] == "n" and len(RENDERERS) > 1) else RENDERERS[0]
+    ss["_init"] = True
+
 with st.expander("Settings", expanded=False):
     c1, c2 = st.columns(2)
-    symbol = c1.selectbox("Instrument", core.TARGETS, index=0)
-    choice = c2.radio("DXY source", ["Auto", "Real", "Synthetic"], horizontal=True)
+    symbol = c1.selectbox("Instrument", core.TARGETS, key="w_sym", help="The market to analyse.")
+    choice = c2.radio("DXY source", ["Auto", "Real", "Synthetic"], horizontal=True, key="w_dx",
+                      help="Auto uses the real DX-Y.NYB series when it is complete enough, otherwise a synthetic "
+                           "index built from the 6 pairs.")
     c1, c2 = st.columns(2)
-    tf = c1.selectbox("Timeframe", core.TF_ORDER, index=1)
+    tf = c1.selectbox("Timeframe", core.TF_ORDER, key="w_tf", help="Bar size.")
     pres = core.PRESETS[tf]
-    labels = [f"{h} bars ({lab})" for h, lab, _ in pres] + ["Custom"]
-    dflt = [i for i, p in enumerate(pres) if p[2]][0]
-    pick = c2.selectbox("Horizon", labels, index=dflt, key=f"hz_{tf}")
+    labels = [hz_label(h, lab) for h, lab, _ in pres] + ["Custom"]
+    st.session_state.setdefault(f"hz_{tf}", next(hz_label(h, lab) for h, lab, d in pres if d))
+    pick = c2.selectbox("Horizon", labels, key=f"hz_{tf}",
+                        help="Forecast window in bars. It is also the Efficiency Ratio window, so it changes how "
+                             "the current regime is labelled.")
+    hwarn = None
     if pick == "Custom":
-        H = int(st.number_input("Custom horizon (bars)", 3, 300, core.default_H(tf), key=f"hc_{tf}"))
+        h1, h2 = st.columns([3, 2])
+        st.session_state.setdefault(f"hc_{tf}", str(core.default_H(tf)))
+        raw_h = h1.text_input("Custom horizon in bars (min 3, max 300)", key=f"hc_{tf}",
+                              help="Type a number and press Enter. Values outside 3 to 300 are clamped.")
+        H, hwarn = core.parse_horizon(raw_h, core.default_H(tf))
+        h2.markdown(f"<div style='padding-top:1.9rem'>= ~{H * core.TF_SECONDS[tf] / 3600:g} h</div>",
+                    unsafe_allow_html=True)
     else:
         H = pres[labels.index(pick)][0]
     H = max(3, H)
+    if hwarn:
+        st.warning(hwarn)
+    st.caption("Horizon is both the forecast window and the Efficiency Ratio window, so changing it also changes "
+               "the current-regime label.")
     c1, c2 = st.columns(2)
-    qa = c1.slider("ATR percentile (theta)", 30, 70, 50)
-    qe = c2.slider("ER percentile (gamma)", 30, 70, 50)
+    qa = c1.slider("ATR percentile (theta)", 30, 70, key="w_qa",
+                   help="Volatility threshold = this percentile of the historical nATR (ATR divided by price). "
+                        "Higher = stricter 'high volatility', so Choppy and Volatile become rarer; lower = more "
+                        "common.")
+    qe = c2.slider("ER percentile (gamma)", 30, 70, key="w_qe",
+                   help="Trend threshold = this percentile of the historical Efficiency Ratio (1 = straight line, "
+                        "0 = back and forth). Higher = stricter trend definition; lower = looser.")
+    live_theta = c1.empty()
+    live_gamma = c2.empty()
+    live_shares = st.empty()
+    st.caption("Changing percentiles, ATR length or horizon changes the definitions; accuracy numbers are not "
+               "comparable across settings. Do not choose settings by accuracy.")
     c1, c2 = st.columns(2)
-    atr_n = int(c1.number_input("ATR length N", 3, 50, 10))
-    tz = c2.selectbox("Timezone", tz_options(), index=tz_options().index("UTC") if "UTC" in tz_options() else 0)
+    atr_n = int(c1.number_input("ATR length N", 3, 50, key="w_an",
+                                help="Bars used to smooth ATR (Wilder). Smaller = reacts faster, noisier; larger = "
+                                     "smoother, slower. Default 10."))
+    tz = c2.selectbox("Timezone", TZS, key="w_tz", help="Display timezone for the chart and window end.")
     anchor = 0
     if tf in ("2h", "3h", "4h"):
         b = int(tf[0])
-        anchor = st.slider("UTC anchor offset (hours)", 0, b - 1, 0)
-    use_hgb = st.checkbox("Include gradient boosting (slow)", value=False)
-    rend_opts = ["Stable (components.html)"] + (["New (st.iframe)"] if hasattr(st, "iframe") else [])
-    renderer = st.radio("Chart renderer", rend_opts, horizontal=True)
-    if st.button("Refresh data"):
+        st.session_state.setdefault(f"w_ao_{tf}", 0)
+        anchor = st.slider("UTC anchor offset (hours)", 0, b - 1, key=f"w_ao_{tf}",
+                           help="Shifts where the resampled bars start (UTC hours).")
+    use_hgb = st.checkbox("Include gradient boosting (slow)", key="w_hg",
+                          help="Adds a gradient boosting model next to logistic regression. Much slower.")
+    renderer = st.radio("Chart renderer", RENDERERS, horizontal=True, key="w_rd",
+                        help="Use 'New' only if the chart still renders.")
+    b1, b2 = st.columns(2)
+    if b1.button("Refresh data"):
         st.cache_data.clear()
         st.cache_resource.clear()
         st.rerun()
+    b2.button("Reset settings", on_click=reset_settings)
+    st.caption("Bookmark this page or add it to your home screen to keep your settings.")
+
+with st.expander("What do these settings mean?"):
+    st.markdown("""
+- **ATR percentile (theta):** the volatility threshold is this percentile of the historical nATR (ATR divided by
+  price). Higher means a stricter "high volatility", so Choppy and Volatile become rarer; lower means they become
+  more common.
+- **ER percentile (gamma):** the trend threshold is this percentile of the historical Efficiency Ratio
+  (1 = straight line, 0 = back and forth). Higher means a stricter trend definition; lower means a looser one.
+- **ATR length N:** how many bars smooth the ATR (Wilder). Smaller reacts faster but is noisier; larger is smoother
+  but slower. Default 10.
+- **Horizon:** the forecast window in bars and also the Efficiency Ratio window, so changing it changes how the
+  current regime is labelled.
+
+The live values under the sliders show what the current settings mean in practice. Changing any of these changes the
+definitions, so accuracy numbers are not comparable across settings. Do not choose settings by accuracy.
+""")
+
+# persist the settings in the URL (only when they changed; defaults keep the URL clean)
+_want = core.settings_to_params({"symbol": symbol, "dx": choice, "tf": tf, "H": H, "custom": pick == "Custom",
+                                 "qa": qa, "qe": qe, "an": atr_n, "tz": tz, "ao": anchor, "hgb": bool(use_hgb),
+                                 "rd": "n" if renderer.startswith("New") else "s"}, TZS)
+if st.query_params.to_dict() != _want:
+    if _want:
+        st.query_params.from_dict(_want)
+    else:
+        st.query_params.clear()
 
 # ----------------------------------------------------------------------------- data
 with st.spinner("Loading data..."), stage("Data load"):
@@ -451,6 +545,18 @@ else:
 R = core.regimes(cf["natr"], cf["er"], theta, gamma)
 ylab = core.make_labels(R, H)
 age_arr = core.run_length(R)
+lab_ok = ylab[ylab >= 0]
+if np.isfinite(theta):
+    live_theta.markdown(f"theta now: **{theta:.5f}** nATR = **{theta * 100:.3f}%** of price")
+else:
+    live_theta.markdown("theta now: n/a")
+live_gamma.markdown(f"gamma now: **{gamma:.3f}**" if np.isfinite(gamma) else "gamma now: n/a")
+if len(lab_ok):
+    sh_ = np.bincount(lab_ok, minlength=4)[:4] / len(lab_ok)
+    live_shares.markdown("Share of labeled bars: " + " | ".join(f"{SHORT[k]} {sh_[k]:.0%}" for k in range(4)) +
+                         f" (N={len(lab_ok)})")
+else:
+    live_shares.markdown("Share of labeled bars: n/a (not enough bars)")
 cur_R = int(R[-1])
 age = int(age_arr[-1])
 age_txt = f" age {age} bars" if cur_R >= 0 else ""
@@ -503,6 +609,7 @@ prov = (f"Yahoo (free, unofficial) | last closed bar {fmt_ts(last_ts, 'UTC')} | 
 
 
 def head() -> None:
+    st.markdown(f"**{symbol} | {tf} | horizon {H} bars (~{H * core.TF_SECONDS[tf] / 3600:g} h)**")
     st.caption(prov)
     if symbol == "DXY":
         st.markdown(f"**{S['source_label']}**")
