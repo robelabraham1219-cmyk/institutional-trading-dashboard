@@ -31,16 +31,19 @@ TF_SECONDS = {"30m": 1800, "1h": 3600, "2h": 7200, "3h": 10800, "4h": 14400,
 TF_NATIVE = {"30m": "30m", "1h": "1h", "2h": "1h", "3h": "1h", "4h": "1h",
              "1D": "1d", "3D": "1d", "1W": "1d"}
 LADDER = ["30m", "1h", "4h", "1D", "1W"]
-PRESETS = {  # (H bars, label, is_default)
-    "30m": [(12, "6h", 0), (24, "12h", 0), (48, "24h", 1), (96, "48h", 0)],
-    "1h": [(6, "6h", 0), (12, "12h", 0), (24, "24h", 1), (48, "48h", 0)],
-    "2h": [(3, "6h", 0), (6, "12h", 0), (12, "24h", 1), (24, "48h", 0)],
-    "3h": [(4, "12h", 0), (8, "24h", 1), (16, "48h", 0)],
-    "4h": [(3, "12h", 0), (6, "24h", 1), (12, "48h", 0)],
+PRESETS = {  # (H bars, label, is_default); minimum horizon is 3 bars
+    "30m": [(3, "1.5 h", 0), (4, "2 h", 0), (6, "3 h", 0), (8, "4 h", 0), (12, "6 h", 0), (24, "12 h", 0),
+            (48, "24 h", 1), (96, "48 h", 0)],
+    "1h": [(3, "3 h", 0), (4, "4 h", 0), (5, "5 h", 0), (6, "6 h", 0), (12, "12 h", 0), (24, "24 h", 1),
+           (48, "48 h", 0)],
+    "2h": [(3, "6 h", 0), (4, "8 h", 0), (6, "12 h", 0), (12, "24 h", 1), (24, "48 h", 0)],
+    "3h": [(3, "9 h", 0), (4, "12 h", 0), (8, "24 h", 1), (16, "48 h", 0)],
+    "4h": [(3, "12 h", 0), (6, "24 h", 1), (12, "48 h", 0)],
     "1D": [(3, "3 days", 1), (5, "5 days", 0), (10, "10 days", 0)],
     "3D": [(3, "3 bars", 1), (5, "5 bars", 0), (8, "8 bars", 0)],
     "1W": [(4, "4 weeks", 1), (8, "8 weeks", 0), (12, "12 weeks", 0)],
 }
+H_MIN, H_MAX = 3, 300
 REGIME_NAMES = ["Stagnant", "Steady trend", "Choppy", "Volatile trend"]
 REGIME_COLORS = ["#9aa0a6", "#3b82f6", "#f59e0b", "#ef4444"]
 MEANINGS = [
@@ -869,6 +872,114 @@ def mtf_row(df: pd.DataFrame, H: int, qa: float, qe: float, atr_n: int):
 def default_H(tf: str) -> int:
     """Default horizon preset for a timeframe."""
     return [h for h, _, d in PRESETS[tf] if d][0]
+
+
+def parse_horizon(raw, default: int):
+    """Custom horizon from free text. Returns (bars clamped to 3..300, warning or None).
+
+    Empty text -> default (no warning); non-numeric -> default with a warning; out of range -> clamped with a warning.
+    """
+    txt = "" if raw is None else str(raw).strip()
+    if txt == "":
+        return int(default), None
+    try:
+        v = float(txt)
+        if not np.isfinite(v):
+            raise ValueError
+    except ValueError:
+        return int(default), f"'{txt}' is not a number; using the default of {int(default)} bars."
+    n = int(round(v))
+    note = f"rounded to {n}; " if abs(v - n) > 1e-9 else ""
+    if n < H_MIN:
+        return H_MIN, f"Horizon {txt} is below the minimum: {note}using {H_MIN} bars."
+    if n > H_MAX:
+        return H_MAX, f"Horizon {txt} is above the maximum: {note}using {H_MAX} bars."
+    return n, (f"Horizon {txt} {note[:-2]}." if note else None)
+
+
+SETTING_DEFAULTS = {"symbol": "DXY", "dx": "Auto", "tf": "1h", "qa": 50, "qe": 50, "an": 10, "tz": "UTC",
+                    "ao": 0, "hgb": False, "rd": "s"}
+
+
+def parse_settings(q: dict, tz_opts: list, has_iframe: bool = False) -> dict:
+    """Validate URL query parameters (short keys) against the allowed options; invalid -> default.
+
+    Keys: s symbol, dx DXY source, tf timeframe, hz horizon ('24' preset bars or 'c36' custom bars),
+    qa/qe percentiles 30-70, an ATR length 3-50, tz timezone, ao anchor offset, hg 0/1, rd s/n.
+    Returns the normalised settings plus 'invalid' (list of keys that fell back).
+    """
+    import re
+    q = q or {}
+    g = lambda k: q.get(k) if isinstance(q.get(k), str) else None
+    out = dict(SETTING_DEFAULTS)
+    if tz_opts and out["tz"] not in tz_opts:
+        out["tz"] = tz_opts[0]
+    bad = []
+
+    def pick(key, name, ok):
+        v = g(key)
+        if v is None:
+            return
+        val = ok(v)
+        if val is None:
+            bad.append(key)
+        else:
+            out[name] = val
+
+    def to_int(lo, hi):
+        return lambda v: int(v) if re.fullmatch(r"\d{1,4}", v) and lo <= int(v) <= hi else None
+
+    pick("s", "symbol", lambda v: v if v in TARGETS else None)
+    pick("dx", "dx", lambda v: v if v in ("Auto", "Real", "Synthetic") else None)
+    pick("tf", "tf", lambda v: v if v in TF_ORDER else None)
+    pick("qa", "qa", to_int(30, 70))
+    pick("qe", "qe", to_int(30, 70))
+    pick("an", "an", to_int(3, 50))
+    pick("tz", "tz", lambda v: v if v in (tz_opts or []) else None)
+    pick("hg", "hgb", lambda v: {"0": False, "1": True}.get(v))
+    pick("rd", "rd", lambda v: v if (v == "s" or (v == "n" and has_iframe)) else None)
+    tf = out["tf"]
+    out["H"], out["custom"] = default_H(tf), False
+    v = g("hz")
+    if v is not None:
+        if v.startswith("c") and re.fullmatch(r"\d{1,4}", v[1:]) and H_MIN <= int(v[1:]) <= H_MAX:
+            out["H"], out["custom"] = int(v[1:]), True
+        elif re.fullmatch(r"\d{1,4}", v) and int(v) in [h for h, _, _ in PRESETS[tf]]:
+            out["H"] = int(v)
+        else:
+            bad.append("hz")
+    out["ao"] = 0
+    v = g("ao")
+    if v is not None:
+        if tf in ("2h", "3h", "4h") and re.fullmatch(r"\d{1,2}", v) and int(v) < int(tf[0]):
+            out["ao"] = int(v)
+        else:
+            bad.append("ao")
+    out["invalid"] = bad
+    return out
+
+
+def settings_to_params(cur: dict, tz_opts: list | None = None) -> dict:
+    """Short-key URL parameters for the settings that differ from the defaults (empty dict = clean URL)."""
+    d = dict(SETTING_DEFAULTS)
+    if tz_opts and d["tz"] not in tz_opts:
+        d["tz"] = tz_opts[0]
+    p = {}
+    for key, name in (("s", "symbol"), ("dx", "dx"), ("tf", "tf"), ("qa", "qa"), ("qe", "qe"), ("an", "an"),
+                      ("tz", "tz")):
+        if cur[name] != d[name]:
+            p[key] = str(cur[name])
+    if cur.get("custom"):
+        p["hz"] = f"c{int(cur['H'])}"
+    elif int(cur["H"]) != default_H(cur["tf"]):
+        p["hz"] = str(int(cur["H"]))
+    if int(cur.get("ao", 0)) != 0 and cur["tf"] in ("2h", "3h", "4h"):
+        p["ao"] = str(int(cur["ao"]))
+    if bool(cur.get("hgb")):
+        p["hg"] = "1"
+    if cur.get("rd", "s") != "s":
+        p["rd"] = cur["rd"]
+    return p
 
 
 def transition_matrix(R: np.ndarray, y: np.ndarray) -> np.ndarray:
